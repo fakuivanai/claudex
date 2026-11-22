@@ -86,7 +86,7 @@ CLAUDEX_CLAUDE_LAUNCHER = "/absolute/path/to/claude-launcher"
 | `send_message`, `read_messages` | Delivers Claude messages to any loaded Codex chat as attributed tool output. An unloaded Codex chat is reported as `not_loaded`. Stores Codex messages for the exact Claude chat and hands its worker a fixed notice. The recipient calls `read_messages` to fetch the body. |
 | `launch_claude`, `wake_chat` | Opens Claude Desktop or asks it to reopen a saved chat. `waiting_for_inbox` means the native worker did not appear in time. Stored mail remains available. |
 | `open_chat_draft` | Opens a Claude Code composer for the person to review and submit. Claude confirms any folder supplied through the link. |
-| `list_skills`, `read_skill` | Reads local user `SKILL.md` files as text, including links to read-only Home Manager skills in the Nix store. Scopes are `claude-user`, `codex-user`, and `agents-user`. |
+| `list_skills`, `read_skill` | Reads local user `SKILL.md` files as text, including linked skill directories installed by Home Manager. Scopes are `claude-user`, `codex-user`, and `agents-user`. |
 
 A submitted Claude inbox notice can still be held or declined by the app.
 A lost Codex acknowledgement leaves delivery uncertain. Check the recipient

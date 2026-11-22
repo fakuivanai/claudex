@@ -1,6 +1,5 @@
 import os
 from pathlib import Path
-import stat
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -72,36 +71,13 @@ class SkillReaderTest(unittest.TestCase):
         linked.symlink_to(outside, target_is_directory=True)
         self.assertEqual(read_skill(Provider.CLAUDE, "claude-user", "linked").content, "User-owned skill")
 
-    def test_reads_a_link_to_a_read_only_store_directory(self) -> None:
-        self.assertEqual(self.read_linked_store_skill(mode=0o555), "Managed skill")
-
-    def test_refuses_an_unowned_writable_store_directory(self) -> None:
-        with self.assertRaises(FileNotFoundError):
-            self.read_linked_store_skill(mode=0o755)
-
-    def read_linked_store_skill(self, *, mode: int) -> str:
-        managed = self.write_skill("store", "skill", b"Managed skill")
-        managed.chmod(mode)
-        self.addCleanup(managed.chmod, 0o755)
+    def test_reads_a_skill_without_requiring_ownership_of_its_directory(self) -> None:
+        managed = self.write_skill("managed", "skill", b"Managed skill")
         linked = self.root / "claude" / "skills" / "linked"
         linked.parent.mkdir(parents=True)
         linked.symlink_to(managed, target_is_directory=True)
-        actual_fstat = os.fstat
-        managed_identity = (managed.stat().st_dev, managed.stat().st_ino)
-
-        def report_managed_owner(descriptor: int) -> os.stat_result:
-            entry = actual_fstat(descriptor)
-            if (entry.st_dev, entry.st_ino) == managed_identity and stat.S_ISDIR(entry.st_mode):
-                values = list(entry)
-                values[4] = os.getuid() + 1
-                return os.stat_result(values)
-            return entry
-
-        with (
-            patch("skill_reader._NIX_STORE", self.root / "store"),
-            patch("skill_reader.os.fstat", side_effect=report_managed_owner),
-        ):
-            return read_skill(Provider.CLAUDE, "claude-user", "linked").content
+        with patch.object(os, "getuid", return_value=managed.stat().st_uid + 1):
+            self.assertEqual(read_skill(Provider.CLAUDE, "claude-user", "linked").content, "Managed skill")
 
     def test_limits_size(self) -> None:
         self.write_skill("claude", "large", b"x" * (MAX_SKILL_BYTES + 1))
