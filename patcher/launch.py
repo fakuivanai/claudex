@@ -55,6 +55,8 @@ class CacheRecord:
 FILE_IDENTITY = TypeAdapter(FileIdentity)
 CACHE_RECORD = TypeAdapter(CacheRecord)
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+# Generated references are named by the source identity and patch digests.
+CACHE_REFERENCE = re.compile(r"[0-9a-f]{64}-([0-9a-f]{64})\.json")
 # A managed stock run invalidates an older Remote Control shutdown snapshot.
 STOCK_LAUNCH_MARKER = "last-stock-launch"
 STOCK_LAUNCH_CUTOFF = "CLAUDEX_REMOTE_CONTROL_SINCE"
@@ -157,6 +159,45 @@ def cached_archive(source: Path, cache: Path) -> Path:
     return candidate
 
 
+def prune_cached_archives(cache: Path, current: Path) -> None:
+    """Remove proven stale cache entries after checking that Desktop is stopped under the launch lock."""
+    if current.parent != cache:
+        return
+    current_identity = FileIdentity.read(current)
+    for reference in cache.iterdir():
+        name = CACHE_REFERENCE.fullmatch(reference.name)
+        if name is None:
+            continue
+        try:
+            info = reference.lstat()
+            if info.st_uid != os.getuid() or not stat.S_ISREG(info.st_mode):
+                continue
+            record = CACHE_RECORD.validate_json(reference.read_bytes(), strict=True)
+        except (OSError, ValidationError):
+            continue
+        if SHA256_HEX.fullmatch(record.source_digest) is None:
+            continue
+        candidate = cache / f"{record.source_digest}-{name[1]}.asar"
+        if candidate == current:
+            if current_identity != record.artifact:
+                reference.unlink(missing_ok=True)
+            continue
+        try:
+            identity = FileIdentity.read(candidate)
+        except FileNotFoundError:
+            reference.unlink(missing_ok=True)
+            continue
+        except OSError:
+            # An unreadable or nonregular artifact cannot be proven to be ours.
+            continue
+        if identity != record.artifact or (
+            identity.device == current_identity.device and identity.inode == current_identity.inode
+        ):
+            continue
+        candidate.unlink(missing_ok=True)
+        reference.unlink(missing_ok=True)
+
+
 def mount_command(bubblewrap: str, patched: Path, stock: Path, command: list[str]) -> list[str]:
     return [
         bubblewrap, "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc",
@@ -191,13 +232,18 @@ class Started:
 
 
 @dataclass(frozen=True)
-class BeforeStartFailure:
+class Fallback:
     reason: str
+
+
+@dataclass(frozen=True)
+class Disabled:
+    """The caller chose to launch Claude Desktop in stock mode."""
 
 
 def start_patched(
     bubblewrap: str, patched: Path, stock: Path, command: list[str], environment: dict[str, str], cache: Path,
-) -> Started | BeforeStartFailure:
+) -> Started | Fallback:
     with tempfile.TemporaryDirectory(prefix="launch-", dir=cache) as directory:
         marker = Path(directory) / "account-launcher-start"
         wrapped = mount_command(
@@ -207,13 +253,13 @@ def start_patched(
         try:
             launched = subprocess.run(wrapped, env=environment, cwd=environment["HOME"], check=False)
         except OSError as error:
-            return BeforeStartFailure(f"could not start bubblewrap ({error.strerror})")
+            return Fallback(f"could not start bubblewrap ({error.strerror})")
         try:
             stage = marker.read_text()
         except FileNotFoundError:
-            return BeforeStartFailure(f"patch mount setup failed (exit {launched.returncode})")
+            return Fallback(f"patch mount setup failed (exit {launched.returncode})")
         if stage == "exec-failed":
-            return BeforeStartFailure("the account launcher could not start inside the patch mount")
+            return Fallback("the account launcher could not start inside the patch mount")
         return Started(launched.returncode)
 
 
@@ -238,13 +284,13 @@ def notify_stock_fallback(environment: dict[str, str]) -> None:
 
 
 def stock_launch(
-    command: list[str], environment: dict[str, str], state: Path, fallback_reason: str | None = None,
+    command: list[str], environment: dict[str, str], state: Path, selection: Disabled | Fallback,
 ) -> int:
-    reason = fallback_reason if fallback_reason is not None else "Remote Control patch disabled"
+    reason = selection.reason if isinstance(selection, Fallback) else "Remote Control patch disabled"
     print(f"claudex: {reason}. Launching stock Claude Desktop.", file=sys.stderr)
     # Python and Electron both express this wall-clock cutoff in milliseconds.
     publish_bytes(state / STOCK_LAUNCH_MARKER, str(time.time_ns() // 1_000_000).encode())
-    if fallback_reason is not None:
+    if isinstance(selection, Fallback):
         notify_stock_fallback(environment)
     return subprocess.run(command, env=environment, cwd=environment["HOME"], check=False).returncode
 
@@ -285,22 +331,28 @@ def launch(source: Path, command: list[str], *, disabled: bool, reuse_running: b
         if running_desktop():
             return existing_launch(command, environment, reuse_running)
         if disabled:
-            return stock_launch(command, environment, state)
+            return stock_launch(command, environment, state, Disabled())
         bubblewrap = shutil.which("bwrap", path=environment["PATH"])
         if bubblewrap is None:
-            return stock_launch(command, environment, state, "bubblewrap unavailable in the desktop environment")
+            return stock_launch(command, environment, state, Fallback("bubblewrap unavailable in the desktop environment"))
         try:
             cache = desktop_data_directory(environment, "XDG_CACHE_HOME", home / ".cache")
             source = source.resolve(strict=True)
             patched = cached_archive(source, cache)
             cutoff = stock_cutoff(state)
         except (OSError, ValueError) as error:
-            return stock_launch(command, environment, state, f"Remote Control patch unavailable ({error})")
+            return stock_launch(command, environment, state, Fallback(f"Remote Control patch unavailable ({error})"))
+        if running_desktop():
+            return existing_launch(command, environment, reuse_running)
+        try:
+            prune_cached_archives(cache, patched)
+        except OSError as error:
+            print(f"claudex: Could not remove an old cached patch ({error}).", file=sys.stderr)
         patched_environment = {**environment, STOCK_LAUNCH_CUTOFF: cutoff}
         result = start_patched(bubblewrap, patched, source, command, patched_environment, cache)
         match result:
-            case BeforeStartFailure(reason):
-                return stock_launch(command, environment, state, reason)
+            case Fallback():
+                return stock_launch(command, environment, state, result)
             case Started(status):
                 return status
 

@@ -281,9 +281,25 @@ os.execv(arguments[0], arguments)
         with (
             patch("patcher.launch.desktop_environment", return_value=self.environment),
             patch("patcher.launch.running_desktop", return_value=True),
+            patch("patcher.launch.prune_cached_archives") as prune,
             redirect_stderr(io.StringIO()),
         ):
             self.assertEqual(launch(self.stock, args, disabled=False, reuse_running=True), 0)
+        prune.assert_not_called()
+        self.assertFalse(self.record.exists())
+
+    def test_desktop_appearing_during_build_prevents_cache_pruning(self) -> None:
+        self.fake_bubblewrap()
+        args = self.fake_launcher()
+        with (
+            patch("patcher.launch.desktop_environment", return_value=self.environment),
+            patch("patcher.launch.running_desktop", side_effect=[False, False, True]),
+            patch("patcher.launch.cached_archive", return_value=self.patched),
+            patch("patcher.launch.prune_cached_archives") as prune,
+            redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(launch(self.stock, args, disabled=False, reuse_running=True), 0)
+        prune.assert_not_called()
         self.assertFalse(self.record.exists())
 
     def test_process_probe_distinguishes_electron_worker_from_main(self) -> None:
@@ -302,7 +318,7 @@ os.execv(arguments[0], arguments)
             encode_header(Directory((("session.js", Packed(0, len(chunk), integrity_of(chunk, 16), None)),)))
             + chunk,
         )
-        self.cache.mkdir(parents=True)
+        self.cache.mkdir(mode=0o700, parents=True)
         return DesktopRelease("fixture", hashlib.sha256(self.stock.read_bytes()).hexdigest(), (
             "session.js",
         ), (Anchor("fixture", chunk, b"patched anchor"),))
@@ -342,6 +358,70 @@ os.execv(arguments[0], arguments)
             original.write_bytes(b"tampered archive")
             rebuilt = cached_archive(self.stock, self.cache)
         self.assertNotEqual(rebuilt.read_bytes(), b"tampered archive")
+
+    def test_launch_keeps_the_current_cache_and_preserves_unmanaged_entries(self) -> None:
+        release = self.cache_fixture()
+        self.fake_bubblewrap()
+        args = self.fake_launcher()
+        stale_patch = "a" * 64
+        current_patch = "b" * 64
+        with (
+            patch("patcher.build.SUPPORTED_RELEASES", (release,)),
+            patch("patcher.launch.patch_digest", return_value=stale_patch),
+        ):
+            stale = cached_archive(self.stock, self.cache)
+        stale_reference, = self.cache.glob("*.json")
+
+        staging = self.cache / "launch-unfinished"
+        staging.mkdir()
+        (staging / "app.asar").write_bytes(b"partially written")
+        orphan = self.cache / f"{'c' * 64}-{stale_patch}.asar"
+        orphan.write_bytes(b"no provenance")
+        unrelated = self.cache / f"{'d' * 64}-{stale_patch}.json"
+        unrelated.write_text("user note")
+        linked = self.cache / f"{'e' * 64}-{stale_patch}.json"
+        linked.symlink_to(unrelated)
+
+        with (
+            patch("patcher.build.SUPPORTED_RELEASES", (release,)),
+            patch("patcher.launch.patch_digest", return_value=current_patch),
+            patch("patcher.launch.desktop_environment", return_value=self.environment),
+            patch("patcher.launch.running_desktop", return_value=False),
+        ):
+            self.assertEqual(launch(self.stock, args, disabled=False), 0)
+
+        self.assertFalse(stale.exists())
+        self.assertFalse(stale_reference.exists())
+        self.assertEqual(len(list(self.cache.glob(f"*-{current_patch}.asar"))), 1)
+        self.assertEqual(len(list(self.cache.glob(f"*-{current_patch}.json"))), 1)
+        self.assertTrue((staging / "app.asar").is_file())
+        self.assertTrue(orphan.exists())
+        self.assertTrue(linked.is_symlink())
+        self.assertEqual(unrelated.read_text(), "user note")
+
+    def test_cache_hit_prunes_stale_references_to_the_current_archive(self) -> None:
+        release = self.cache_fixture()
+        self.fake_bubblewrap()
+        args = self.fake_launcher()
+        current_patch = "f" * 64
+        with (
+            patch("patcher.build.SUPPORTED_RELEASES", (release,)),
+            patch("patcher.launch.patch_digest", return_value=current_patch),
+            patch("patcher.launch.desktop_environment", return_value=self.environment),
+            patch("patcher.launch.running_desktop", return_value=False),
+        ):
+            current = cached_archive(self.stock, self.cache)
+            reference, = self.cache.glob("*.json")
+            obsolete = self.cache / f"{'e' * 64}-{current_patch}.json"
+            payload = json.loads(reference.read_text())
+            payload["artifact"]["inode"] = -1
+            obsolete.write_text(json.dumps(payload))
+            with patch("patcher.build.build") as build:
+                self.assertEqual(launch(self.stock, args, disabled=False), 0)
+            build.assert_not_called()
+        self.assertTrue(current.is_file())
+        self.assertTrue(reference.is_file())
+        self.assertFalse(obsolete.exists())
 
 
 if __name__ == "__main__":
