@@ -8,7 +8,9 @@ import struct
 from typing import BinaryIO
 
 
+# The verified ASAR header is small relative to the archive body.
 HEADER_LIMIT = 4 * 1024 * 1024
+# Stream the body instead of keeping an entire installed archive in memory.
 COPY_BLOCK = 1024 * 1024
 
 

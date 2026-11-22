@@ -29,9 +29,9 @@ class DesktopRelease:
     anchors: tuple[Anchor, ...]
 
 
-# The local session manager serializes launch passes and records account
-# changes in its load epoch. The warmer hook runs only after the resumed
-# query is installed. These aliases are private to this exact archive.
+# These aliases are private to the pinned session-manager chunk.
+# The reference locations are the stock manager's runLaunchPass, wB,
+# gB, and the local-session-stop-all shutdown handler in that chunk.
 STARTUP = (
     b"resumeQuitInterruptedSessionsAtLaunch(e){let t=this.launchPassChain.then((()=>"
     b"this.launchPass.runLaunchPass(e)));return this.launchPassChain=t.catch((()=>void 0)),t}"
@@ -41,20 +41,47 @@ STARTUP_HOOK = (
     b'let claudexLaunchPass=this.launchPassChain.then(async()=>{'
     b'await this.launchPass.runLaunchPass(e);'
     b'await require("./claudex-restore.cjs").restoreAtLaunch(this,e,{'
+    # t.I0() is the signed-in account read by the stock same-account restore.
+    # t.ddt() is the fresh feature-flag check runLaunchPass makes after hydration.
     b'account:()=>t.I0(),flagsReady:()=>t.ddt(),'
+    # gB subscribes to se.u, the organization rule store, until t.H1 elapses.
+    # se.l() is the native availability blocker used by pB/wB.
     b'waitForOrganizationPolicy:()=>gB(t.H1,()=>se.l()==="org_denied"&&se.u.state()==="pending"),'
+    # wB names t.ldt("4267904482") as ccd_remote_control_restore_at_launch_disabled.
     b'canRestore:async()=>se.l()===void 0&&!t.ldt("4267904482")'
+    # runLaunchPass bounds the policy overlay readiness wait with t.ATt and t.H1.
+    # The barrier t.DSt().overlayApplied() fails closed if the overlay isn't ready.
     b'&&await t.ATt(t.DSt().overlayApplied().then(()=>!0,()=>!1),t.H1,!1)'
+    # se.o() is the managed-settings decision; stock requires "allowed".
     b'&&await se.o()==="allowed",'
-    b'hasPendingInput:chat=>t.vI(chat.sessionId,id=>this.sessions.get(id)),'
+    # Both stock quit and launch passes use t.vI to exclude unattended automation.
+    b'isUnattended:chat=>t.vI(chat.sessionId,id=>this.sessions.get(id)),'
+    # wS is the stock restore worktree/path safety probe, including its timeout.
     b'checkWorktree:chat=>wS(()=>this.worktreePool,chat),'
+    # t.UTt sleeps for the stock warm-up slot; t.EEt is Desktop's main logger.
     b'wait:ms=>t.UTt(ms),log:message=>t.EEt.info(message)});'
     b'});return this.launchPassChain=claudexLaunchPass.catch(()=>void 0),claudexLaunchPass}'
 )
 DEFERRED_ROSTER = b"w.some((e=>e.interruptedByQuitAt!==void 0||e.remoteControlLiveAtUpdateQuit!==void 0))&&this.resumeQuitInterruptedSessionsAtLaunch(e)"
 DEFERRED_ROSTER_HOOK = DEFERRED_ROSTER.replace(
-    b"!==void 0))&&",
-    b'!==void 0||require("./claudex-restore.cjs").hasSavedRemoteControl(e)))&&',
+    b"))&&",
+    b'))||require("./claudex-restore.cjs").shouldCheckDeferredRoster(this))&&',
+    1,
+).replace(b"w.some(", b"(w.some(", 1)
+
+# This runs immediately after Desktop marks itself as quitting, before it stops
+# any of the live local workers. _B is the eligibility test already used just
+# below this point by the native update-quit path. The patch leaves the native
+# remoteControlLiveAtUpdateQuit record alone because ordinary quits only mark
+# it if the separate mB experiment (3106428025) is enabled.
+QUIT_CAPTURE = b"this.markAppQuitting();try{let e=performance.now(),r=0,i=0;for(let e of this.heldSessions())"
+QUIT_CAPTURE_HOOK = QUIT_CAPTURE.replace(
+    b";try{",
+    b';try{require("./claudex-restore.cjs").captureAtQuit(this,{'
+    b'account:()=>t.I0(),'
+    b'connected:chat=>_B(chat,t.vI(chat.sessionId,id=>this.held(id))),'
+    b'log:message=>t.EEt.info(message)})}catch{'
+    b't.EEt.warn("[claudex] Remote Control could not inspect the native quit roster")}try{',
     1,
 )
 AFTER_WARM = b"this.deps.remoteControlLifecycle().installRemoteControlProcess(i,W,R.remoteControlReattaching);"
@@ -62,7 +89,7 @@ AFTER_WARM_HOOK = (
     AFTER_WARM
     + b'if((r.fromPage===!0||r.rowOpen===!0)&&!r.adoptOnly&&r.allowFork===void 0){'
     b'void require("./claudex-restore.cjs").restoreAfterOpening('
-    b'i,W,this.deps.remoteControlLifecycle(),'
+    b'this.deps.sessions(),i,W,this.deps.remoteControlLifecycle(),'
     b'()=>a.accountId!==null&&t.I0()===a.accountId&&this.deps.currentAccountId()===a.accountId'
     b'&&this.deps.currentOrgId()===a.orgId&&this.deps.sessions().get(e)===i,'
     b'message=>t.EEt.info(message))}'
@@ -71,7 +98,7 @@ VISIBLE_CHAT = b"this.warmLifecycle.onVisibilityChange(n,r),this.previewIdleMana
 VISIBLE_CHAT_HOOK = (
     VISIBLE_CHAT
     + b'(r&&a.query&&!a.isRunning&&a.homeTenancy&&require("./claudex-restore.cjs").restoreAfterOpening('
-    b'a,a.query,this.remoteControlLifecycle,'
+    b'this.sessions,a,a.query,this.remoteControlLifecycle,'
     b'()=>!this.appQuitting&&this.sessions.get(n)===a&&a.homeTenancy.accountId!==null'
     b'&&t.I0()===a.homeTenancy.accountId&&this.currentAccountId===a.homeTenancy.accountId'
     b'&&this.currentOrgId===a.homeTenancy.orgId,message=>t.EEt.info(message))),'
@@ -85,6 +112,7 @@ SUPPORTED_RELEASES = (
         anchors=(
             Anchor("startup pass", STARTUP, STARTUP_HOOK),
             Anchor("deferred active roster", DEFERRED_ROSTER, DEFERRED_ROSTER_HOOK),
+            Anchor("capture connected chats before stock quit", QUIT_CAPTURE, QUIT_CAPTURE_HOOK),
             Anchor("resumed worker installed", AFTER_WARM, AFTER_WARM_HOOK),
             Anchor("existing worker shown", VISIBLE_CHAT, VISIBLE_CHAT_HOOK),
         ),
@@ -175,22 +203,18 @@ def build(source_path: Path, output_path: Path) -> str:
             return digest
 
 
-@dataclass
-class Arguments(argparse.Namespace):
-    source: Path
-    output: Path
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True, type=Path, help="installed app.asar")
     parser.add_argument("--output", required=True, type=Path, help="new app.asar path; never overwritten")
-    arguments = parser.parse_args(namespace=Arguments(Path(), Path()))
+    arguments = parser.parse_args()
+    source: Path = arguments.source
+    output: Path = arguments.output
     try:
-        digest = build(arguments.source, arguments.output)
+        digest = build(source, output)
     except (OSError, ValueError) as error:
         parser.exit(1, f"ASAR build refused: {error}\n")
-    print(f"{digest}  {arguments.output}")
+    print(f"{digest}  {output}")
 
 
 if __name__ == "__main__":

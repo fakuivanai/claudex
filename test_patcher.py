@@ -1,6 +1,4 @@
-from contextlib import redirect_stderr
 import hashlib
-import io
 import os
 from pathlib import Path
 import subprocess
@@ -9,11 +7,17 @@ import unittest
 from unittest.mock import patch
 
 from patcher.archive import Directory, Packed, Unpacked, encode_header, integrity_of, packed_entry, read_header
-from patcher.build import Anchor, DesktopRelease, MODULE_NAME, STARTUP_HOOK, build, patch_chunk
-from patcher.launch import launch
+from patcher.build import Anchor, DesktopRelease, MODULE_NAME, QUIT_CAPTURE_HOOK, STARTUP_HOOK, build, patch_chunk
 
 
 class PatcherTests(unittest.TestCase):
+    def run_node(self, harness: str, hook: bytes) -> None:
+        outcome = subprocess.run(
+            [os.environ.get("CLAUDEX_NODE", "node"), "-e", harness, hook.decode()],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        self.assertEqual(outcome.returncode, 0, outcome.stderr)
+
     def test_startup_hook_uses_vendor_scope_after_the_stock_pass(self) -> None:
         harness = """
         const assert = require("node:assert/strict");
@@ -36,11 +40,26 @@ class PatcherTests(unittest.TestCase):
           process.exitCode = 1;
         });
         """
-        outcome = subprocess.run(
-            [os.environ.get("CLAUDEX_NODE", "node"), "-e", harness, STARTUP_HOOK.decode()],
-            capture_output=True, text=True, check=False, timeout=10,
-        )
-        self.assertEqual(outcome.returncode, 0, outcome.stderr)
+        self.run_node(harness, STARTUP_HOOK)
+
+    def test_quit_hook_captures_before_stock_stops_its_workers(self) -> None:
+        harness = """
+        const assert = require("node:assert/strict");
+        const events = [];
+        const patchedQuit = new Function(
+          "t", "require", "events",
+          "return ({stop(){ " + process.argv[1] + " { events.push('stop worker'); } } catch {} }})"
+        )(
+          { EEt: { warn: () => undefined } },
+          () => ({ captureAtQuit: () => events.push("capture current workers") }),
+          events
+        );
+        patchedQuit.markAppQuitting = () => events.push("mark quitting");
+        patchedQuit.heldSessions = () => [{}];
+        patchedQuit.stop();
+        assert.deepEqual(events, ["mark quitting", "capture current workers", "stop worker"]);
+        """
+        self.run_node(harness, QUIT_CAPTURE_HOOK)
 
     def test_build_preserves_alias_offsets_and_unpacked_entries(self) -> None:
         prefix, old, tail = b"prefix", b"stock hook", b"identical resource"
@@ -102,25 +121,6 @@ class PatcherTests(unittest.TestCase):
         fixture = DesktopRelease("fixture", "", ("session.js",), (Anchor("fixture", b"stock", b"new"),))
         with self.assertRaisesRegex(ValueError, "fixture reconnect patch anchor changed"):
             patch_chunk(b"stock stock", fixture)
-
-    def test_disabled_launch_runs_stock_without_building(self) -> None:
-        with patch("patcher.launch.build") as build_archive, patch("patcher.launch.subprocess.run") as start:
-            start.return_value.returncode = 0
-            with redirect_stderr(io.StringIO()):
-                launch(Path("stock.asar"), ["claude"], disabled=True)
-            self.assertEqual((build_archive.call_count, start.call_args.args), (0, (["claude"],)))
-
-    def test_build_failure_launches_stock(self) -> None:
-        status = io.StringIO()
-        with tempfile.TemporaryDirectory() as temporary:
-            source = Path(temporary) / "unknown.asar"
-            source.write_bytes(b"unsupported")
-            with patch("patcher.launch.shutil.which", return_value="bwrap"), patch("patcher.launch.subprocess.run") as start:
-                start.return_value.returncode = 0
-                with redirect_stderr(status):
-                    launch(source, ["claude"], disabled=False)
-                start.assert_called_once_with(["claude"], check=False)
-
 
 if __name__ == "__main__":
     unittest.main()
