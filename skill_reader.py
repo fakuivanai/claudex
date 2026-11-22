@@ -9,10 +9,7 @@ import os
 from pathlib import Path
 import stat
 
-
-class SkillProvider(StrEnum):
-    CODEX = "codex"
-    CLAUDE = "claude"
+from models import Provider
 
 
 class SkillScope(StrEnum):
@@ -23,7 +20,7 @@ class SkillScope(StrEnum):
 
 @dataclass(frozen=True)
 class SkillReference:
-    provider: SkillProvider
+    provider: Provider
     scope: SkillScope
     name: str
 
@@ -35,20 +32,15 @@ class SkillDocument:
 
 
 SKILL_SCOPES = {
-    SkillProvider.CODEX: (SkillScope.CODEX_USER, SkillScope.AGENTS_USER),
-    SkillProvider.CLAUDE: (SkillScope.CLAUDE_USER,),
+    Provider.CODEX: (SkillScope.CODEX_USER, SkillScope.AGENTS_USER),
+    Provider.CLAUDE: (SkillScope.CLAUDE_USER,),
 }
+# Skills are returned inline as literal text, so cap the file before reading.
 MAX_SKILL_BYTES = 64 * 1024
-_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+# Follow installed skill directory links. The document itself must be a regular file.
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY
 _FILE_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
 _UNAVAILABLE = {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EACCES, errno.EPERM}
-
-
-def _provider(value: str) -> SkillProvider:
-    try:
-        return SkillProvider(value)
-    except ValueError:
-        raise ValueError("Unknown skill provider") from None
 
 
 def _root(scope: SkillScope) -> Path:
@@ -69,6 +61,8 @@ def _valid_name(name: str) -> bool:
 def _directory(path: str | Path, parent: int | None = None) -> Iterator[int]:
     descriptor = os.open(path, _DIRECTORY_FLAGS, dir_fd=parent)
     try:
+        if os.fstat(descriptor).st_uid != os.getuid():
+            raise PermissionError(errno.EACCES, "Skill directories must be owned by the local user.")
         yield descriptor
     finally:
         os.close(descriptor)
@@ -78,10 +72,9 @@ def _regular_skill(directory: int) -> bool:
     return stat.S_ISREG(os.stat("SKILL.md", dir_fd=directory, follow_symlinks=False).st_mode)
 
 
-def list_skills(provider: str) -> list[SkillReference]:
-    selected = _provider(provider)
+def list_skills(provider: Provider) -> list[SkillReference]:
     skills: list[SkillReference] = []
-    for scope in SKILL_SCOPES[selected]:
+    for scope in SKILL_SCOPES[provider]:
         try:
             with _directory(_root(scope)) as root:
                 for name in sorted(os.listdir(root)):
@@ -90,7 +83,7 @@ def list_skills(provider: str) -> list[SkillReference]:
                     try:
                         with _directory(name, root) as directory:
                             if _regular_skill(directory):
-                                skills.append(SkillReference(selected, scope, name))
+                                skills.append(SkillReference(provider, scope, name))
                     except OSError as error:
                         if error.errno not in _UNAVAILABLE:
                             raise
@@ -100,13 +93,12 @@ def list_skills(provider: str) -> list[SkillReference]:
     return skills
 
 
-def read_skill(provider: str, scope: str, name: str) -> SkillDocument:
-    selected = _provider(provider)
+def read_skill(provider: Provider, scope: str, name: str) -> SkillDocument:
     try:
         skill_scope = SkillScope(scope)
     except ValueError:
         raise ValueError("Unknown skill scope for provider") from None
-    if skill_scope not in SKILL_SCOPES[selected]:
+    if skill_scope not in SKILL_SCOPES[provider]:
         raise ValueError("Unknown skill scope for provider")
     if not _valid_name(name):
         raise ValueError("Invalid skill name")
@@ -134,4 +126,4 @@ def read_skill(provider: str, scope: str, name: str) -> SkillDocument:
         content = data.decode("utf-8")
     except UnicodeDecodeError:
         raise ValueError("Skill document is not valid UTF-8") from None
-    return SkillDocument(SkillReference(selected, skill_scope, name), content)
+    return SkillDocument(SkillReference(provider, skill_scope, name), content)

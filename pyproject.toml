@@ -1,3 +1,31 @@
+[build-system]
+requires = ["setuptools==80.10.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claudex"
+version = "0.1.0"
+description = "Local MCP bridge for Claude Code and Codex Desktop"
+readme = "README.md"
+requires-python = ">=3.12"
+dynamic = ["dependencies"]
+
+[project.scripts]
+claudex = "claudex:main"
+
+[tool.setuptools]
+packages = ["patcher"]
+py-modules = [
+    "claude_desktop", "claude_lifecycle", "claudex", "codex_desktop", "codex_history",
+    "codex_peer", "desktop_environment", "models", "peer_mailbox", "skill_reader",
+]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.in"]}
+
+[tool.setuptools.package-data]
+patcher = ["restore.cjs"]
+
 [tool.mypy]
 python_version = "3.12"
 strict = true

@@ -124,7 +124,8 @@ librt==0.17.0 \
     --hash=sha256:fa9effa057fd97157c3b3f3bd565a0f32d11176861453164e630280f34584ace \
     --hash=sha256:fc93f5a5ce10be674b0707dec0e33fc5f0beb14a5077d103179f3518fcb48a9a \
     --hash=sha256:fd18d1f708f78577556a7d76505048b9e3ad6ff61b8d9c91616a5a3f1e6c770b
-    # via mypy
+    # via
+    #   mypy
 mypy==1.20.1 \
     --hash=sha256:0131edd7eba289973d1ba1003d1a37c426b85cdef76650cd02da6420898a5eb3 \
     --hash=sha256:09d8df92bb25b6065ab91b178da843dda67b33eb819321679a6e98a907ce0e10 \
@@ -170,7 +171,8 @@ mypy==1.20.1 \
     --hash=sha256:f5b84a79070586e0d353ee07b719d9d0a4aa7c8ee90c0ea97747e98cbe193019 \
     --hash=sha256:f8e945b872a05f4fbefabe2249c0b07b6b194e5e11a86ebee9edf855de09806c \
     --hash=sha256:fba3fb0968a7b48806b0c90f38d39296f10766885a94c83bd21399de1e14eb28
-    # via -r requirements-dev.in
+    # via
+    #   -r requirements-dev.in
 mypy-extensions==1.2.0 \
     --hash=sha256:993e7a20aa5671eb41a7132cf555af30062da99729601601b9a8382b11cae768 \
     --hash=sha256:c6e275a07f1c2fc096b62940452d0eaa3f3af7de45d704787866240a7c6d5a51
@@ -180,7 +182,12 @@ mypy-extensions==1.2.0 \
 pathspec==1.1.1 \
     --hash=sha256:17db5ecd524104a120e173814c90367a96a98d07c45b2e10c2f3919fff91bf5a \
     --hash=sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189
-    # via mypy
+    # via
+    #   mypy
+setuptools==80.10.1 \
+    --hash=sha256:bf2e513eb8144c3298a3bd28ab1a5edb739131ec5c22e045ff93cd7f5319703a \
+    --hash=sha256:fc30c51cbcb8199a219c12cc9c281b5925a4978d212f84229c909636d9f6984e
+    # via -r requirements-dev.in
 typing-extensions==4.16.0 \
     --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8 \
     --hash=sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5
