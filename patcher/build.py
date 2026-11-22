@@ -32,10 +32,15 @@ class DesktopRelease:
 # The local session manager serializes launch passes and records account
 # changes in its load epoch. The warmer hook runs only after the resumed
 # query is installed. These aliases are private to this exact archive.
-STARTUP = b"this.launchPass.runLaunchPass(e)"
+STARTUP = (
+    b"resumeQuitInterruptedSessionsAtLaunch(e){let t=this.launchPassChain.then((()=>"
+    b"this.launchPass.runLaunchPass(e)));return this.launchPassChain=t.catch((()=>void 0)),t}"
+)
 STARTUP_HOOK = (
-    STARTUP
-    + b'.then(()=>require("./claudex-restore.cjs").restoreAtLaunch(this,e,{'
+    b'resumeQuitInterruptedSessionsAtLaunch(e){'
+    b'let claudexLaunchPass=this.launchPassChain.then(async()=>{'
+    b'await this.launchPass.runLaunchPass(e);'
+    b'await require("./claudex-restore.cjs").restoreAtLaunch(this,e,{'
     b'account:()=>t.I0(),flagsReady:()=>t.ddt(),'
     b'waitForOrganizationPolicy:()=>gB(t.H1,()=>se.l()==="org_denied"&&se.u.state()==="pending"),'
     b'canRestore:async()=>se.l()===void 0&&!t.ldt("4267904482")'
@@ -43,7 +48,8 @@ STARTUP_HOOK = (
     b'&&await se.o()==="allowed",'
     b'hasPendingInput:chat=>t.vI(chat.sessionId,id=>this.sessions.get(id)),'
     b'checkWorktree:chat=>wS(()=>this.worktreePool,chat),'
-    b'wait:ms=>t.UTt(ms),log:message=>t.EEt.info(message)}))'
+    b'wait:ms=>t.UTt(ms),log:message=>t.EEt.info(message)});'
+    b'});return this.launchPassChain=claudexLaunchPass.catch(()=>void 0),claudexLaunchPass}'
 )
 DEFERRED_ROSTER = b"w.some((e=>e.interruptedByQuitAt!==void 0||e.remoteControlLiveAtUpdateQuit!==void 0))&&this.resumeQuitInterruptedSessionsAtLaunch(e)"
 DEFERRED_ROSTER_HOOK = DEFERRED_ROSTER.replace(

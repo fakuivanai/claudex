@@ -1,17 +1,47 @@
 from contextlib import redirect_stderr
 import hashlib
 import io
+import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from patcher.archive import Directory, Packed, Unpacked, encode_header, integrity_of, packed_entry, read_header
-from patcher.build import Anchor, DesktopRelease, MODULE_NAME, build, patch_chunk
+from patcher.build import Anchor, DesktopRelease, MODULE_NAME, STARTUP_HOOK, build, patch_chunk
 from patcher.launch import launch
 
 
 class PatcherTests(unittest.TestCase):
+    def test_startup_hook_uses_vendor_scope_after_the_stock_pass(self) -> None:
+        harness = """
+        const assert = require("node:assert/strict");
+        const events = [];
+        const vendor = { I0: () => "signed-in account" };
+        const injectedRequire = () => ({
+          restoreAtLaunch: (_manager, epoch, platform) => {
+            events.push([platform.account(), epoch]);
+          },
+        });
+        const owner = new Function(
+          "t", "require", "return ({" + process.argv[1] + "});"
+        )(vendor, injectedRequire);
+        owner.launchPassChain = Promise.resolve();
+        owner.launchPass = { runLaunchPass: async () => events.push("stock") };
+        owner.resumeQuitInterruptedSessionsAtLaunch(3).then(() => {
+          assert.deepEqual(events, ["stock", ["signed-in account", 3]]);
+        }).catch(error => {
+          console.error(error);
+          process.exitCode = 1;
+        });
+        """
+        outcome = subprocess.run(
+            [os.environ.get("CLAUDEX_NODE", "node"), "-e", harness, STARTUP_HOOK.decode()],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        self.assertEqual(outcome.returncode, 0, outcome.stderr)
+
     def test_build_preserves_alias_offsets_and_unpacked_entries(self) -> None:
         prefix, old, tail = b"prefix", b"stock hook", b"identical resource"
         replacement = b"patched hook"
