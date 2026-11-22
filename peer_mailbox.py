@@ -4,7 +4,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
-from models import PEER_MESSAGE, PeerMessage as PeerMessage, Provider as Provider, Sender as Sender
+from models import PEER_MESSAGE, PeerMessage
 
 
 @dataclass(frozen=True, slots=True)

@@ -7,11 +7,11 @@ import unittest
 import uuid
 
 import codex_history as history
-from codex_peer import PeerSender
+from models import CodexChatId, Provider, Sender
 
 
-def chat_id(number: int) -> str:
-    return str(uuid.UUID(int=number))
+def chat_id(number: int) -> CodexChatId:
+    return CodexChatId(str(uuid.UUID(int=number)))
 
 
 def fixture_items() -> tuple[str, list[dict[str, object]]]:
@@ -158,7 +158,8 @@ class CodexHistoryTest(unittest.TestCase):
         if not isinstance(peer, history.PeerOutput):
             self.fail("Expected attributed peer output from the recorded turn")
         self.assertEqual(
-            peer.message.sender, PeerSender("Claude fixture", "claude", "local_00000000-0000-4000-8000-000000000001"),
+            peer.message.sender,
+            Sender(Provider.CLAUDE, "local_00000000-0000-4000-8000-000000000001", "Claude fixture"),
         )
 
     def test_history_pages_list_each_turn_once(self) -> None:
@@ -188,6 +189,33 @@ class CodexHistoryTest(unittest.TestCase):
         self.add_turn(1, 11, [{"type": "agentMessage", "text": "a" * (history.MAX_TEXT_CHARS + 1)}])
         message, = history.read_chat(chat_id(1), root=self.root).turns[0].messages
         self.assertEqual(message.preview, history.VisibleText("a" * history.MAX_TEXT_CHARS, True))
+
+    def test_turn_cap_keeps_original_user_message_and_newest_replies(self) -> None:
+        self.add_chat(1)
+        items: list[dict[str, object]] = [
+            {"type": "userMessage", "content": [{"type": "text", "text": "Original request"}]},
+        ]
+        items.extend({"type": "agentMessage", "text": f"Reply {number}"} for number in range(10))
+        self.add_turn(1, 11, items)
+        turn, = history.read_chat(chat_id(1), root=self.root).turns
+        self.assertEqual(
+            [message.preview.text for message in turn.messages],
+            ["Original request", *(f"Reply {number}" for number in range(3, 10))],
+        )
+        self.assertTrue(turn.over_message_cap)
+        self.assertEqual(turn.skipped_records, 0)
+
+    def test_skipped_records_do_not_count_as_visible_overflow(self) -> None:
+        self.add_chat(1)
+        self.add_turn(1, 11, [
+            {"type": "agentMessage", "text": "Visible"},
+            {"type": "agentMessage", "text": 7},
+            {"type": "reasoning", "summary": ["hidden"]},
+        ])
+        turn, = history.read_chat(chat_id(1), root=self.root).turns
+        self.assertEqual([message.preview.text for message in turn.messages], ["Visible"])
+        self.assertFalse(turn.over_message_cap)
+        self.assertEqual(turn.skipped_records, 1)
 
     def test_read_only_history_sees_committed_wal(self) -> None:
         self.state.execute("PRAGMA journal_mode=WAL")

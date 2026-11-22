@@ -1,5 +1,5 @@
 {
-  "source": "Sanitized from a disposable Codex Desktop 26.1103.60933 chat, thread_history_1.sqlite.",
+  "source": "Sanitized from a disposable Codex Desktop 26.1103.60933 chat, thread_history_1.sqlite. Peer output translated into the current Claudex envelope.",
   "status": "completed",
   "items": [
     {
@@ -8,8 +8,8 @@
         "type": "functionCallOutput",
         "id": "fco_fixture",
         "name": "peer_message",
-        "namespace": "thread_bridge",
-        "output": "{\"schema\":\"thread-bridge.peer-message/v1\",\"message_id\":\"fixture-message\",\"sender\":{\"peer\":\"Claude fixture\",\"provider\":\"claude\",\"host\":\"local\",\"profile\":\"current local app\",\"thread\":\"local_00000000-0000-4000-8000-000000000001\"},\"untrusted_peer_content\":\"Fixture peer text.\"}"
+        "namespace": "claudex",
+        "output": "{\"schema\":\"claudex.peer-message/v1\",\"message_id\":\"00000000-0000-4000-8000-000000000005\",\"sender\":{\"provider\":\"claude\",\"chat_id\":\"local_00000000-0000-4000-8000-000000000001\",\"title\":\"Claude fixture\"},\"untrusted_peer_content\":\"Fixture peer text.\"}"
       }
     },
     {

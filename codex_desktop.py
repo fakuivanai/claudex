@@ -17,16 +17,40 @@ from pathlib import Path
 import socket
 import struct
 import time
+from typing import Annotated, NewType
 import uuid
 
-from codex_peer import PeerMessage as PeerMessage, PeerSender as PeerSender, ToolOutput, tool_output
+from pydantic import AliasPath, BaseModel, BeforeValidator, ConfigDict, Field, StringConstraints, TypeAdapter
+
+from codex_peer import ToolOutput, tool_output
+from models import CodexChatId, PeerMessage, parse_uuid
 
 
+# Reject oversized frame lengths before allocating storage for the payload.
 MAX_FRAME_BYTES = 4 * 1024 * 1024
+# Bound discovery and delivery together, including responses from renderer clients.
 TIMEOUT_SECONDS = 12.0
+# The router bounds a single request independently of the client deadline.
+ROUTER_TIMEOUT_MILLISECONDS = 10_000
+# Read large frames in chunks and keep one socket read bounded.
+READ_CHUNK_BYTES = 64 * 1024
+# Request and turn identifiers are opaque strings, including vendor-prefixed IDs.
+WireIdentifier = Annotated[str, StringConstraints(min_length=1, max_length=128)]
+ClientId = NewType("ClientId", str)
+
+
+def parse_client_id(value: object) -> ClientId:
+    return ClientId(parse_uuid(value))
+
+
+CheckedClientId = Annotated[ClientId, BeforeValidator(parse_client_id)]
 
 
 class DesktopError(ValueError):
+    pass
+
+
+class OwnerNotLoaded(DesktopError):
     pass
 
 
@@ -35,26 +59,20 @@ class UnconfirmedDelivery(DesktopError):
 
 
 @dataclass(frozen=True)
-class Ready:
-    chat_id: str
-    owner_client_id: str
-
-    def to_wire(self) -> dict[str, object]:
-        return {
-            "state": "ready",
-            "chat_id": self.chat_id,
-            "owner_client_id": self.owner_client_id,
-            "supports_untrusted_app_input": True,
-        }
-
-
-@dataclass(frozen=True)
 class Submitted:
-    chat_id: str
+    chat_id: CodexChatId
     turn_id: str
 
     def to_wire(self) -> dict[str, object]:
         return {"state": "submitted", "chat_id": self.chat_id, "turn_id": self.turn_id}
+
+
+@dataclass(frozen=True)
+class NotLoaded:
+    chat_id: CodexChatId
+
+    def to_wire(self) -> dict[str, object]:
+        return {"state": "not_loaded", "chat_id": self.chat_id, "error": "Open this chat in Codex Desktop before sending."}
 
 
 @dataclass(frozen=True)
@@ -73,24 +91,49 @@ class Unknown:
         return {"state": "unknown", "error": self.error}
 
 
-def parse_chat_identifier(value: object) -> str:
-    if isinstance(value, str):
-        try:
-            return str(uuid.UUID(value))
-        except ValueError:
-            pass
-    raise DesktopError("Expected a Codex Desktop chat UUID")
+type Delivery = Submitted | NotLoaded | Refused | Unknown
 
 
 class Method(Enum):
-    INITIALIZE = "initialize"
-    DISCOVER_OWNER = "thread-owner-discovery"
-    START_TURN = "thread-follower-start-turn"
+    # The initialization request precedes negotiation of renderer capabilities.
+    INITIALIZE = ("initialize", 0)
+    # Discovery version 1 reports the owner's untrusted-app-input capability.
+    DISCOVER_OWNER = ("thread-owner-discovery", 1)
+    # Start-turn version 2 accepts output separate from user input.
+    START_TURN = ("thread-follower-start-turn", 2)
+
+    def __init__(self, wire_name: str, version: int) -> None:
+        self.wire_name = wire_name
+        self.version = version
 
 
-@dataclass(frozen=True)
-class DiscoveryRequest:
-    request_id: str
+class RouterPayload(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+
+class DiscoveryRequest(RouterPayload):
+    request_id: WireIdentifier = Field(validation_alias="requestId")
+
+
+class ResponsePayload(RouterPayload):
+    request_id: WireIdentifier = Field(validation_alias="requestId")
+    result_type: str = Field(validation_alias="resultType")
+    method: str | None = None
+    handled_by: object = Field(default=None, validation_alias="handledByClientId")
+    error: object = None
+    result: object = None
+
+
+class Initialization(RouterPayload):
+    client_id: CheckedClientId = Field(validation_alias="clientId")
+
+
+class OwnerCapability(RouterPayload):
+    supports_tool_output: bool = Field(default=False, validation_alias="supportsUntrustedAppInput")
+
+
+class StartedTurn(RouterPayload):
+    turn_id: WireIdentifier = Field(validation_alias=AliasPath("result", "turn", "id"))
 
 
 @dataclass(frozen=True)
@@ -99,93 +142,58 @@ class RouterRejection:
     no_owner: bool
 
 
-@dataclass(frozen=True)
-class Initialization:
-    client_id: str
-
-
-@dataclass(frozen=True)
-class OwnerDiscovery:
-    owner_id: str
-    supports_tool_output: bool
-
-
-@dataclass(frozen=True)
-class StartedTurn:
-    turn_id: str
-
-
-type Reply = Initialization | OwnerDiscovery | StartedTurn
+type Reply = Initialization | OwnerCapability | StartedTurn
 
 
 @dataclass(frozen=True)
 class RouterResponse:
     request_id: str
-    handled_by: str
+    handled_by: ClientId
     reply: Reply
 
 
 type IncomingFrame = DiscoveryRequest | RouterRejection | RouterResponse
-
-
-def object_fields(value: object) -> dict[object, object]:
-    if isinstance(value, dict):
-        return value
-    raise DesktopError("Malformed Codex Desktop IPC response")
-
-
-def frame_identifier(value: object) -> str:
-    if isinstance(value, str) and 0 < len(value) <= 128:
-        return value
-    raise DesktopError("Invalid identifier in Codex Desktop IPC response")
+FRAME_BODY = TypeAdapter(dict[str, object])
 
 
 def parse_router_frame(payload: bytes) -> IncomingFrame | None:
     try:
-        data: object = json.loads(payload)
-    except (ValueError, RecursionError) as error:
+        fields = FRAME_BODY.validate_json(payload, strict=True)
+        match fields.get("type"):
+            case "client-discovery-request":
+                return DiscoveryRequest.model_validate(fields)
+            case "response":
+                response = ResponsePayload.model_validate(fields)
+            case _:
+                return None
+
+        if response.result_type != "success":
+            no_owner = response.error in ("no-client-found", "client-not-found") and response.handled_by is None
+            return RouterRejection(response.request_id, no_owner)
+
+        reply: Reply
+        match response.method:
+            case Method.INITIALIZE.wire_name:
+                reply = Initialization.model_validate(response.result)
+            case Method.DISCOVER_OWNER.wire_name:
+                reply = OwnerCapability.model_validate(response.result)
+            case Method.START_TURN.wire_name:
+                reply = StartedTurn.model_validate(response.result)
+            case _:
+                return None
+        return RouterResponse(response.request_id, parse_client_id(response.handled_by), reply)
+    except ValueError as error:
         raise DesktopError("Malformed Codex Desktop IPC response") from error
-    fields = object_fields(data)
-    kind = fields.get("type")
-    if kind == "client-discovery-request":
-        return DiscoveryRequest(frame_identifier(fields.get("requestId")))
-    if kind != "response":
-        return None
-    request_id = frame_identifier(fields.get("requestId"))
-    if fields.get("resultType") != "success":
-        no_owner = (
-            fields.get("error") in ("no-client-found", "client-not-found")
-            and fields.get("handledByClientId") is None
-        )
-        return RouterRejection(request_id, no_owner)
-    method = fields.get("method")
-    if method not in (Method.INITIALIZE.value, Method.DISCOVER_OWNER.value, Method.START_TURN.value):
-        return None
-    handled_by = parse_chat_identifier(fields.get("handledByClientId"))
-    result = object_fields(fields.get("result"))
-    reply: Reply
-    match method:
-        case Method.INITIALIZE.value:
-            reply = Initialization(parse_chat_identifier(result.get("clientId")))
-        case Method.DISCOVER_OWNER.value:
-            reply = OwnerDiscovery(handled_by, result.get("supportsUntrustedAppInput") is True)
-        case Method.START_TURN.value:
-            start_reply = object_fields(result.get("result"))
-            turn_fields = object_fields(start_reply.get("turn"))
-            reply = StartedTurn(frame_identifier(turn_fields.get("id")))
-        case _:
-            return None
-    return RouterResponse(request_id, handled_by, reply)
 
 
 class DesktopClient:
     def __init__(self, connection: socket.socket) -> None:
         self.connection = connection
         self.deadline = time.monotonic() + TIMEOUT_SECONDS
-        self.client_id = "initializing-client"
+        self.client_id: ClientId | None = None
 
     def initialize(self) -> None:
-        response = self.request(Method.INITIALIZE, 0, {"clientType": "claudex"})
+        response = self.request(Method.INITIALIZE, {"clientType": "claudex"})
         if not isinstance(response.reply, Initialization) or response.handled_by != response.reply.client_id:
             raise DesktopError("Codex Desktop router did not establish a client identity")
         self.client_id = response.reply.client_id
@@ -201,7 +209,7 @@ class DesktopClient:
         chunks = bytearray()
         while len(chunks) < count:
             self.set_timeout()
-            chunk = self.connection.recv(min(count - len(chunks), 65536))
+            chunk = self.connection.recv(min(count - len(chunks), READ_CHUNK_BYTES))
             if not chunk:
                 raise DesktopError("Codex Desktop IPC disconnected")
             chunks.extend(chunk)
@@ -220,9 +228,7 @@ class DesktopClient:
         self.set_timeout()
         self.connection.sendall(struct.pack("<I", len(payload)) + payload)
 
-    def request(
-        self, method: Method, version: int, parameters: dict[str, object], *, target: str | None = None,
-    ) -> RouterResponse:
+    def request(self, method: Method, parameters: dict[str, object], *, target: ClientId | None = None) -> RouterResponse:
         request_id = str(uuid.uuid4())
         try:
             remaining = self.set_timeout()
@@ -231,11 +237,11 @@ class DesktopClient:
         frame: dict[str, object] = {
             "type": "request",
             "requestId": request_id,
-            "sourceClientId": self.client_id,
-            "method": method.value,
+            "sourceClientId": self.client_id or "initializing-client",
+            "method": method.wire_name,
             "params": parameters,
-            "version": version,
-            "timeoutMs": min(10000, max(1, int(remaining * 1000))),
+            "version": method.version,
+            "timeoutMs": min(ROUTER_TIMEOUT_MILLISECONDS, max(1, int(remaining * 1000))),
         }
         if target is not None:
             frame["targetClientId"] = target
@@ -256,31 +262,28 @@ class DesktopClient:
             raise failure("Codex Desktop IPC closed, timed out, or returned invalid data") from error
         if isinstance(incoming, RouterRejection):
             if incoming.no_owner:
-                raise DesktopError("Codex Desktop has no loaded owner for that local chat")
+                raise OwnerNotLoaded("Codex Desktop has no loaded owner for that local chat")
             failure = UnconfirmedDelivery if method is Method.START_TURN else DesktopError
             raise failure("Codex Desktop did not confirm the request")
         if target is not None and incoming.handled_by != target:
             raise UnconfirmedDelivery("Codex Desktop acknowledgement did not match the request")
         return incoming
 
-    def owner(self, chat_id: str) -> str:
-        response = self.request(
-            Method.DISCOVER_OWNER, 1, {"hostId": "local", "conversationId": chat_id},
-        )
+    def owner(self, chat_id: CodexChatId) -> ClientId:
+        response = self.request(Method.DISCOVER_OWNER, {"hostId": "local", "conversationId": chat_id})
         reply = response.reply
-        if not isinstance(reply, OwnerDiscovery):
+        if not isinstance(reply, OwnerCapability):
             raise DesktopError("Codex Desktop acknowledgement did not match owner discovery")
-        if reply.owner_id == self.client_id:
+        if response.handled_by == self.client_id:
             raise DesktopError("Codex Desktop returned the relay as chat owner")
         if not reply.supports_tool_output:
             raise DesktopError("Codex Desktop owner does not advertise untrusted tool input support")
-        return reply.owner_id
+        return response.handled_by
 
-    def deliver(self, chat_id: str, output: ToolOutput) -> Submitted:
+    def deliver(self, chat_id: CodexChatId, output: ToolOutput) -> Submitted:
         owner = self.owner(chat_id)
         response = self.request(
             Method.START_TURN,
-            2,
             {
                 "conversationId": chat_id,
                 "turnStart": {"request": {"threadId": chat_id, "input": [], "toolOutput": output}},
@@ -310,24 +313,13 @@ def desktop_client(socket_path: Path | None) -> Iterator[DesktopClient]:
         yield client
 
 
-def owner(chat_id: str, *, socket_path: Path | None = None) -> Ready | Refused:
-    """Read the loaded local chat owner and its untrusted-input capability."""
-    try:
-        chat_id = parse_chat_identifier(chat_id)
-        with desktop_client(socket_path) as client:
-            return Ready(chat_id, client.owner(chat_id))
-    except DesktopError as error:
-        return Refused(str(error))
-
-
-def deliver(
-    chat_id: str, message: PeerMessage, *, socket_path: Path | None = None,
-) -> Submitted | Refused | Unknown:
+def deliver(chat_id: CodexChatId, message: PeerMessage, *, socket_path: Path | None = None) -> Delivery:
     """Submit an already-authorized peer message through the existing owner."""
     try:
-        chat_id = parse_chat_identifier(chat_id)
         with desktop_client(socket_path) as client:
             return client.deliver(chat_id, tool_output(message))
+    except OwnerNotLoaded:
+        return NotLoaded(chat_id)
     except UnconfirmedDelivery as error:
         return Unknown(str(error))
     except DesktopError as error:

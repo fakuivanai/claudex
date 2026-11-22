@@ -1,37 +1,29 @@
 """Launch the signed-in Claude Desktop and open native Code links."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import time
 from urllib.parse import urlencode
 
 import claude_desktop
-from claude_desktop import ClaudeChatId, ClaudeDesktopError, CodexNoticeSender, LiveChat, NoticeStatus
+from claude_desktop import ClaudeDesktopError, LiveChat, NoticeStatus
+from desktop_environment import desktop_environment
+from models import ClaudeChatId, Sender
 
 
+# Desktop may take several seconds to initialize a cold Claude Code worker.
 OPEN_TIMEOUT = 18.0
-
-
-class LaunchStatus(StrEnum):
-    REQUESTED = "launch_requested"
-
-
-class DraftStatus(StrEnum):
-    REQUESTED = "draft_requested"
+# Poll the local registry without contending with the worker's startup.
+INBOX_POLL_INTERVAL = 0.25
 
 
 class WakeStatus(StrEnum):
     ALREADY_RUNNING = "already_running"
     INBOX_READY = "inbox_ready"
     WAITING_FOR_INBOX = "waiting_for_inbox"
-
-
-class StoredStatus(StrEnum):
-    STORED = "stored"
 
 
 @dataclass(frozen=True)
@@ -42,15 +34,11 @@ class WakeResult:
 
 @dataclass(frozen=True)
 class StoredNotice:
-    message_id: str
     reason: str
-    status: StoredStatus = field(default=StoredStatus.STORED, init=False)
-    opened_saved_chat: bool = field(default=False, init=False)
 
 
 @dataclass(frozen=True)
 class AttemptedNotice:
-    message_id: str
     status: NoticeStatus
     opened_saved_chat: bool
 
@@ -66,29 +54,24 @@ class _ReadyInbox:
 
 def _launcher() -> Path:
     configured = os.environ.get("CLAUDEX_CLAUDE_LAUNCHER")
-    default = Path.home() / ".local" / "bin" / "claude-desktop"
-    if configured:
-        candidate = Path(configured)
-    else:
-        fallback = shutil.which("claude-desktop") if not default.is_file() else None
-        candidate = Path(fallback) if fallback else default
-    if not candidate.is_absolute() or not candidate.is_file() or not os.access(candidate, os.X_OK):
+    candidate = Path(configured) if configured else None
+    if candidate is None or not candidate.is_absolute() or not candidate.is_file() or not os.access(candidate, os.X_OK):
         raise ClaudeDesktopError("Set CLAUDEX_CLAUDE_LAUNCHER to the absolute path of your executable Claude Desktop launcher.")
     return candidate
 
 
-def launch(url: str | None = None) -> LaunchStatus:
+def launch(url: str | None = None) -> None:
     arguments = [str(_launcher())]
     if url is not None:
         arguments.append(url)
     try:
+        environment = desktop_environment()
         subprocess.Popen(
             arguments, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            cwd=environment["HOME"], env=environment, start_new_session=True,
         )
     except OSError as error:
         raise ClaudeDesktopError("Could not launch Claude Desktop") from error
-    return LaunchStatus.REQUESTED
 
 
 def validate_saved(target: ClaudeChatId) -> None:
@@ -104,7 +87,7 @@ def wait_for_inbox(target: ClaudeChatId, timeout: float = OPEN_TIMEOUT) -> LiveC
                 return live
         if time.monotonic() >= deadline:
             return None
-        time.sleep(0.25)
+        time.sleep(INBOX_POLL_INTERVAL)
 
 
 def draft_url(prompt: str, folder: str | None = None) -> str:
@@ -119,16 +102,14 @@ def draft_url(prompt: str, folder: str | None = None) -> str:
     return "claude://code/new?" + urlencode(parameters)
 
 
-def open_draft(prompt: str, folder: str | None = None) -> DraftStatus:
+def open_draft(prompt: str, folder: str | None = None) -> None:
     launch(draft_url(prompt, folder))
-    return DraftStatus.REQUESTED
 
 
 def _ensure_inbox(target: ClaudeChatId) -> _ReadyInbox | None:
     live = wait_for_inbox(target, timeout=0)
     if live is not None:
         return _ReadyInbox(live, opened_saved_chat=False)
-    validate_saved(target)
     # Desktop 5.11492.5 accepts its own local ID here and keeps its own runtime.
     launch("claude://code/continue?" + urlencode({"session": target}))
     live = wait_for_inbox(target)
@@ -136,16 +117,17 @@ def _ensure_inbox(target: ClaudeChatId) -> _ReadyInbox | None:
 
 
 def wake(target: ClaudeChatId) -> WakeResult:
+    validate_saved(target)
     ready = _ensure_inbox(target)
     if ready is None:
         return WakeResult(target, WakeStatus.WAITING_FOR_INBOX)
     return WakeResult(target, WakeStatus.INBOX_READY if ready.opened_saved_chat else WakeStatus.ALREADY_RUNNING)
 
 
-def notify(target: ClaudeChatId, message_id: str, *, sender: CodexNoticeSender | None = None) -> NoticeResult:
+def notify(target: ClaudeChatId, message_id: str, *, sender: Sender) -> NoticeResult:
     """Notify the exact live inbox, or leave the message stored until it appears."""
     ready = _ensure_inbox(target)
     if ready is None:
-        return StoredNotice(message_id, "No live inbox appeared after requesting the saved chat.")
+        return StoredNotice("No live inbox appeared after requesting the saved chat.")
     status = claude_desktop.submit_notice(ready.live, message_id, sender)
-    return AttemptedNotice(message_id, status, ready.opened_saved_chat)
+    return AttemptedNotice(status, ready.opened_saved_chat)

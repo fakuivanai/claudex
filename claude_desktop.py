@@ -5,25 +5,24 @@ from enum import StrEnum
 import json
 import os
 from pathlib import Path
-import re
 import socket
-from typing import Annotated, Literal, NewType, TypeVar
+from typing import Annotated, Literal, TypeVar
 
 from claude_agent_sdk import SessionMessage, get_session_messages
-from pydantic import Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, TypeAdapter, ValidationError
 
+from models import ClaudeChatId, Sender, UUIDText, parse_claude_chat_id, parse_uuid
 
-UUID_PATTERN = r"^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$"
-CHAT_PATTERN = "^local_" + UUID_PATTERN[1:]
-MESSAGE_PATTERN = r"[A-Za-z0-9_-]+"
+# Keep the title short inside the native one-line mailbox notice.
 MAX_NOTICE_TITLE = 120
+# Bound the visible local transcript preview returned by one MCP call.
 MAX_HISTORY_MESSAGES = 100
+# A single transcript entry may include a much larger pasted document.
 MAX_HISTORY_TEXT = 4000
+# Keep external titles literal inside Claude Code's XML-like peer message wrapper.
 NOTICE_ESCAPES = str.maketrans({"<": "\\u003c", ">": "\\u003e", "&": "\\u0026", "[": "\\u005b", "]": "\\u005d"})
 
-ClaudeChatId = NewType("ClaudeChatId", str)
-BackendId = Annotated[str, Field(pattern=UUID_PATTERN)]
-DesktopId = Annotated[ClaudeChatId, Field(pattern=CHAT_PATTERN)]
+DesktopId = Annotated[ClaudeChatId, BeforeValidator(parse_claude_chat_id)]
 
 
 class ClaudeDesktopError(RuntimeError):
@@ -33,6 +32,24 @@ class ClaudeDesktopError(RuntimeError):
 class Liveness(StrEnum):
     PROCESS_VISIBLE = "process_visible"
     INBOX_PRESENT = "inbox_present"
+    SAVED = "saved"
+
+
+class WorkerStatus(StrEnum):
+    IDLE = "idle"
+    RUNNING = "running"
+    WORKING = "working"
+    BUSY = "busy"
+    WAITING = "waiting"
+
+
+def worker_status(value: object) -> WorkerStatus | None:
+    if isinstance(value, str):
+        try:
+            return WorkerStatus(value)
+        except ValueError:
+            pass
+    return None
 
 
 class NoticeStatus(StrEnum):
@@ -49,7 +66,7 @@ class MessageRole(StrEnum):
 class ClaudeChat:
     id: ClaudeChatId
     title: str
-    status: str
+    status: WorkerStatus | None
     liveness: Liveness
 
 
@@ -66,6 +83,17 @@ class HistoryMessage:
     text: str
 
 
+class TranscriptContent(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True)
+    content: str | list[object]
+
+
+class TranscriptText(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True)
+    type: Literal["text"]
+    text: str
+
+
 @dataclass(frozen=True)
 class ClaudeHistory:
     chat: ClaudeChat
@@ -73,16 +101,11 @@ class ClaudeHistory:
 
 
 @dataclass(frozen=True)
-class CodexNoticeSender:
-    id: str
-    title: str
-
-
-@dataclass(frozen=True)
 class SavedChat:
     id: Annotated[DesktopId, Field(alias="sessionId")]
     archived: Annotated[bool, Field(alias="isArchived")]
-    backend_id: Annotated[BackendId | None, Field(alias="cliSessionId")] = None
+    backend_id: Annotated[UUIDText | None, Field(alias="cliSessionId")] = None
+    archived_backend_id: Annotated[UUIDText | None, Field(alias="unarchivedCliSessionId")] = None
     title: str | None = None
 
 
@@ -91,23 +114,17 @@ class RuntimeMarker:
     entrypoint: Literal["claude-desktop"]
     kind: Literal["interactive"]
     id: Annotated[DesktopId, Field(alias="hostSessionId")]
-    backend_id: Annotated[BackendId, Field(alias="sessionId")]
+    backend_id: Annotated[UUIDText, Field(alias="sessionId")]
     process_id: Annotated[int, Field(alias="pid", gt=0)]
     process_domain: Annotated[str, Field(alias="pidDomain")]
     inbox_path: Annotated[str | None, Field(alias="messagingSocketPath")] = None
-    status: str | None = None
+    status: Annotated[WorkerStatus | None, BeforeValidator(worker_status)] = None
     name: str | None = None
 
 
 SAVED_CHAT = TypeAdapter(SavedChat)
 RUNTIME_MARKER = TypeAdapter(RuntimeMarker)
 Record = TypeVar("Record", SavedChat, RuntimeMarker)
-
-
-def parse_chat_identifier(value: str) -> ClaudeChatId:
-    if not re.fullmatch(CHAT_PATTERN, value):
-        raise ValueError("Use the exact local Claude Desktop chat ID.")
-    return ClaudeChatId(value)
 
 
 def read_record(path: Path, schema: TypeAdapter[Record]) -> Record | None:
@@ -117,13 +134,13 @@ def read_record(path: Path, schema: TypeAdapter[Record]) -> Record | None:
         return None
 
 
-def saved_records(target: ClaudeChatId) -> list[SavedChat]:
+def saved_records(target: ClaudeChatId, *, include_archived: bool = False) -> list[SavedChat]:
     config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
     registry = config / "Claude" / "claude-code-sessions"
     records: list[SavedChat] = []
     for path in registry.glob(f"*/*/{target}.json"):
         record = read_record(path, SAVED_CHAT)
-        if record is not None and record.id == target and not record.archived:
+        if record is not None and record.id == target and (include_archived or not record.archived):
             records.append(record)
     return records
 
@@ -158,7 +175,7 @@ def _matching_chat(path: Path, machine: str, namespace: str) -> LiveChat | None:
     if title is None:
         return None
     liveness = Liveness.PROCESS_VISIBLE if process_visible else Liveness.INBOX_PRESENT
-    return LiveChat(ClaudeChat(marker.id, title, marker.status or "unknown", liveness), marker.backend_id, inbox)
+    return LiveChat(ClaudeChat(marker.id, title, marker.status, liveness), marker.backend_id, inbox)
 
 
 def live_sessions() -> list[LiveChat]:
@@ -184,70 +201,74 @@ def list_chats() -> list[ClaudeChat]:
 def sender() -> ClaudeChat:
     # Claude Code provides the startup UUID to each stdio MCP process:
     # https://code.claude.com/docs/en/env-vars
-    backend_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    if not re.fullmatch(UUID_PATTERN, backend_id):
-        raise ClaudeDesktopError("Claude Code did not provide a session ID to this MCP process")
+    try:
+        backend_id = parse_uuid(os.environ.get("CLAUDE_CODE_SESSION_ID"))
+    except ValueError:
+        raise ClaudeDesktopError("Claude Code did not provide a session ID to this MCP process") from None
     matching = [live.chat for live in live_sessions() if live.backend_id == backend_id]
     if len(matching) != 1:
         raise ClaudeDesktopError("Claude Code's MCP session ID no longer identifies one live Desktop chat. Reconnect the MCP server")
     return matching[0]
 
 
-def _visible_text(content: object) -> str:
+def _visible_text(content: str | list[object]) -> str:
     if isinstance(content, str):
         return content[:MAX_HISTORY_TEXT]
-    if not isinstance(content, list):
-        return ""
     text: list[str] = []
     for part in content:
-        if isinstance(part, dict) and part.get("type") == "text":
-            value: object = part.get("text")
-            if isinstance(value, str):
-                text.append(value[:MAX_HISTORY_TEXT])
+        try:
+            text.append(TranscriptText.model_validate(part).text[:MAX_HISTORY_TEXT])
+        except ValidationError:
+            continue
     return "\n".join(text)[:MAX_HISTORY_TEXT]
 
 
 def _history_message(row: SessionMessage) -> HistoryMessage | None:
-    message: object = row.message
-    if not isinstance(message, dict):
+    try:
+        message = TranscriptContent.model_validate(row.message)
+    except ValidationError:
         return None
-    return HistoryMessage(MessageRole(row.type), _visible_text(message.get("content")))
+    return HistoryMessage(MessageRole(row.type), _visible_text(message.content))
 
 
-def read_chat(target: ClaudeChatId, limit: int = 20) -> ClaudeHistory:
-    if not 1 <= limit <= MAX_HISTORY_MESSAGES:
-        raise ValueError(f"Use a Claude history limit from 1 to {MAX_HISTORY_MESSAGES}.")
+def read_chat(target: ClaudeChatId, limit: int, *, include_archived: bool = False) -> ClaudeHistory:
     live = next((session for session in live_sessions() if session.chat.id == target), None)
-    if live is None:
-        raise ValueError("Open the exact Claude Code Desktop chat before reading it.")
+    if live is not None:
+        chat, backend_id = live.chat, live.backend_id
+    else:
+        records = saved_records(target, include_archived=include_archived)
+        backends = {
+            backend for record in records
+            if (backend := record.backend_id or record.archived_backend_id) is not None
+        }
+        if len(backends) != 1:
+            raise ValueError("No unique saved Claude Desktop transcript matches this chat.")
+        backend_id = backends.pop()
+        titles = {record.title for record in records if record.title}
+        title = titles.pop() if len(titles) == 1 else str(target)
+        chat = ClaudeChat(target, title, None, Liveness.SAVED)
     # The SDK resolves a project from the exact UUID and reconstructs the current branch.
     # Its limit starts at the beginning, so apply our window from the end instead.
-    rows = get_session_messages(live.backend_id)
+    rows = get_session_messages(backend_id)
     messages = tuple(
         message for row in rows[-limit:]
-        if row.session_id == live.backend_id and (message := _history_message(row)) is not None
+        if row.session_id == backend_id and (message := _history_message(row)) is not None
     )
-    return ClaudeHistory(live.chat, messages)
+    return ClaudeHistory(chat, messages)
 
 
-def notice_text(message_id: str, sender: CodexNoticeSender | None) -> str:
-    if not re.fullmatch(MESSAGE_PATTERN, message_id):
-        raise ClaudeDesktopError("Expected a mailbox message ID")
+def notice_text(message_id: str, sender: Sender) -> str:
     prefix = f"Claudex mailbox message {message_id} is available"
-    if sender is None:
-        return f"{prefix}."
-    if not re.fullmatch(UUID_PATTERN, sender.id):
-        raise ClaudeDesktopError("Expected an exact Codex Desktop sender chat ID")
     title = " ".join("".join(char if char.isprintable() else " " for char in sender.title).split())
-    if not title or title == sender.id:
-        return f"{prefix} from Codex chat {sender.id}."
+    if not title or title == sender.chat_id:
+        return f"{prefix} from Codex chat {sender.chat_id}."
     if len(title) > MAX_NOTICE_TITLE:
         title = title[:MAX_NOTICE_TITLE - 1].rstrip() + "…"
     quoted_title = json.dumps(title, ensure_ascii=False).translate(NOTICE_ESCAPES)
-    return f"{prefix} from Codex chat {quoted_title} (ID {sender.id})."
+    return f"{prefix} from Codex chat {quoted_title} (ID {sender.chat_id})."
 
 
-def submit_notice(target: LiveChat, message_id: str, sender: CodexNoticeSender | None) -> NoticeStatus:
+def submit_notice(target: LiveChat, message_id: str, sender: Sender) -> NoticeStatus:
     if target.inbox is None:
         raise ClaudeDesktopError("Claude Desktop chat has no matching live inbox")
     # Claude Code 2.1.325 interprets this frame as an attributed peer notice
@@ -256,11 +277,12 @@ def submit_notice(target: LiveChat, message_id: str, sender: CodexNoticeSender |
     frame = {
         "type": "user",
         "session_id": target.backend_id,
-        "from": "thread-bridge",
+        "from": "claudex",
         "priority": "next",
         "message": {"role": "user", "content": notice_text(message_id, sender)},
     }
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        # A local inbox should accept promptly. A stalled worker leaves the body in the mailbox.
         connection.settimeout(2)
         try:
             connection.connect(str(target.inbox))

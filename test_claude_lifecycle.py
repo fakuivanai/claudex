@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -5,16 +6,20 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 import claude_desktop
-from claude_desktop import ClaudeChat, LiveChat, Liveness, NoticeStatus, parse_chat_identifier
+from claude_desktop import ClaudeChat, LiveChat, Liveness, NoticeStatus, WorkerStatus
+from models import Provider, Sender, parse_claude_chat_id
 import claude_lifecycle
 
 
-TARGET = parse_chat_identifier("local_00000000-0000-4000-8000-000000000101")
+TARGET = parse_claude_chat_id("local_00000000-0000-4000-8000-000000000101")
 MARKER = LiveChat(
-    ClaudeChat(TARGET, "Fixture chat", "idle", Liveness.INBOX_PRESENT),
+    ClaudeChat(TARGET, "Fixture chat", WorkerStatus.IDLE, Liveness.INBOX_PRESENT),
     "00000000-0000-4000-8000-000000000102",
     Path("/tmp/claudex-fixture/inbox.sock"),
 )
+
+
+SENDER = Sender(Provider.CODEX, "00000000-0000-4000-8000-000000000103", "Fixture Codex")
 
 
 class LifecycleTest(unittest.TestCase):
@@ -48,12 +53,12 @@ class LifecycleTest(unittest.TestCase):
     def test_notify_uses_the_worker_returned_after_reopen(self) -> None:
         self.lookup.side_effect = [None, MARKER]
         self.notice.return_value = NoticeStatus.SUBMITTED
-        claude_lifecycle.notify(TARGET, "message")
-        self.notice.assert_called_once_with(MARKER, "message", None)
+        claude_lifecycle.notify(TARGET, "message", sender=SENDER)
+        self.notice.assert_called_once_with(MARKER, "message", SENDER)
 
     def test_notify_without_worker_leaves_message_stored(self) -> None:
         self.lookup.return_value = None
-        self.assertIsInstance(claude_lifecycle.notify(TARGET, "message"), claude_lifecycle.StoredNotice)
+        self.assertIsInstance(claude_lifecycle.notify(TARGET, "message", sender=SENDER), claude_lifecycle.StoredNotice)
 
     def test_draft_encodes_prompt_as_data(self) -> None:
         prompt = "Check A & B? folder=/elsewhere"
@@ -65,3 +70,20 @@ class LifecycleTest(unittest.TestCase):
         claude_lifecycle.open_draft("Show the current project")
         url = urlsplit(self.launcher.call_args.args[0])
         self.assertEqual((url.scheme, url.netloc, url.path), ("claude", "code", "/new"))
+
+
+class LauncherTest(unittest.TestCase):
+    def test_requires_explicit_launcher(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(claude_desktop.ClaudeDesktopError, "CLAUDEX_CLAUDE_LAUNCHER"):
+                claude_lifecycle.launch()
+
+    def test_launch_passes_only_the_desktop_environment(self) -> None:
+        environment = {"HOME": "/desktop-home", "DISPLAY": ":0"}
+        with (
+            patch.object(claude_lifecycle, "_launcher", return_value=Path("/normal-launcher")),
+            patch.object(claude_lifecycle, "desktop_environment", return_value=environment),
+            patch("claude_lifecycle.subprocess.Popen") as start,
+        ):
+            claude_lifecycle.launch("claude://code/new")
+        self.assertEqual(start.call_args.kwargs["env"], environment)

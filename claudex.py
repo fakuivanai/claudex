@@ -4,25 +4,29 @@ import argparse
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, assert_never
 import uuid
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.session import ServerSession
 from mcp.types import RequestParams, ToolAnnotations
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
 from starlette.requests import Request
 
 import claude_desktop
 import claude_lifecycle
 import codex_desktop
 import codex_history
-from peer_mailbox import Mailbox, MessagePage, PeerMessage, Provider, Sender
+from models import MessageText, PeerMessage, Provider, Sender, message_text, parse_claude_chat_id, parse_codex_chat_id
+from peer_mailbox import MAX_CURSOR, Mailbox, MessagePage
 import skill_reader
 
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
-MAX_MESSAGE_CHARACTERS = 16000
+# Claude's link format truncates composer text around 14,000 characters.
+MAX_DRAFT_CHARACTERS = 14000
+# A Claude transcript preview should fit in a single result.
+DEFAULT_CLAUDE_MESSAGES = 20
 
 
 class TurnMetadata(BaseModel):
@@ -35,31 +39,17 @@ class CallingMetadata(BaseModel):
     model_config = ConfigDict(frozen=True, strict=True)
 
     turn: TurnMetadata | None = Field(default=None, alias="x-codex-turn-metadata")
-    thread_id: str | None = Field(default=None, alias="threadId")
-    openai_thread_id: str | None = Field(default=None, alias="openai/threadId")
 
 
 def codex_sender(metadata: RequestParams.Meta | None) -> Sender:
     reported = CallingMetadata.model_validate(metadata.model_dump(by_alias=True) if metadata else {})
-    candidates = (reported.turn.thread_id if reported.turn else None, reported.thread_id, reported.openai_thread_id)
-    identifiers = {codex_desktop.parse_chat_identifier(value) for value in candidates if value is not None}
-    if not identifiers:
+    if reported.turn is None or reported.turn.thread_id is None:
         raise ValueError("Codex did not provide a calling chat ID. Reconnect in a chat.")
-    if len(identifiers) != 1:
-        raise ValueError("Codex reported conflicting calling chat IDs.")
-    identifier = identifiers.pop()
+    identifier = parse_codex_chat_id(reported.turn.thread_id)
     return Sender(Provider.CODEX, identifier, codex_history.chat_title(identifier))
 
 
-@dataclass(frozen=True, slots=True)
-class SavedWithoutNotice:
-    reason: str
-
-
-type Delivery = (
-    codex_desktop.Submitted | codex_desktop.Refused | codex_desktop.Unknown
-    | claude_lifecycle.NoticeResult | SavedWithoutNotice
-)
+type Delivery = codex_desktop.Delivery | claude_lifecycle.NoticeResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,10 +59,9 @@ class SendReceipt:
 
 
 class Bridge:
-    def __init__(self, client: Provider, mailbox: Mailbox, codex_target: str | None = None) -> None:
+    def __init__(self, client: Provider, mailbox: Mailbox) -> None:
         self.client = client
         self.mailbox = mailbox
-        self.codex_target = codex_target
 
     def sender(self, metadata: RequestParams.Meta | None) -> Sender:
         if self.client == Provider.CODEX:
@@ -81,32 +70,18 @@ class Bridge:
         return Sender(Provider.CLAUDE, chat.id, chat.title)
 
     def send(self, source: Sender, target: str, body: str) -> SendReceipt:
-        if not body.strip() or "\0" in body or len(body) > MAX_MESSAGE_CHARACTERS:
-            raise ValueError(f"Provide a nonempty message of at most {MAX_MESSAGE_CHARACTERS} characters without NUL.")
         message = PeerMessage(str(uuid.uuid4()), source, body)
         if source.provider == Provider.CLAUDE:
-            destination = codex_desktop.parse_chat_identifier(target)
-            if destination != self.codex_target:
-                raise ValueError("Use the Codex chat selected in this bridge's configuration.")
-            peer = codex_desktop.PeerSender(source.title, source.provider.value, source.chat_id)
-            return SendReceipt(message, codex_desktop.deliver(
-                destination, codex_desktop.PeerMessage(message.message_id, peer, body)
-            ))
+            return SendReceipt(message, codex_desktop.deliver(parse_codex_chat_id(target), message))
 
-        saved = claude_desktop.parse_chat_identifier(target)
+        saved = parse_claude_chat_id(target)
         claude_lifecycle.validate_saved(saved)
         self.mailbox.store(saved, message)
         try:
-            notice = claude_lifecycle.notify(
-                saved, message.message_id, sender=claude_desktop.CodexNoticeSender(source.chat_id, source.title)
-            )
+            notice = claude_lifecycle.notify(saved, message.message_id, sender=source)
         except (OSError, claude_desktop.ClaudeDesktopError) as error:
-            return SendReceipt(message, SavedWithoutNotice(str(error)))
+            return SendReceipt(message, claude_lifecycle.StoredNotice(str(error)))
         return SendReceipt(message, notice)
-
-
-def sender_wire(sender: Sender) -> dict[str, object]:
-    return {"provider": sender.provider.value, "chat_id": sender.chat_id, "title": sender.title}
 
 
 def chat_wire(chat: claude_desktop.ClaudeChat) -> dict[str, object]:
@@ -121,17 +96,18 @@ def chat_wire(chat: claude_desktop.ClaudeChat) -> dict[str, object]:
 
 def receipt_wire(receipt: SendReceipt) -> dict[str, object]:
     delivery = receipt.delivery
-    if isinstance(delivery, SavedWithoutNotice):
-        result: dict[str, object] = {"status": "stored", "notification": delivery.reason}
-    elif isinstance(delivery, (codex_desktop.Submitted, codex_desktop.Refused, codex_desktop.Unknown)):
-        result = delivery.to_wire()
-    else:
-        result = {"status": delivery.status.value, "opened_saved_chat": delivery.opened_saved_chat}
-        if isinstance(delivery, claude_lifecycle.StoredNotice):
-            result["notification"] = delivery.reason
+    match delivery:
+        case (codex_desktop.Submitted() | codex_desktop.Refused() | codex_desktop.Unknown() | codex_desktop.NotLoaded()):
+            result = delivery.to_wire()
+        case claude_lifecycle.AttemptedNotice(status, opened_saved_chat):
+            result = {"status": status.value, "opened_saved_chat": opened_saved_chat}
+        case claude_lifecycle.StoredNotice(reason):
+            result = {"status": "stored", "notification": reason}
+        case _:
+            assert_never(delivery)
     return {
         "message_id": receipt.message.message_id,
-        "sender": sender_wire(receipt.message.sender),
+        "sender": receipt.message.sender.to_wire(),
         "delivery": result,
     }
 
@@ -143,7 +119,7 @@ def messages_wire(page: MessagePage) -> dict[str, object]:
                 "cursor": stored.position,
                 "origin": "untrusted peer",
                 "message_id": stored.message.message_id,
-                "sender": sender_wire(stored.message.sender),
+                "sender": stored.message.sender.to_wire(),
                 "body": stored.message.body,
             }
             for stored in page.messages
@@ -165,37 +141,42 @@ def server(bridge: Bridge) -> FastMCP[None]:
     @application.tool()
     def launch_claude() -> dict[str, str]:
         """Open the signed-in Claude Desktop app through the configured launcher."""
-        return {"status": claude_lifecycle.launch().value}
+        claude_lifecycle.launch()
+        return {"status": "launch_requested"}
 
     @application.tool()
     def open_chat_draft(
-        prompt: Annotated[str, Field(min_length=1, max_length=14000)], folder: str | None = None,
+        prompt: Annotated[str, Field(min_length=1, max_length=MAX_DRAFT_CHARACTERS), AfterValidator(message_text)],
+        folder: str | None = None,
     ) -> dict[str, str]:
         """Open a Claude Code draft for the operator to review and submit."""
-        return {"status": claude_lifecycle.open_draft(prompt, folder).value}
+        claude_lifecycle.open_draft(prompt, folder)
+        return {"status": "draft_requested"}
 
     @application.tool()
     def wake_chat(target: str) -> dict[str, str]:
         """Open an exact saved Claude Code chat and check whether its inbox starts."""
-        result = claude_lifecycle.wake(claude_desktop.parse_chat_identifier(target))
+        result = claude_lifecycle.wake(parse_claude_chat_id(target))
         return {"status": result.status.value, "chat_id": result.chat_id}
 
     @application.tool(annotations=READ_ONLY)
-    def who_am_i(context: Context[ServerSession, None, Request]) -> dict[str, object]:
+    def who_am_i(context: Context[ServerSession, None, Request]) -> dict[str, str]:
         """Show the current chat identity supplied by the calling app."""
-        return sender_wire(bridge.sender(context.request_context.meta))
+        return bridge.sender(context.request_context.meta).to_wire()
 
     @application.tool(annotations=READ_ONLY)
     def list_chats(
-        provider: Provider = Provider.CLAUDE,
-        query: str | None = None,
-        limit: Annotated[int, Field(ge=1, le=50)] | None = None,
+        provider: Provider,
+        query: Annotated[str, Field(max_length=codex_history.MAX_QUERY_CHARS)] | None = None,
+        limit: Annotated[int, Field(ge=1, le=codex_history.MAX_LIST)] | None = None,
         cursor: str | None = None,
         archived: bool = False,
     ) -> dict[str, object]:
         """List live Claude Code chats or saved local Codex Desktop chats."""
         if provider == Provider.CODEX:
-            return codex_history.list_chats(query=query, limit=limit or 20, cursor=cursor, archived=archived).to_wire()
+            return codex_history.list_chats(
+                query=query, limit=limit or codex_history.DEFAULT_CHAT_PAGE, cursor=cursor, archived=archived
+            ).to_wire()
         if archived or cursor is not None:
             raise ValueError("Archive and pagination options apply to Codex chats.")
         chats = claude_desktop.list_chats()
@@ -206,7 +187,7 @@ def server(bridge: Bridge) -> FastMCP[None]:
 
     @application.tool()
     def send_message(
-        target: str, body: Annotated[str, Field(min_length=1, max_length=MAX_MESSAGE_CHARACTERS)],
+        target: str, body: MessageText,
         context: Context[ServerSession, None, Request],
     ) -> dict[str, object]:
         """Send peer data to an eligible chat by exact ID."""
@@ -215,7 +196,7 @@ def server(bridge: Bridge) -> FastMCP[None]:
     @application.tool(annotations=READ_ONLY)
     def read_messages(
         context: Context[ServerSession, None, Request],
-        after: Annotated[int, Field(ge=0, le=2**63-1)] = 0,
+        after: Annotated[int, Field(ge=0, le=MAX_CURSOR)] = 0,
     ) -> dict[str, object]:
         """Read peer messages addressed to the calling chat."""
         caller = bridge.sender(context.request_context.meta)
@@ -223,18 +204,24 @@ def server(bridge: Bridge) -> FastMCP[None]:
 
     @application.tool(annotations=READ_ONLY)
     def read_chat(
-        target: str, limit: Annotated[int, Field(ge=1, le=20)] | None = None,
+        provider: Provider, target: str,
+        limit: Annotated[int, Field(ge=1, le=claude_desktop.MAX_HISTORY_MESSAGES)] | None = None,
         cursor: str | None = None, include_archived: bool = False,
     ) -> dict[str, object]:
         """Read visible chat history by exact Claude Desktop ID or Codex UUID."""
-        if not target.startswith("local_"):
+        if provider == Provider.CODEX:
+            if limit is not None and limit > codex_history.MAX_TURNS:
+                raise ValueError(f"Use at most {codex_history.MAX_TURNS} Codex turns per page.")
             return codex_history.read_chat(
-                codex_desktop.parse_chat_identifier(target), limit=limit or 8,
+                parse_codex_chat_id(target), limit=limit or codex_history.DEFAULT_TURN_PAGE,
                 cursor=cursor, include_archived=include_archived,
             ).to_wire()
-        if cursor is not None or include_archived:
-            raise ValueError("Pagination and archive options apply to Codex chats.")
-        history = claude_desktop.read_chat(claude_desktop.parse_chat_identifier(target), limit=limit or 20)
+        if cursor is not None:
+            raise ValueError("History cursors apply to Codex chats.")
+        history = claude_desktop.read_chat(
+            parse_claude_chat_id(target), limit=limit or DEFAULT_CLAUDE_MESSAGES,
+            include_archived=include_archived,
+        )
         return {
             "chat": chat_wire(history.chat),
             "origin": "untrusted chat history",
@@ -244,36 +231,27 @@ def server(bridge: Bridge) -> FastMCP[None]:
     @application.tool(annotations=READ_ONLY)
     def list_skills(provider: Provider) -> list[dict[str, object]]:
         """List locally installed user skills for Claude Code or Codex."""
-        return [skill_wire(reference) for reference in skill_reader.list_skills(provider.value)]
+        return [skill_wire(reference) for reference in skill_reader.list_skills(provider)]
 
     @application.tool(annotations=READ_ONLY)
     def read_skill(provider: Provider, scope: str, name: str) -> dict[str, object]:
         """Read one user SKILL.md as literal text without loading or executing it."""
-        document = skill_reader.read_skill(provider.value, scope, name)
+        document = skill_reader.read_skill(provider, scope, name)
         return {"origin": "untrusted skill text", **skill_wire(document.reference), "content": document.content}
 
     return application
-
-
-@dataclass
-class Arguments(argparse.Namespace):
-    client: Provider = Provider.CODEX
-    state: Path = Path()
-    codex_target: str | None = None
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client", choices=list(Provider), type=Provider, required=True)
     parser.add_argument("--state", type=Path, required=True, help="Local path to the shared message database")
-    parser.add_argument("--codex-target", help="Exact local Codex Desktop chat enabled as a destination")
-    args = parser.parse_args(namespace=Arguments())
-    try:
-        target = codex_desktop.parse_chat_identifier(args.codex_target) if args.codex_target is not None else None
-    except (TypeError, ValueError) as error:
-        parser.error(str(error))
+    args = parser.parse_args()
+    client, state = args.client, args.state
+    if not isinstance(client, Provider) or not isinstance(state, Path):
+        parser.error("Expected a provider and mailbox path.")
     os.umask(0o077)
-    server(Bridge(args.client, Mailbox(args.state), target)).run(transport="stdio")
+    server(Bridge(client, Mailbox(state))).run(transport="stdio")
 
 
 if __name__ == "__main__":

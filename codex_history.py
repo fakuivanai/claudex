@@ -5,25 +5,46 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
-import json
 from pathlib import Path
 import sqlite3
 import time
-import uuid
+from typing import Annotated, Literal, assert_never
 
-from codex_peer import LEGACY_NAMESPACE, NAMESPACE, TOOL_NAME, PeerMessage, parse_peer_output
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, RootModel, ValidationError
 
+from codex_peer import NAMESPACE, TOOL_NAME, parse_peer_output
+from models import CodexChatId, PeerMessage, Provider, parse_codex_chat_id
 
+# Keep metadata pages small enough for an MCP tool result.
 MAX_LIST = 50
+# The default metadata page leaves room for additional tool results.
+DEFAULT_CHAT_PAGE = 20
+# Bound how many turns can expand into messages in one result.
 MAX_TURNS = 10
+# Most chats fit a useful amount of recent context in this many turns.
+DEFAULT_TURN_PAGE = 8
+# Reserve room for the original request and keep recent visible entries.
 MAX_MESSAGES_PER_TURN = 8
+# Bound JSON parsing and avoid reading oversized tool records into Python.
 MAX_RECORD_CHARS = 256 * 1024
+# Quote a useful text preview without passing every long reply through MCP.
 MAX_TEXT_CHARS = 2000
+# The title filter case-folds each candidate in SQLite.
 MAX_QUERY_CHARS = 160
+# Let a busy desktop database win over a long-running history request.
 SQL_TIMEOUT = 1.5
+# Wait briefly for SQLite writer locks and interrupt long queries at a regular interval.
+SQL_LOCK_TIMEOUT = 0.3
+SQL_PROGRESS_INTERVAL = 1000
+# Cursor ordinals are SQLite signed integers.
 SQLITE_MAX_INT = 2**63 - 1
+SQLITE_MAX_INT_DIGITS = len(str(SQLITE_MAX_INT))
+# A compact query fingerprint keeps cursors tied to their non-secret search scope.
+CURSOR_SCOPE_CHARS = 12
+# Names from Codex Desktop's local projection and metadata stores.
 STATE_DATABASE = "state_5.sqlite"
 HISTORY_DATABASE = "thread_history_1.sqlite"
+# Match top-level Desktop chats, including those created from a phone.
 DESKTOP_CHAT = """
     source IN ('vscode', 'exec', 'appServer', 'app_server')
     AND (
@@ -38,10 +59,15 @@ DESKTOP_CHAT = """
     AND attached_thread_parent_id IS NULL
     AND NOT EXISTS (SELECT 1 FROM thread_spawn_edges WHERE child_thread_id = threads.id)
 """
-CHAT_COLUMNS = """
-    id, substr(name, 1, 256) AS name, substr(title, 1, 256) AS title,
-    archived, updated_at_ms, recency_at_ms, history_mode
+# Keep title previews at the same size in list, search, and index results.
+TITLE_PREVIEW_CHARS = 256
+CHAT_COLUMNS = f"""
+    id, substr(name, 1, {TITLE_PREVIEW_CHARS}) AS name,
+    substr(title, 1, {TITLE_PREVIEW_CHARS}) AS title, archived, updated_at_ms, recency_at_ms, history_mode
 """
+CheckedChatId = Annotated[CodexChatId, BeforeValidator(parse_codex_chat_id)]
+type HistoryMode = Literal["paginated", "legacy"]
+type TurnStatus = Literal["completed", "failed", "inProgress", "interrupted"]
 
 
 class HistoryError(ValueError):
@@ -50,14 +76,14 @@ class HistoryError(ValueError):
 
 @dataclass(frozen=True)
 class Chat:
-    id: str
+    id: CodexChatId
     title: str
     updated_at_ms: int | None
     archived: bool
 
     def to_wire(self) -> dict[str, object]:
         return {
-            "provider": "codex",
+            "provider": Provider.CODEX.value,
             "id": self.id,
             "title": self.title,
             "updated_at_ms": self.updated_at_ms,
@@ -69,13 +95,26 @@ class Chat:
 class StoredChat:
     chat: Chat
     recency_at_ms: int
-    history_mode: str
+    history_mode: HistoryMode
 
 
-@dataclass(frozen=True)
-class IndexedChat:
-    id: str
-    title: str
+class DatabaseRecord(BaseModel):
+    model_config = ConfigDict(strict=True)
+
+
+class ChatRow(DatabaseRecord):
+    id: CheckedChatId
+    name: str | None
+    title: str | None
+    archived: Literal[0, 1]
+    updated_at_ms: int | None
+    recency_at_ms: int
+    history_mode: HistoryMode
+
+
+class IndexedChat(DatabaseRecord):
+    id: CheckedChatId
+    title: str = Field(validation_alias="thread_name")
 
 
 @dataclass(frozen=True)
@@ -142,11 +181,10 @@ class PeerOutput:
 type ChatMessage = UserMessage | AssistantMessage | PeerOutput
 
 
-@dataclass(frozen=True)
-class StoredTurn:
-    id: str
-    ordinal: int
-    status: str
+class StoredTurn(DatabaseRecord):
+    id: str = Field(validation_alias="turn_id")
+    ordinal: int = Field(validation_alias="rollout_ordinal")
+    status: TurnStatus
     started_at: int | None
     completed_at: int | None
 
@@ -155,7 +193,8 @@ class StoredTurn:
 class Turn:
     record: StoredTurn
     messages: tuple[ChatMessage, ...]
-    messages_truncated: bool
+    over_message_cap: bool
+    skipped_records: int
 
     def to_wire(self) -> dict[str, object]:
         return {
@@ -164,7 +203,8 @@ class Turn:
             "started_at": self.record.started_at,
             "completed_at": self.record.completed_at,
             "messages": [message.to_wire() for message in self.messages],
-            "messages_truncated": self.messages_truncated,
+            "over_message_cap": self.over_message_cap,
+            "skipped_records": self.skipped_records,
         }
 
 
@@ -184,20 +224,8 @@ class ChatHistory:
         }
 
 
-def chat_identifier(value: str) -> str:
-    try:
-        return str(uuid.UUID(value))
-    except ValueError as error:
-        raise HistoryError("Use an exact Codex chat UUID") from error
-
-
-def validate_limit(value: int, maximum: int) -> None:
-    if type(value) is not int or not 1 <= value <= maximum:
-        raise HistoryError(f"Limit must be an integer between 1 and {maximum}")
-
-
 def ordinal(value: str) -> int:
-    if not value.isascii() or not value.isdecimal() or len(value) > 19:
+    if not value.isascii() or not value.isdecimal() or len(value) > SQLITE_MAX_INT_DIGITS:
         raise HistoryError("Invalid history cursor")
     result = int(value)
     if result > SQLITE_MAX_INT:
@@ -214,12 +242,14 @@ def database(root: Path | None, name: str) -> Iterator[sqlite3.Connection]:
     path = codex_home(root) / name
     try:
         # A read-only connection still sees committed entries in the WAL.
-        with closing(sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=0.3)) as connection:
+        with closing(sqlite3.connect(
+            path.absolute().as_uri() + "?mode=ro", uri=True, timeout=SQL_LOCK_TIMEOUT,
+        )) as connection:
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA query_only=ON")
             connection.execute("PRAGMA trusted_schema=OFF")
             deadline = time.monotonic() + SQL_TIMEOUT
-            connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), SQL_PROGRESS_INTERVAL)
             yield connection
     except sqlite3.Error as error:
         if getattr(error, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
@@ -227,60 +257,33 @@ def database(root: Path | None, name: str) -> Iterator[sqlite3.Connection]:
         raise HistoryError("The local Codex Desktop history database is unavailable or incompatible") from error
 
 
-def text_column(value: object) -> str:
-    if isinstance(value, str):
-        return value
-    raise HistoryError("The local Codex history contains an invalid text column")
-
-
-def optional_text_column(value: object) -> str | None:
-    return text_column(value) if value is not None else None
-
-
-def integer_column(value: object) -> int:
-    if type(value) is int:
-        return value
-    raise HistoryError("The local Codex history contains an invalid integer column")
-
-
-def optional_integer_column(value: object) -> int | None:
-    return integer_column(value) if value is not None else None
-
-
 def parse_chat(row: sqlite3.Row) -> StoredChat:
-    identifier = chat_identifier(text_column(row["id"]))
-    title = optional_text_column(row["name"]) or optional_text_column(row["title"]) or identifier
-    archive = integer_column(row["archived"])
-    if archive not in (0, 1):
-        raise HistoryError("The local Codex history contains an invalid archive value")
-    chat = Chat(identifier, title, optional_integer_column(row["updated_at_ms"]), bool(archive))
-    return StoredChat(chat, integer_column(row["recency_at_ms"]), text_column(row["history_mode"]))
+    try:
+        data = ChatRow.model_validate(dict(row))
+    except ValidationError as error:
+        raise HistoryError("The local Codex history contains an invalid chat record") from error
+    chat = Chat(data.id, data.name or data.title or data.id, data.updated_at_ms, bool(data.archived))
+    return StoredChat(chat, data.recency_at_ms, data.history_mode)
 
 
 def parse_index_entry(line: str) -> IndexedChat | None:
     try:
-        decoded: object = json.loads(line)
-    except (ValueError, RecursionError):
+        entry = IndexedChat.model_validate_json(line)
+    except ValidationError:
         return None
-    if not isinstance(decoded, dict):
-        return None
-    entry: dict[object, object] = decoded
-    identifier, title = entry.get("id"), entry.get("thread_name")
-    if not isinstance(identifier, str) or not isinstance(title, str) or not title.strip():
-        return None
-    return IndexedChat(identifier, title[:256])
+    return entry if entry.title.strip() else None
 
 
-def chat_title(chat_id: str, *, root: Path | None = None) -> str:
+def chat_title(chat_id: CodexChatId, *, root: Path | None = None) -> str:
     """Resolve a display title from the session index, including CLI chats."""
     index = codex_home(root) / "session_index.jsonl"
-    title = chat_id
+    title: str = chat_id
     try:
         with index.open(encoding="utf-8", errors="replace") as source:
             for line in source:
                 entry = parse_index_entry(line)
                 if entry is not None and entry.id == chat_id:
-                    title = entry.title
+                    title = entry.title[:TITLE_PREVIEW_CHARS]
     except OSError:
         pass
     return title
@@ -291,37 +294,41 @@ def contains_title(value: object, query: str) -> int:
 
 
 def list_chats(
-    query: str | None = None, limit: int = 20, cursor: str | None = None, archived: bool = False,
+    query: str | None = None, limit: int = DEFAULT_CHAT_PAGE, cursor: str | None = None, archived: bool = False,
     *, root: Path | None = None,
 ) -> ChatPage:
     """List local top-level Codex Desktop chats using title or exact ID."""
-    validate_limit(limit, MAX_LIST)
     keyword = "" if query is None else query.strip().casefold()
-    if query is not None and len(query) > MAX_QUERY_CHARS:
-        raise HistoryError(f"Query must be text of up to {MAX_QUERY_CHARS} characters")
-    scope = hashlib.sha256(f"{int(archived)}:{keyword}".encode("utf-8")).hexdigest()[:12]
+    scope = hashlib.sha256(f"{int(archived)}:{keyword}".encode("utf-8")).hexdigest()[:CURSOR_SCOPE_CHARS]
 
     filters = [DESKTOP_CHAT, "archived = ?"]
     parameters: list[str | int] = [archived]
     if keyword:
         try:
-            exact = chat_identifier(keyword)
-        except HistoryError:
-            filters.append("(bridge_has_title(substr(name, 1, 256), ?) OR bridge_has_title(substr(title, 1, 256), ?))")
+            exact = parse_codex_chat_id(keyword)
+        except ValueError:
+            filters.append(
+                f"(claudex_has_title(substr(name, 1, {TITLE_PREVIEW_CHARS}), ?) "
+                f"OR claudex_has_title(substr(title, 1, {TITLE_PREVIEW_CHARS}), ?))"
+            )
             parameters.extend((keyword, keyword))
         else:
             filters.append("id = ?")
             parameters.append(exact)
     if cursor is not None:
         current_scope, separator, position = cursor.partition(":")
-        if len(cursor) > 100 or not separator or current_scope != scope:
+        if not separator or current_scope != scope:
             raise HistoryError("Use a chat list cursor from the same query and archive selection")
         timestamp, _, last_id = position.partition(":")
         filters.append("(recency_at_ms, id) < (?, ?)")
-        parameters.extend((ordinal(timestamp), chat_identifier(last_id)))
+        try:
+            identifier = parse_codex_chat_id(last_id)
+        except ValueError as error:
+            raise HistoryError("Invalid chat list cursor") from error
+        parameters.extend((ordinal(timestamp), identifier))
     parameters.append(limit + 1)
     with database(root, STATE_DATABASE) as connection:
-        connection.create_function("bridge_has_title", 2, contains_title, deterministic=True)
+        connection.create_function("claudex_has_title", 2, contains_title, deterministic=True)
         rows = connection.execute(
             f"SELECT {CHAT_COLUMNS} FROM threads WHERE " + " AND ".join(filters)
             + " ORDER BY recency_at_ms DESC, id DESC LIMIT ?",
@@ -336,104 +343,163 @@ def list_chats(
     return ChatPage(tuple(item.chat for item in page), next_cursor)
 
 
-def visible_text(text: object) -> VisibleText | None:
-    if not isinstance(text, str) or not text.strip():
+class UserTextPart(DatabaseRecord):
+    type: Literal["text"]
+    text: str
+
+
+class NonTextPart(DatabaseRecord):
+    type: str
+
+
+class ProjectedUser(DatabaseRecord):
+    type: Literal["userMessage"]
+    content: list[UserTextPart | NonTextPart]
+
+
+class ProjectedAssistant(DatabaseRecord):
+    type: Literal["agentMessage"]
+    phase: str | None = None
+    text: str
+
+
+class ProjectedToolOutput(DatabaseRecord):
+    type: Literal["functionCallOutput"]
+    namespace: str
+    name: str
+    output: str
+
+
+class ItemRow(DatabaseRecord):
+    item_type: str
+    item_json: str | None
+    rollout_ordinal: int
+
+
+type ProjectedMessage = Annotated[
+    ProjectedUser | ProjectedAssistant | ProjectedToolOutput, Field(discriminator="type")
+]
+
+
+class ProjectedMessageRecord(RootModel[ProjectedMessage]):
+    pass
+
+
+def visible_text(text: str) -> VisibleText | None:
+    if not text.strip():
         return None
     return VisibleText(text[:MAX_TEXT_CHARS], len(text) > MAX_TEXT_CHARS)
 
 
-def user_text(content: object) -> Iterator[str]:
-    if not isinstance(content, list):
-        return
-    entries: list[object] = content
-    for part in entries:
-        if isinstance(part, dict):
-            fields: dict[object, object] = part
-            text = fields.get("text")
-            if fields.get("type") == "text" and isinstance(text, str):
-                yield text
+def parse_phase(phase: str | None) -> AnswerPhase | None:
+    try:
+        return AnswerPhase(phase)
+    except ValueError:
+        return None
 
 
-def parse_phase(value: object) -> AnswerPhase | None:
-    if isinstance(value, str):
-        try:
-            return AnswerPhase(value)
-        except ValueError:
-            pass
-    return None
-
-
-def parse_record(row: sqlite3.Row) -> ChatMessage | None:
-    payload: object = row["item_json"]
-    kind: object = row["item_type"]
-    if not isinstance(payload, str):
+def parse_record(row: ItemRow) -> ChatMessage | None:
+    if row.item_json is None:
         return None
     try:
-        decoded: object = json.loads(payload)
-    except (ValueError, RecursionError):
+        record = ProjectedMessageRecord.model_validate_json(row.item_json).root
+    except ValidationError:
         return None
-    if not isinstance(decoded, dict):
+    if record.type != row.item_type:
         return None
-    item: dict[object, object] = decoded
-    if item.get("type") != kind:
-        return None
-    match kind:
-        case "userMessage":
-            preview = visible_text("\n".join(user_text(item.get("content"))))
+    match record:
+        case ProjectedUser(content=content):
+            preview = visible_text("\n".join(part.text for part in content if isinstance(part, UserTextPart)))
             return UserMessage(preview) if preview is not None else None
-        case "agentMessage":
-            preview = visible_text(item.get("text"))
-            return AssistantMessage(preview, parse_phase(item.get("phase"))) if preview is not None else None
-        case "functionCallOutput":
-            message = parse_peer_output(item.get("output"), item.get("namespace"), item.get("name"))
-            if message is not None:
-                preview = visible_text(message.body)
-                if preview is not None:
-                    return PeerOutput(preview, message)
-    return None
+        case ProjectedAssistant(text=text, phase=phase):
+            preview = visible_text(text)
+            return AssistantMessage(preview, parse_phase(phase)) if preview is not None else None
+        case ProjectedToolOutput(output=output, namespace=namespace, name=name):
+            message = parse_peer_output(output, namespace, name)
+            if message is None or (preview := visible_text(message.body)) is None:
+                return None
+            return PeerOutput(preview, message)
+        case _:
+            assert_never(record)
 
 
 def parse_turn(row: sqlite3.Row) -> StoredTurn:
-    return StoredTurn(
-        text_column(row["turn_id"]), integer_column(row["rollout_ordinal"]), text_column(row["status"]),
-        optional_integer_column(row["started_at"]), optional_integer_column(row["completed_at"]),
-    )
+    try:
+        return StoredTurn.model_validate(dict(row))
+    except ValidationError as error:
+        raise HistoryError("The local Codex history contains an invalid turn record") from error
 
 
-def visible_messages(connection: sqlite3.Connection, chat_id: str, turn: StoredTurn) -> Turn:
+def visible_messages(connection: sqlite3.Connection, chat_id: CodexChatId, turn: StoredTurn) -> Turn:
+    first_user = connection.execute(
+        """
+        SELECT item_type, rollout_ordinal, CASE WHEN length(item_json) <= ? THEN item_json END AS item_json
+        FROM thread_items WHERE thread_id = ? AND turn_id = ? AND item_type = 'userMessage'
+        ORDER BY rollout_ordinal LIMIT 1
+        """,
+        (MAX_RECORD_CHARS, chat_id, turn.id),
+    ).fetchone()
+    original_ordinal = None
+    messages: list[tuple[int, ChatMessage]] = []
+    skipped = 0
+    if first_user is not None:
+        try:
+            first = ItemRow.model_validate(dict(first_user))
+        except ValidationError:
+            # The recent-record scan still includes this unpinned row.
+            pass
+        else:
+            original_ordinal = first.rollout_ordinal
+            original = parse_record(first)
+            if original is None:
+                skipped += 1
+            else:
+                messages.append((original_ordinal, original))
+
+    # Fetch newest records first, filling the visible budget after skipping bad records.
     rows = connection.execute(
         """
-        SELECT item_type, CASE WHEN length(item_json) <= ? THEN item_json END AS item_json
+        SELECT item_type, rollout_ordinal, CASE WHEN length(item_json) <= ? THEN item_json END AS item_json
         FROM thread_items
-        WHERE thread_id = ? AND turn_id = ? AND (
+        WHERE thread_id = ? AND turn_id = ? AND (? IS NULL OR rollout_ordinal != ?) AND (
             item_type IN ('userMessage', 'agentMessage')
             OR CASE WHEN item_type = 'functionCallOutput' AND length(item_json) <= ? AND json_valid(item_json)
-                THEN json_extract(item_json, '$.namespace') IN (?, ?)
+                THEN json_extract(item_json, '$.namespace') = ?
                     AND json_extract(item_json, '$.name') = ?
                 ELSE 0 END
         )
         ORDER BY rollout_ordinal DESC
-        LIMIT ?
         """,
-        (MAX_RECORD_CHARS, chat_id, turn.id, MAX_RECORD_CHARS, NAMESPACE, LEGACY_NAMESPACE, TOOL_NAME,
-         MAX_MESSAGES_PER_TURN + 1),
-    ).fetchall()
-    parsed = (parse_record(row) for row in reversed(rows[:MAX_MESSAGES_PER_TURN]))
-    messages = tuple(message for message in parsed if message is not None)
-    return Turn(turn, messages, len(messages) < len(rows))
+        (MAX_RECORD_CHARS, chat_id, turn.id, original_ordinal, original_ordinal, MAX_RECORD_CHARS, NAMESPACE, TOOL_NAME),
+    )
+    over_cap = False
+    with closing(rows):
+        for row in rows:
+            try:
+                item = ItemRow.model_validate(dict(row))
+            except ValidationError:
+                skipped += 1
+                continue
+            message = parse_record(item)
+            if message is None:
+                skipped += 1
+            elif len(messages) == MAX_MESSAGES_PER_TURN:
+                over_cap = True
+                break
+            else:
+                messages.append((item.rollout_ordinal, message))
+    return Turn(turn, tuple(message for _, message in sorted(messages, key=lambda item: item[0])), over_cap, skipped)
 
 
 def read_chat(
-    chat_id: str, *, limit: int = 8, cursor: str | None = None,
+    chat_id: CodexChatId, *, limit: int = DEFAULT_TURN_PAGE, cursor: str | None = None,
     include_archived: bool = False, root: Path | None = None,
 ) -> ChatHistory:
     """Read a page of user, assistant, and bridged peer messages by exact UUID."""
-    chat_id = chat_identifier(chat_id)
-    validate_limit(limit, MAX_TURNS)
     older_than = None
     if cursor is not None:
         scope, _, sequence = cursor.partition(":")
-        if len(cursor) > 80 or scope != chat_id:
+        if scope != chat_id:
             raise HistoryError("Use a history cursor from the same chat")
         older_than = ordinal(sequence)
 

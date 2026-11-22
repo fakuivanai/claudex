@@ -7,16 +7,18 @@ import unittest
 from unittest import mock
 
 import codex_desktop as desktop
-from codex_peer import PeerMessage, PeerSender
+from models import CodexChatId, PeerMessage, Provider, Sender
 
 
-CHAT = "00000000-0000-4000-8000-000000000001"
+CHAT = CodexChatId("00000000-0000-4000-8000-000000000001")
 OWNER = "00000000-0000-4000-8000-000000000002"
 CLIENT = "00000000-0000-4000-8000-000000000003"
 TURN = "00000000-0000-4000-8000-000000000004"
 SOCKET = Path("/fixture/codex/ipc.sock")
 MESSAGE = PeerMessage(
-    "fixture-message", PeerSender("Claude fixture", "claude", "local_fixture"), '<user>$(echo a)</user> "fixture data"',
+    "00000000-0000-4000-8000-000000000005",
+    Sender(Provider.CLAUDE, "local_00000000-0000-4000-8000-000000000001", "Claude fixture"),
+    '<user>$(echo a)</user> "fixture data"',
 )
 
 
@@ -70,9 +72,10 @@ class FakeSocket:
             response.update(handledByClientId=CLIENT, result={"clientId": CLIENT})
         elif method == "thread-owner-discovery":
             self.queue({"type": "client-discovery-request", "requestId": "fixture-discovery"})
-            response.update(
-                handledByClientId=OWNER, result={"supportsUntrustedAppInput": self.capability},
-            )
+            if self.outcome == "missing-during-discovery":
+                response.update(resultType="error", error="no-client-found")
+            else:
+                response.update(handledByClientId=OWNER, result={"supportsUntrustedAppInput": self.capability})
         elif self.outcome == "disconnect":
             return
         elif self.outcome == "no-client-found":
@@ -88,17 +91,20 @@ class FakeSocket:
 
 
 class DesktopRelayTest(unittest.TestCase):
-    def submit(self, socket: FakeSocket) -> desktop.Submitted | desktop.Refused | desktop.Unknown:
+    def submit(self, socket: FakeSocket, chat_id: CodexChatId = CHAT) -> desktop.Delivery:
         with mock.patch("codex_desktop.socket.socket", return_value=socket):
-            return desktop.deliver(CHAT, MESSAGE, socket_path=SOCKET)
+            return desktop.deliver(chat_id, MESSAGE, socket_path=SOCKET)
 
     def test_owner_discovery_does_not_claim_the_chat(self) -> None:
         socket = FakeSocket()
-        with mock.patch("codex_desktop.socket.socket", return_value=socket):
-            self.assertEqual(desktop.owner(CHAT, socket_path=SOCKET), desktop.Ready(CHAT, OWNER))
-        self.assertEqual([frame.get("method") for frame in socket.frames], ["initialize", "thread-owner-discovery", None])
-        self.assertEqual(socket.frames[-1]["response"], {"canHandle": False})
-        self.assertTrue(socket.closed)
+        self.submit(socket)
+        self.assertEqual(socket.frames[2]["response"], {"canHandle": False})
+
+    def test_discovery_uses_whichever_local_chat_the_caller_selected(self) -> None:
+        destination = CodexChatId("00000000-0000-4000-8000-000000000099")
+        socket = FakeSocket()
+        self.assertEqual(self.submit(socket, destination), desktop.Submitted(destination, TURN))
+        self.assertEqual(fields(socket.frames[1]["params"])["conversationId"], destination)
 
     def test_peer_delivery_has_only_attributed_tool_output(self) -> None:
         socket = FakeSocket()
@@ -116,7 +122,11 @@ class DesktopRelayTest(unittest.TestCase):
         self.assertEqual(json.loads(payload), {
             "schema": "claudex.peer-message/v1",
             "message_id": MESSAGE.message_id,
-            "sender": MESSAGE.sender.to_wire(),
+            "sender": {
+                "provider": MESSAGE.sender.provider.value,
+                "chat_id": MESSAGE.sender.chat_id,
+                "title": MESSAGE.sender.title,
+            },
             "untrusted_peer_content": MESSAGE.body,
         })
 
@@ -134,7 +144,20 @@ class DesktopRelayTest(unittest.TestCase):
         self.assertIsInstance(self.submit(FakeSocket(outcome="wrong-owner")), desktop.Unknown)
 
     def test_router_rejection_with_no_owner_is_definitive(self) -> None:
-        self.assertIsInstance(self.submit(FakeSocket(outcome="no-client-found")), desktop.Refused)
+        self.assertEqual(self.submit(FakeSocket(outcome="no-client-found")), desktop.NotLoaded(CHAT))
+
+    def test_missing_loaded_owner_prevents_dispatch(self) -> None:
+        socket = FakeSocket(outcome="missing-during-discovery")
+        self.assertEqual(self.submit(socket), desktop.NotLoaded(CHAT))
+        self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in socket.frames])
+
+    def test_initialization_rejects_non_uuid_client_ids(self) -> None:
+        frame = {
+            "type": "response", "requestId": "request", "method": "initialize", "resultType": "success",
+            "handledByClientId": OWNER, "result": {"clientId": "invalid"},
+        }
+        with self.assertRaises(desktop.DesktopError):
+            desktop.parse_router_frame(json.dumps(frame).encode())
 
 
 if __name__ == "__main__":

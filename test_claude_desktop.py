@@ -8,11 +8,12 @@ from unittest.mock import patch
 from claude_agent_sdk import SessionMessage
 
 import claude_desktop
-from claude_desktop import ClaudeChat, ClaudeDesktopError, CodexNoticeSender, Liveness, LiveChat, MessageRole, NoticeStatus
+from claude_desktop import ClaudeChat, ClaudeDesktopError, Liveness, LiveChat, MessageRole, NoticeStatus, WorkerStatus
+from models import Provider, Sender, parse_claude_chat_id
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "claude_desktop_linux"
-CHAT_ID = claude_desktop.parse_chat_identifier("local_00000000-0000-4000-8000-000000000101")
+CHAT_ID = parse_claude_chat_id("local_00000000-0000-4000-8000-000000000101")
 BACKEND_ID = "00000000-0000-4000-8000-000000000102"
 
 
@@ -21,7 +22,7 @@ class ClaudeDesktopTest(unittest.TestCase):
         work = self.enterContext(TemporaryDirectory(prefix="claudex-desktop-"))
         root = Path(work)
         self.inbox = root / "inbox.sock"
-        self.live = LiveChat(ClaudeChat(CHAT_ID, "Fixture chat", "idle", Liveness.PROCESS_VISIBLE), BACKEND_ID, self.inbox)
+        self.live = LiveChat(ClaudeChat(CHAT_ID, "Fixture chat", WorkerStatus.IDLE, Liveness.PROCESS_VISIBLE), BACKEND_ID, self.inbox)
         self.enterContext(patch.dict(os.environ, {
             "XDG_CONFIG_HOME": str(root / "config"),
             "CLAUDE_CONFIG_DIR": str(root / "code"),
@@ -60,7 +61,7 @@ class ClaudeDesktopTest(unittest.TestCase):
             claude_desktop.sender()
 
     def test_notice_quotes_external_codex_title(self) -> None:
-        sender = CodexNoticeSender("00000000-0000-4000-8000-000000000103", 'Check\n"paths" <tag>')
+        sender = Sender(Provider.CODEX, "00000000-0000-4000-8000-000000000103", 'Check\n"paths" <tag>')
         self.assertEqual(
             claude_desktop.notice_text("mail-reference", sender),
             r'Claudex mailbox message mail-reference is available from Codex chat "Check \"paths\" \u003ctag\u003e" (ID 00000000-0000-4000-8000-000000000103).',
@@ -68,16 +69,16 @@ class ClaudeDesktopTest(unittest.TestCase):
 
     def test_native_notice_uses_exact_backend_without_message_body(self) -> None:
         with patch("claude_desktop.socket.socket") as factory:
-            status = claude_desktop.submit_notice(self.live, "mail-reference", sender=None)
+            status = claude_desktop.submit_notice(self.live, "mail-reference", sender=Sender(Provider.CODEX, BACKEND_ID, BACKEND_ID))
             connection = factory.return_value.__enter__.return_value
             frame: object = json.loads(connection.sendall.call_args.args[0])
         self.assertEqual(status, NoticeStatus.SUBMITTED)
         self.assertEqual(frame, {
             "type": "user",
             "session_id": BACKEND_ID,
-            "from": "thread-bridge",
+            "from": "claudex",
             "priority": "next",
-            "message": {"role": "user", "content": "Claudex mailbox message mail-reference is available."},
+            "message": {"role": "user", "content": "Claudex mailbox message mail-reference is available from Codex chat 00000000-0000-4000-8000-000000000102."},
         })
 
     def test_history_returns_recent_visible_text(self) -> None:
@@ -91,3 +92,21 @@ class ClaudeDesktopTest(unittest.TestCase):
         with patch.object(claude_desktop, "get_session_messages", return_value=messages):
             result = claude_desktop.read_chat(CHAT_ID, 1)
         self.assertEqual(result.messages, (claude_desktop.HistoryMessage(MessageRole.ASSISTANT, "visible"),))
+
+    def test_saved_history_does_not_need_a_running_worker(self) -> None:
+        self.marker.unlink()
+        messages = [SessionMessage("user", "first", BACKEND_ID, {"content": "saved request"})]
+        with patch.object(claude_desktop, "get_session_messages", return_value=messages) as history:
+            result = claude_desktop.read_chat(CHAT_ID, 1)
+        self.assertEqual(result.chat.liveness, Liveness.SAVED)
+        history.assert_called_once_with(BACKEND_ID)
+
+    def test_ambiguous_saved_chat_does_not_read_a_transcript(self) -> None:
+        self.marker.unlink()
+        duplicate = self.record.parent.parent / "other-organization" / self.record.name
+        duplicate.parent.mkdir()
+        duplicate.write_text(self.record.read_text().replace(BACKEND_ID, "00000000-0000-4000-8000-000000000103"))
+        with patch.object(claude_desktop, "get_session_messages") as history:
+            with self.assertRaisesRegex(ValueError, "No unique"):
+                claude_desktop.read_chat(CHAT_ID, 1)
+            history.assert_not_called()

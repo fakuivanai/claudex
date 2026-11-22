@@ -9,8 +9,10 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import RequestParams
 
-from claudex import Bridge, SavedWithoutNotice, codex_sender
-from peer_mailbox import Mailbox, Provider, Sender
+from claudex import Bridge, codex_sender
+from claude_lifecycle import StoredNotice
+from models import Provider, Sender
+from peer_mailbox import Mailbox
 
 
 CODEX_CHAT = "11111111-1111-4111-8111-111111111111"
@@ -23,7 +25,7 @@ class BridgeTest(unittest.TestCase):
     def setUp(self) -> None:
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.bridge = Bridge(Provider.CLAUDE, Mailbox(Path(temporary.name) / "mail.sqlite"), CODEX_CHAT)
+        self.bridge = Bridge(Provider.CLAUDE, Mailbox(Path(temporary.name) / "mail.sqlite"))
 
     def test_sender_identity_comes_from_request(self) -> None:
         metadata = RequestParams.Meta.model_validate({"x-codex-turn-metadata": {"thread_id": CODEX_CHAT}})
@@ -35,26 +37,26 @@ class BridgeTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "did not provide"):
                 codex_sender(None)
 
-    def test_conflicting_request_identities_are_rejected(self) -> None:
+    def test_unverified_metadata_keys_do_not_supply_identity(self) -> None:
         metadata = RequestParams.Meta.model_validate({
             "threadId": CODEX_CHAT,
             "openai/threadId": "33333333-3333-4333-8333-333333333333",
         })
-        with self.assertRaisesRegex(ValueError, "conflicting"):
+        with self.assertRaisesRegex(ValueError, "did not provide"):
             codex_sender(metadata)
 
-    def test_only_the_configured_codex_chat_can_receive_a_message(self) -> None:
+    def test_a_second_codex_destination_is_dispatched(self) -> None:
+        other = "33333333-3333-4333-8333-333333333333"
         with patch("claudex.codex_desktop.deliver") as deliver:
-            with self.assertRaisesRegex(ValueError, "selected"):
-                self.bridge.send(CLAUDE_SENDER, "33333333-3333-4333-8333-333333333333", "peer body")
-            deliver.assert_not_called()
+            self.bridge.send(CLAUDE_SENDER, other, "peer body")
+        self.assertEqual(deliver.call_args.args[0], other)
 
     def test_codex_delivery_receives_claude_identity(self) -> None:
         with patch("claudex.codex_desktop.deliver") as deliver:
             self.bridge.send(CLAUDE_SENDER, CODEX_CHAT, "peer body")
         target, message = deliver.call_args.args
         self.assertEqual(
-            (target, message.sender.chat_id, message.sender.peer),
+            (target, message.sender.chat_id, message.sender.title),
             (CODEX_CHAT, CLAUDE_CHAT, CLAUDE_SENDER.title),
         )
 
@@ -72,7 +74,7 @@ class BridgeTest(unittest.TestCase):
             patch("claudex.claude_lifecycle.notify", side_effect=OSError("offline")),
         ):
             receipt = self.bridge.send(CODEX_SENDER, CLAUDE_CHAT, "peer body")
-        self.assertEqual(receipt.delivery, SavedWithoutNotice("offline"))
+        self.assertEqual(receipt.delivery, StoredNotice("offline"))
 
 
 class StdioTest(unittest.IsolatedAsyncioTestCase):
