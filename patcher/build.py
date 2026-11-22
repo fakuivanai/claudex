@@ -84,21 +84,40 @@ QUIT_CAPTURE_HOOK = QUIT_CAPTURE.replace(
     b't.EEt.warn("[claudex] Remote Control could not inspect the native quit roster")}try{',
     1,
 )
+# In zW.warmSession(e, r), e is the chat ID and i is its current roster entry.
+# W is the spawned SDK query assigned to i.query before the native attachment
+# installs it. R is the resolved spawn configuration passed to that call.
 AFTER_WARM = b"this.deps.remoteControlLifecycle().installRemoteControlProcess(i,W,R.remoteControlReattaching);"
 AFTER_WARM_HOOK = (
     AFTER_WARM
+    # Native warmLifecycle.onWarmUp uses fromPage for a page-driven warm. The
+    # interrupted-turn reopen path sets rowOpen when a person opens the row.
+    # adoptOnly reattaches an existing SSH worker. allowFork is the explicit
+    # rewind target that warmSession compares with pendingRewindTo.
     + b'if((r.fromPage===!0||r.rowOpen===!0)&&!r.adoptOnly&&r.allowFork===void 0){'
     b'void require("./claudex-restore.cjs").restoreAfterOpening('
+    # LocalSessionManager constructs zW with accessors for its live session
+    # table, native Remote Control lifecycle, and current account and org.
     b'this.deps.sessions(),i,W,this.deps.remoteControlLifecycle(),'
+    # The warmer captured a.accountId/a.orgId before async work. Recheck that
+    # tenant and the original roster entry at attach time.
     b'()=>a.accountId!==null&&t.I0()===a.accountId&&this.deps.currentAccountId()===a.accountId'
     b'&&this.deps.currentOrgId()===a.orgId&&this.deps.sessions().get(e)===i,'
     b'message=>t.EEt.info(message))}'
 )
+# LocalSessionManager.setSessionVisibility(n, r, i) takes a chat ID n and a
+# visibility boolean r. It looks up a in the live session table and schedules
+# native warm/preview visibility handling before this hook runs.
 VISIBLE_CHAT = b"this.warmLifecycle.onVisibilityChange(n,r),this.previewIdleManager.onVisibilityChange(n,r),"
 VISIBLE_CHAT_HOOK = (
     VISIBLE_CHAT
+    # An idle installed query can reconnect when shown. Native hydration writes
+    # homeTenancy from the account/org that owns this chat, even across switches.
     + b'(r&&a.query&&!a.isRunning&&a.homeTenancy&&require("./claudex-restore.cjs").restoreAfterOpening('
+    # The manager holds the same table and lifecycle exposed through zW's deps.
     b'this.sessions,a,a.query,this.remoteControlLifecycle,'
+    # Recheck that the manager is active and that the same chat still belongs
+    # to the signed-in account and current organization before attaching.
     b'()=>!this.appQuitting&&this.sessions.get(n)===a&&a.homeTenancy.accountId!==null'
     b'&&t.I0()===a.homeTenancy.accountId&&this.currentAccountId===a.homeTenancy.accountId'
     b'&&this.currentOrgId===a.homeTenancy.orgId,message=>t.EEt.info(message))),'

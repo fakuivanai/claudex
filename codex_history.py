@@ -33,8 +33,9 @@ MAX_TEXT_CHARS = 2000
 MAX_QUERY_CHARS = 160
 # Let a busy desktop database win over a long-running history request.
 SQL_TIMEOUT = 1.5
-# Wait briefly for SQLite writer locks and interrupt long queries at a regular interval.
+# Give SQLite's writer a brief chance to release its lock.
 SQL_LOCK_TIMEOUT = 0.3
+# Check the read deadline every 1,000 SQLite instructions to limit callback overhead.
 SQL_PROGRESS_INTERVAL = 1000
 # Cursor ordinals are SQLite signed integers.
 SQLITE_MAX_INT = 2**63 - 1
