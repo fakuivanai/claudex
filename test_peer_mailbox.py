@@ -1,9 +1,10 @@
 from pathlib import Path
-import sqlite3
+from unittest.mock import patch
 from tempfile import TemporaryDirectory
 import unittest
 
-from peer_mailbox import Mailbox, MESSAGE_FORMAT, MessagePage, PeerMessage, Provider, Sender
+from models import PEER_MESSAGE, PeerMessage, Provider, Sender
+from peer_mailbox import Mailbox, MessagePage
 
 
 MESSAGE = PeerMessage(
@@ -39,16 +40,14 @@ class MailboxTest(unittest.TestCase):
         self.mailbox.store("recipient", MESSAGE)
         self.assertEqual(self.mailbox.read("recipient", 0).messages[0].message, MESSAGE)
 
-    def test_preexisting_mailbox_format_still_parses(self) -> None:
-        legacy_json = (
-            '{"message_id":"11111111-1111-4111-8111-111111111111",'
-            '"sender":{"peer":"Local review","provider":"codex",'
-            '"thread":"22222222-2222-4222-8222-222222222222"},"body":"Earlier message"}'
-        )
-        self.mailbox.store("recipient", MESSAGE)
-        with sqlite3.connect(self.mailbox.path) as connection:
-            connection.execute("UPDATE mail SET message=?", (legacy_json,))
-        self.assertEqual(self.mailbox.read("recipient", 0).messages[0].message.sender, MESSAGE.sender)
+    def test_retention_removes_only_the_oldest_for_this_recipient(self) -> None:
+        with patch("peer_mailbox.RETENTION", 2):
+            self.mailbox.store("recipient", MESSAGE)
+            self.mailbox.store("another-chat", MESSAGE)
+            self.mailbox.store("recipient", MESSAGE)
+            self.mailbox.store("recipient", MESSAGE)
+        self.assertEqual([row.position for row in self.mailbox.read("recipient", 0).messages], [3, 4])
+        self.assertEqual([row.position for row in self.mailbox.read("another-chat", 0).messages], [2])
 
-    def test_storage_keeps_the_existing_sender_keys(self) -> None:
-        self.assertIn(b'"thread":', MESSAGE_FORMAT.dump_json(MESSAGE, by_alias=True))
+    def test_storage_names_match_the_shared_model(self) -> None:
+        self.assertIn(b'"chat_id":', PEER_MESSAGE.dump_json(MESSAGE))
