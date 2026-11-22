@@ -1,19 +1,42 @@
-"""Read user-authored skill documents from fixed local directories."""
+"""Read literal SKILL.md files from user skill directories."""
 
+from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import StrEnum
 import errno
 import os
 from pathlib import Path
 import stat
 
 
-HOME_DIRECTORY = Path.home()
-SKILL_ROOTS = {
-    "codex": {
-        "codex-user": HOME_DIRECTORY / ".codex" / "skills",
-        "agents-user": HOME_DIRECTORY / ".agents" / "skills",
-    },
-    "claude": {"claude-user": HOME_DIRECTORY / ".claude" / "skills"},
+class SkillProvider(StrEnum):
+    CODEX = "codex"
+    CLAUDE = "claude"
+
+
+class SkillScope(StrEnum):
+    CODEX_USER = "codex-user"
+    AGENTS_USER = "agents-user"
+    CLAUDE_USER = "claude-user"
+
+
+@dataclass(frozen=True)
+class SkillReference:
+    provider: SkillProvider
+    scope: SkillScope
+    name: str
+
+
+@dataclass(frozen=True)
+class SkillDocument:
+    reference: SkillReference
+    content: str
+
+
+SKILL_SCOPES = {
+    SkillProvider.CODEX: (SkillScope.CODEX_USER, SkillScope.AGENTS_USER),
+    SkillProvider.CLAUDE: (SkillScope.CLAUDE_USER,),
 }
 MAX_SKILL_BYTES = 64 * 1024
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -21,25 +44,29 @@ _FILE_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
 _UNAVAILABLE = {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EACCES, errno.EPERM}
 
 
-def _roots(provider):
+def _provider(value: str) -> SkillProvider:
     try:
-        return SKILL_ROOTS[provider]
-    except KeyError:
+        return SkillProvider(value)
+    except ValueError:
         raise ValueError("Unknown skill provider") from None
 
 
-def _valid_name(name):
-    return (
-        bool(name)
-        and not name.startswith(".")
-        and "/" not in name
-        and "\\" not in name
-        and name.isprintable()
-    )
+def _root(scope: SkillScope) -> Path:
+    match scope:
+        case SkillScope.CODEX_USER:
+            return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "skills"
+        case SkillScope.AGENTS_USER:
+            return Path.home() / ".agents" / "skills"
+        case SkillScope.CLAUDE_USER:
+            return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "skills"
+
+
+def _valid_name(name: str) -> bool:
+    return bool(name and not name.startswith(".") and "/" not in name and "\\" not in name and name.isprintable())
 
 
 @contextmanager
-def _directory(path, parent=None):
+def _directory(path: str | Path, parent: int | None = None) -> Iterator[int]:
     descriptor = os.open(path, _DIRECTORY_FLAGS, dir_fd=parent)
     try:
         yield descriptor
@@ -47,23 +74,23 @@ def _directory(path, parent=None):
         os.close(descriptor)
 
 
-def _skill_file(directory):
-    return os.stat("SKILL.md", dir_fd=directory, follow_symlinks=False)
+def _regular_skill(directory: int) -> bool:
+    return stat.S_ISREG(os.stat("SKILL.md", dir_fd=directory, follow_symlinks=False).st_mode)
 
 
-def list_skills(provider: str) -> list[dict]:
-    """List skill folder names with their provider and scope."""
-    skills = []
-    for scope, root in _roots(provider).items():
+def list_skills(provider: str) -> list[SkillReference]:
+    selected = _provider(provider)
+    skills: list[SkillReference] = []
+    for scope in SKILL_SCOPES[selected]:
         try:
-            with _directory(root) as root_directory:
-                for name in sorted(os.listdir(root_directory)):
+            with _directory(_root(scope)) as root:
+                for name in sorted(os.listdir(root)):
                     if not _valid_name(name):
                         continue
                     try:
-                        with _directory(name, root_directory) as directory:
-                            if stat.S_ISREG(_skill_file(directory).st_mode):
-                                skills.append({"provider": provider, "scope": scope, "name": name})
+                        with _directory(name, root) as directory:
+                            if _regular_skill(directory):
+                                skills.append(SkillReference(selected, scope, name))
                     except OSError as error:
                         if error.errno not in _UNAVAILABLE:
                             raise
@@ -73,17 +100,20 @@ def list_skills(provider: str) -> list[dict]:
     return skills
 
 
-def read_skill(provider: str, scope: str, name: str) -> dict:
-    """Return the exact SKILL.md text for a listed skill."""
-    root = _roots(provider).get(scope)
-    if root is None:
+def read_skill(provider: str, scope: str, name: str) -> SkillDocument:
+    selected = _provider(provider)
+    try:
+        skill_scope = SkillScope(scope)
+    except ValueError:
+        raise ValueError("Unknown skill scope for provider") from None
+    if skill_scope not in SKILL_SCOPES[selected]:
         raise ValueError("Unknown skill scope for provider")
     if not _valid_name(name):
         raise ValueError("Invalid skill name")
 
     try:
-        with _directory(root) as root_directory, _directory(name, root_directory) as directory:
-            if not stat.S_ISREG(_skill_file(directory).st_mode):
+        with _directory(_root(skill_scope)) as root, _directory(name, root) as directory:
+            if not _regular_skill(directory):
                 raise FileNotFoundError("Skill not found")
             descriptor = os.open("SKILL.md", _FILE_FLAGS, dir_fd=directory)
             with os.fdopen(descriptor, "rb") as stream:
@@ -104,4 +134,4 @@ def read_skill(provider: str, scope: str, name: str) -> dict:
         content = data.decode("utf-8")
     except UnicodeDecodeError:
         raise ValueError("Skill document is not valid UTF-8") from None
-    return {"provider": provider, "scope": scope, "name": name, "content": content}
+    return SkillDocument(SkillReference(selected, skill_scope, name), content)

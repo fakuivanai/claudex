@@ -1,3 +1,5 @@
 # The v1 SDK is supported by the installed stdio clients and by Claude Agent SDK.
 mcp==1.30.0
 claude-agent-sdk==0.2.187
+pydantic==2.14.4
+starlette==1.10.0

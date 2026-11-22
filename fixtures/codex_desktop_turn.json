@@ -1,0 +1,25 @@
+{
+  "source": "Sanitized from a disposable Codex Desktop 26.1103.60933 chat, thread_history_1.sqlite.",
+  "status": "completed",
+  "items": [
+    {
+      "item_type": "functionCallOutput",
+      "item": {
+        "type": "functionCallOutput",
+        "id": "fco_fixture",
+        "name": "peer_message",
+        "namespace": "thread_bridge",
+        "output": "{\"schema\":\"thread-bridge.peer-message/v1\",\"message_id\":\"fixture-message\",\"sender\":{\"peer\":\"Claude fixture\",\"provider\":\"claude\",\"host\":\"local\",\"profile\":\"current local app\",\"thread\":\"local_00000000-0000-4000-8000-000000000001\"},\"untrusted_peer_content\":\"Fixture peer text.\"}"
+      }
+    },
+    {
+      "item_type": "agentMessage",
+      "item": {
+        "type": "agentMessage",
+        "id": "amsg_fixture",
+        "phase": "final_answer",
+        "text": "Fixture assistant text."
+      }
+    }
+  ]
+}

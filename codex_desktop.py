@@ -1,266 +1,334 @@
-"""Version-specific local relay for selected Codex Desktop chats.
+"""Relay an authorized peer message to the loaded Codex Desktop owner.
 
-The little-endian JSON framing and router initialization are adapted from
-weekly-quota-guard/quota_guard_ipc.py, which was independently derived from the
-installed Desktop bundle. The methods and versions here were rechecked in
-Desktop 26.1103.60933 app.asar: early-bootstrap.js (versions), .vite/build/
-early-bootstrap-339-104173bc8fd02c8b.js (router and discovery), and
-early-bootstrap-815-e030c49be4b9c405.js (owner and turn handler).
+The little-endian framing and initialization were adapted from the local
+weekly-quota-guard/quota_guard_ipc.py prototype, SHA-256
+b272fe9e6006301a8e7d987c5c9ad6d0af5025d57891dfdb63601aa7204fd057.
+That implementation was derived from the Codex Desktop 26.1002.52244 bundle.
+The request methods, capability and versions here were verified against
+Codex Desktop 26.1103.60933.
 """
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
 import json
-import os
 from pathlib import Path
 import socket
-import stat
 import struct
 import time
 import uuid
 
-
-MAX_FRAME = 4 * 1024 * 1024
-MAX_BODY_CHARS = 16000
-TIMEOUT = 12.0
-NO_RECIPIENT = {"no-client-found", "client-not-found"}
+from codex_peer import PeerMessage as PeerMessage, PeerSender as PeerSender, ToolOutput, tool_output
 
 
-class DesktopError(Exception):
-    def __init__(self, message, *, uncertain=False):
-        super().__init__(message)
-        self.uncertain = uncertain
+MAX_FRAME_BYTES = 4 * 1024 * 1024
+TIMEOUT_SECONDS = 12.0
 
 
-def thread_uuid(value):
-    if not isinstance(value, str):
-        raise DesktopError("Expected a Codex Desktop thread UUID")
+class DesktopError(ValueError):
+    pass
+
+
+class UnconfirmedDelivery(DesktopError):
+    pass
+
+
+@dataclass(frozen=True)
+class Ready:
+    chat_id: str
+    owner_client_id: str
+
+    def to_wire(self) -> dict[str, object]:
+        return {
+            "state": "ready",
+            "chat_id": self.chat_id,
+            "owner_client_id": self.owner_client_id,
+            "supports_untrusted_app_input": True,
+        }
+
+
+@dataclass(frozen=True)
+class Submitted:
+    chat_id: str
+    turn_id: str
+
+    def to_wire(self) -> dict[str, object]:
+        return {"state": "submitted", "chat_id": self.chat_id, "turn_id": self.turn_id}
+
+
+@dataclass(frozen=True)
+class Refused:
+    error: str
+
+    def to_wire(self) -> dict[str, object]:
+        return {"state": "refused", "error": self.error}
+
+
+@dataclass(frozen=True)
+class Unknown:
+    error: str
+
+    def to_wire(self) -> dict[str, object]:
+        return {"state": "unknown", "error": self.error}
+
+
+def parse_chat_identifier(value: object) -> str:
+    if isinstance(value, str):
+        try:
+            return str(uuid.UUID(value))
+        except ValueError:
+            pass
+    raise DesktopError("Expected a Codex Desktop chat UUID")
+
+
+class Method(Enum):
+    INITIALIZE = "initialize"
+    DISCOVER_OWNER = "thread-owner-discovery"
+    START_TURN = "thread-follower-start-turn"
+
+
+@dataclass(frozen=True)
+class DiscoveryRequest:
+    request_id: str
+
+
+@dataclass(frozen=True)
+class RouterRejection:
+    request_id: str
+    no_owner: bool
+
+
+@dataclass(frozen=True)
+class Initialization:
+    client_id: str
+
+
+@dataclass(frozen=True)
+class OwnerDiscovery:
+    owner_id: str
+    supports_tool_output: bool
+
+
+@dataclass(frozen=True)
+class StartedTurn:
+    turn_id: str
+
+
+type Reply = Initialization | OwnerDiscovery | StartedTurn
+
+
+@dataclass(frozen=True)
+class RouterResponse:
+    request_id: str
+    handled_by: str
+    reply: Reply
+
+
+type IncomingFrame = DiscoveryRequest | RouterRejection | RouterResponse
+
+
+def object_fields(value: object) -> dict[object, object]:
+    if isinstance(value, dict):
+        return value
+    raise DesktopError("Malformed Codex Desktop IPC response")
+
+
+def frame_identifier(value: object) -> str:
+    if isinstance(value, str) and 0 < len(value) <= 128:
+        return value
+    raise DesktopError("Invalid identifier in Codex Desktop IPC response")
+
+
+def parse_router_frame(payload: bytes) -> IncomingFrame | None:
     try:
-        return str(uuid.UUID(value))
-    except ValueError as error:
-        raise DesktopError("Expected a Codex Desktop thread UUID") from error
-
-
-def thread_socket():
-    path = Path.home() / ".codex" / "ipc" / "ipc.sock"
-    try:
-        directory = path.parent.lstat()
-        endpoint = path.lstat()
-    except OSError as error:
-        raise DesktopError("Codex Desktop IPC socket is unavailable") from error
-    uid = os.getuid()
-    if (
-        not stat.S_ISDIR(directory.st_mode)
-        or not stat.S_ISSOCK(endpoint.st_mode)
-        or directory.st_uid != uid
-        or endpoint.st_uid != uid
-        or directory.st_mode & 0o077
-        or endpoint.st_mode & 0o077
-    ):
-        raise DesktopError("Codex Desktop IPC socket must be private to the current user")
-    return path
+        data: object = json.loads(payload)
+    except (ValueError, RecursionError) as error:
+        raise DesktopError("Malformed Codex Desktop IPC response") from error
+    fields = object_fields(data)
+    kind = fields.get("type")
+    if kind == "client-discovery-request":
+        return DiscoveryRequest(frame_identifier(fields.get("requestId")))
+    if kind != "response":
+        return None
+    request_id = frame_identifier(fields.get("requestId"))
+    if fields.get("resultType") != "success":
+        no_owner = (
+            fields.get("error") in ("no-client-found", "client-not-found")
+            and fields.get("handledByClientId") is None
+        )
+        return RouterRejection(request_id, no_owner)
+    method = fields.get("method")
+    if method not in (Method.INITIALIZE.value, Method.DISCOVER_OWNER.value, Method.START_TURN.value):
+        return None
+    handled_by = parse_chat_identifier(fields.get("handledByClientId"))
+    result = object_fields(fields.get("result"))
+    reply: Reply
+    match method:
+        case Method.INITIALIZE.value:
+            reply = Initialization(parse_chat_identifier(result.get("clientId")))
+        case Method.DISCOVER_OWNER.value:
+            reply = OwnerDiscovery(handled_by, result.get("supportsUntrustedAppInput") is True)
+        case Method.START_TURN.value:
+            start_reply = object_fields(result.get("result"))
+            turn_fields = object_fields(start_reply.get("turn"))
+            reply = StartedTurn(frame_identifier(turn_fields.get("id")))
+        case _:
+            return None
+    return RouterResponse(request_id, handled_by, reply)
 
 
 class DesktopClient:
-    def __init__(self):
+    def __init__(self, connection: socket.socket) -> None:
+        self.connection = connection
+        self.deadline = time.monotonic() + TIMEOUT_SECONDS
         self.client_id = "initializing-client"
-        self.deadline = time.monotonic() + TIMEOUT
-        self.socket = None
 
-    def __enter__(self):
-        try:
-            path = thread_socket()
-            self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.set_timeout()
-            self.socket.connect(str(path))
-            peer = self.socket.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
-            _, uid, _ = struct.unpack("3i", peer)
-            if uid != os.getuid():
-                raise DesktopError("Codex Desktop router peer belongs to a different user")
-            response = self.request("initialize", {"clientType": "thread-bridge"}, 0)
-            assigned = response["result"].get("clientId")
-            if not isinstance(assigned, str) or response.get("handledByClientId") != assigned:
-                raise DesktopError("Codex Desktop router did not establish a client identity")
-            self.client_id = thread_uuid(assigned)
-        except OSError as error:
-            self.__exit__()
-            raise DesktopError("Could not connect to Codex Desktop IPC") from error
-        except BaseException:
-            self.__exit__()
-            raise
-        return self
+    def initialize(self) -> None:
+        response = self.request(Method.INITIALIZE, 0, {"clientType": "claudex"})
+        if not isinstance(response.reply, Initialization) or response.handled_by != response.reply.client_id:
+            raise DesktopError("Codex Desktop router did not establish a client identity")
+        self.client_id = response.reply.client_id
 
-    def __exit__(self, *_):
-        if self.socket is not None:
-            self.socket.close()
-
-    def set_timeout(self):
+    def set_timeout(self) -> float:
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise DesktopError("Codex Desktop IPC timed out")
-        self.socket.settimeout(remaining)
+        self.connection.settimeout(remaining)
         return remaining
 
-    def exact(self, count):
+    def receive_exactly(self, count: int) -> bytes:
         chunks = bytearray()
         while len(chunks) < count:
             self.set_timeout()
-            chunk = self.socket.recv(min(count - len(chunks), 65536))
+            chunk = self.connection.recv(min(count - len(chunks), 65536))
             if not chunk:
                 raise DesktopError("Codex Desktop IPC disconnected")
             chunks.extend(chunk)
-        return chunks
+        return bytes(chunks)
 
-    def read(self):
-        (size,) = struct.unpack("<I", self.exact(4))
-        if not 0 < size <= MAX_FRAME:
+    def read_frame(self) -> IncomingFrame | None:
+        size = int.from_bytes(self.receive_exactly(4), "little")
+        if not 0 < size <= MAX_FRAME_BYTES:
             raise DesktopError("Unexpected Codex Desktop IPC frame length")
-        try:
-            response = json.loads(self.exact(size))
-        except (ValueError, RecursionError) as error:
-            raise DesktopError("Malformed Codex Desktop IPC response") from error
-        if not isinstance(response, dict):
-            raise DesktopError("Malformed Codex Desktop IPC response")
-        return response
+        return parse_router_frame(self.receive_exactly(size))
 
-    def write(self, data):
-        raw = json.dumps(data, ensure_ascii=True, separators=(",", ":")).encode()
-        if not 0 < len(raw) <= MAX_FRAME:
+    def write_frame(self, frame: dict[str, object]) -> None:
+        payload = json.dumps(frame, ensure_ascii=True, separators=(",", ":")).encode()
+        if not 0 < len(payload) <= MAX_FRAME_BYTES:
             raise DesktopError("Codex Desktop IPC request exceeds the frame limit")
         self.set_timeout()
-        self.socket.sendall(struct.pack("<I", len(raw)) + raw)
+        self.connection.sendall(struct.pack("<I", len(payload)) + payload)
 
-    def request(self, method, params, version, *, target=None, mutating=False):
+    def request(
+        self, method: Method, version: int, parameters: dict[str, object], *, target: str | None = None,
+    ) -> RouterResponse:
         request_id = str(uuid.uuid4())
-        remaining = self.set_timeout()
-        request = {
+        try:
+            remaining = self.set_timeout()
+        except OSError as error:
+            raise DesktopError("Codex Desktop IPC closed before the request") from error
+        frame: dict[str, object] = {
             "type": "request",
             "requestId": request_id,
             "sourceClientId": self.client_id,
-            "method": method,
-            "params": params,
+            "method": method.value,
+            "params": parameters,
             "version": version,
             "timeoutMs": min(10000, max(1, int(remaining * 1000))),
         }
         if target is not None:
-            request["targetClientId"] = target
+            frame["targetClientId"] = target
         try:
-            self.write(request)
+            self.write_frame(frame)
             while True:
-                response = self.read()
-                kind = response.get("type")
-                if kind == "client-discovery-request":
-                    incoming = response.get("requestId")
-                    if isinstance(incoming, str) and len(incoming) <= 128:
-                        self.write({
-                            "type": "client-discovery-response",
-                            "requestId": incoming,
-                            "response": {"canHandle": False},
-                        })
-                if kind == "response" and response.get("requestId") == request_id:
+                incoming = self.read_frame()
+                if isinstance(incoming, DiscoveryRequest):
+                    self.write_frame({
+                        "type": "client-discovery-response",
+                        "requestId": incoming.request_id,
+                        "response": {"canHandle": False},
+                    })
+                elif incoming is not None and incoming.request_id == request_id:
                     break
         except (DesktopError, OSError) as error:
-            raise DesktopError("Codex Desktop IPC closed, timed out, or returned invalid data",
-                               uncertain=mutating) from error
-        if response.get("resultType") != "success":
-            error = response.get("error")
-            if isinstance(error, str) and error in NO_RECIPIENT and response.get("handledByClientId") is None:
+            failure = UnconfirmedDelivery if method is Method.START_TURN else DesktopError
+            raise failure("Codex Desktop IPC closed, timed out, or returned invalid data") from error
+        if isinstance(incoming, RouterRejection):
+            if incoming.no_owner:
                 raise DesktopError("Codex Desktop has no loaded owner for that local chat")
-            raise DesktopError("Codex Desktop did not confirm the request", uncertain=mutating)
-        if (
-            response.get("method") != method
-            or not isinstance(response.get("result"), dict)
-            or target is not None and response.get("handledByClientId") != target
-        ):
-            raise DesktopError("Codex Desktop acknowledgement did not match the request",
-                               uncertain=mutating)
-        return response
+            failure = UnconfirmedDelivery if method is Method.START_TURN else DesktopError
+            raise failure("Codex Desktop did not confirm the request")
+        if target is not None and incoming.handled_by != target:
+            raise UnconfirmedDelivery("Codex Desktop acknowledgement did not match the request")
+        return incoming
 
-    def owner(self, thread_id):
+    def owner(self, chat_id: str) -> str:
         response = self.request(
-            "thread-owner-discovery",
-            {"hostId": "local", "conversationId": thread_id},
-            1,
+            Method.DISCOVER_OWNER, 1, {"hostId": "local", "conversationId": chat_id},
         )
-        owner_id = thread_uuid(response.get("handledByClientId"))
-        if owner_id == self.client_id:
+        reply = response.reply
+        if not isinstance(reply, OwnerDiscovery):
+            raise DesktopError("Codex Desktop acknowledgement did not match owner discovery")
+        if reply.owner_id == self.client_id:
             raise DesktopError("Codex Desktop returned the relay as chat owner")
-        if response["result"].get("supportsUntrustedAppInput") is not True:
+        if not reply.supports_tool_output:
             raise DesktopError("Codex Desktop owner does not advertise untrusted tool input support")
-        return owner_id
+        return reply.owner_id
 
-    def deliver(self, thread_id, tool_output):
-        owner_id = self.owner(thread_id)
-        reply = self.request(
-            "thread-follower-start-turn",
-            {
-                "conversationId": thread_id,
-                "turnStart": {
-                    "request": {"threadId": thread_id, "input": [], "toolOutput": tool_output},
-                },
-            },
+    def deliver(self, chat_id: str, output: ToolOutput) -> Submitted:
+        owner = self.owner(chat_id)
+        response = self.request(
+            Method.START_TURN,
             2,
-            target=owner_id,
-            mutating=True,
+            {
+                "conversationId": chat_id,
+                "turnStart": {"request": {"threadId": chat_id, "input": [], "toolOutput": output}},
+            },
+            target=owner,
         )
-        result = reply["result"].get("result")
-        turn = result.get("turn") if isinstance(result, dict) else None
-        turn_id = turn.get("id") if isinstance(turn, dict) else None
-        if not isinstance(turn_id, str) or not turn_id or len(turn_id) > 128:
-            raise DesktopError("Codex Desktop acknowledgement did not include a turn ID",
-                               uncertain=True)
-        return {"state": "submitted", "thread_id": thread_id, "turn_id": turn_id}
+        if not isinstance(response.reply, StartedTurn):
+            raise UnconfirmedDelivery("Codex Desktop acknowledgement did not include a turn ID")
+        return Submitted(chat_id, response.reply.turn_id)
 
 
-def text_field(value, label, maximum):
-    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
-        raise DesktopError(f"Invalid {label}")
-    return value
+@contextmanager
+def desktop_client(socket_path: Path | None) -> Iterator[DesktopClient]:
+    path = socket_path if socket_path is not None else Path.home() / ".codex/ipc/ipc.sock"
+    try:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    except OSError as error:
+        raise DesktopError("Could not create Codex Desktop IPC socket") from error
+    with connection:
+        client = DesktopClient(connection)
+        try:
+            client.set_timeout()
+            connection.connect(str(path))
+        except OSError as error:
+            raise DesktopError("Could not connect to Codex Desktop IPC") from error
+        client.initialize()
+        yield client
 
 
-def peer_output(message):
-    if not isinstance(message, dict):
-        raise DesktopError("Expected an authenticated peer message")
-    sender = message.get("sender")
-    if not isinstance(sender, dict):
-        raise DesktopError("Expected peer sender attribution")
-    origin = {
-        field: text_field(sender.get(field), f"sender {field}", 256)
-        for field in ("peer", "provider", "thread")
-    }
-    content = {
-        "schema": "thread-bridge.peer-message/v1",
-        "message_id": text_field(message.get("message_id"), "message ID", 256),
-        "sender": origin,
-        "untrusted_peer_content": text_field(message.get("body"), "peer body", MAX_BODY_CHARS),
-    }
-    return {
-        "name": "peer_message",
-        "namespace": "thread_bridge",
-        "output": json.dumps(content, ensure_ascii=True, separators=(",", ":")),
-        "retain": False,
-    }
-
-
-def owner(thread_id: str) -> dict:
+def owner(chat_id: str, *, socket_path: Path | None = None) -> Ready | Refused:
     """Read the loaded local chat owner and its untrusted-input capability."""
     try:
-        thread_id = thread_uuid(thread_id)
-        with DesktopClient() as client:
-            return {
-                "state": "ready",
-                "thread_id": thread_id,
-                "owner_client_id": client.owner(thread_id),
-                "supports_untrusted_app_input": True,
-            }
+        chat_id = parse_chat_identifier(chat_id)
+        with desktop_client(socket_path) as client:
+            return Ready(chat_id, client.owner(chat_id))
     except DesktopError as error:
-        return {"state": "refused", "error": str(error)}
+        return Refused(str(error))
 
 
-def deliver(thread_id: str, message: dict) -> dict:
+def deliver(
+    chat_id: str, message: PeerMessage, *, socket_path: Path | None = None,
+) -> Submitted | Refused | Unknown:
     """Submit an already-authorized peer message through the existing owner."""
     try:
-        thread_id = thread_uuid(thread_id)
-        output = peer_output(message)
-        with DesktopClient() as client:
-            return client.deliver(thread_id, output)
+        chat_id = parse_chat_identifier(chat_id)
+        with desktop_client(socket_path) as client:
+            return client.deliver(chat_id, tool_output(message))
+    except UnconfirmedDelivery as error:
+        return Unknown(str(error))
     except DesktopError as error:
-        return {"state": "unknown" if error.uncertain else "refused", "error": str(error)}
+        return Refused(str(error))

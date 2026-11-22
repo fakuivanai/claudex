@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+cd "$(dirname "$0")"
+claudex_python=${CLAUDEX_PYTHON:-python3}
+claudex_node=${CLAUDEX_NODE:-node}
+"$claudex_python" -m mypy .
+"$claudex_python" -B -m unittest discover -v
+"$claudex_node" --test --test-isolation=none patcher/restore.test.cjs

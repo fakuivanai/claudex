@@ -1,94 +1,151 @@
-"""Launch and reopen exact Desktop-owned Claude Code chats."""
+"""Launch the signed-in Claude Desktop and open native Code links."""
+
+from dataclasses import dataclass, field
+from enum import StrEnum
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import time
 from urllib.parse import urlencode
 
 import claude_desktop
+from claude_desktop import ClaudeChatId, ClaudeDesktopError, CodexNoticeSender, LiveChat, NoticeStatus
 
 
-OPEN_TIMEOUT = 18.0  # Allow the managed Desktop worker to start before reporting queued work.
+OPEN_TIMEOUT = 18.0
 
 
-def launch(url=None):
-    launcher = Path(os.environ.get("THREAD_BRIDGE_CLAUDE_LAUNCHER") or Path.home() / ".local/bin/claude-desktop")
-    if not launcher.is_absolute() or not launcher.is_file() or not os.access(launcher, os.X_OK):
-        raise claude_desktop.ClaudeDesktopError("Configure the absolute, executable account-preserving Claude Desktop launcher.")
-    args = [str(launcher)]
+class LaunchStatus(StrEnum):
+    REQUESTED = "launch_requested"
+
+
+class DraftStatus(StrEnum):
+    REQUESTED = "draft_requested"
+
+
+class WakeStatus(StrEnum):
+    ALREADY_RUNNING = "already_running"
+    INBOX_READY = "inbox_ready"
+    WAITING_FOR_INBOX = "waiting_for_inbox"
+
+
+class StoredStatus(StrEnum):
+    STORED = "stored"
+
+
+@dataclass(frozen=True)
+class WakeResult:
+    chat_id: ClaudeChatId
+    status: WakeStatus
+
+
+@dataclass(frozen=True)
+class StoredNotice:
+    message_id: str
+    reason: str
+    status: StoredStatus = field(default=StoredStatus.STORED, init=False)
+    opened_saved_chat: bool = field(default=False, init=False)
+
+
+@dataclass(frozen=True)
+class AttemptedNotice:
+    message_id: str
+    status: NoticeStatus
+    opened_saved_chat: bool
+
+
+NoticeResult = StoredNotice | AttemptedNotice
+
+
+@dataclass(frozen=True)
+class _ReadyInbox:
+    live: LiveChat
+    opened_saved_chat: bool
+
+
+def _launcher() -> Path:
+    configured = os.environ.get("CLAUDEX_CLAUDE_LAUNCHER")
+    default = Path.home() / ".local" / "bin" / "claude-desktop"
+    if configured:
+        candidate = Path(configured)
+    else:
+        fallback = shutil.which("claude-desktop") if not default.is_file() else None
+        candidate = Path(fallback) if fallback else default
+    if not candidate.is_absolute() or not candidate.is_file() or not os.access(candidate, os.X_OK):
+        raise ClaudeDesktopError("Set CLAUDEX_CLAUDE_LAUNCHER to the absolute path of your executable Claude Desktop launcher.")
+    return candidate
+
+
+def launch(url: str | None = None) -> LaunchStatus:
+    arguments = [str(_launcher())]
     if url is not None:
-        args.append(url)
+        arguments.append(url)
     try:
         subprocess.Popen(
-            args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            arguments, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
     except OSError as error:
-        raise claude_desktop.ClaudeDesktopError("Could not launch Claude Desktop") from error
-    return {"status": "launch_requested"}
+        raise ClaudeDesktopError("Could not launch Claude Desktop") from error
+    return LaunchStatus.REQUESTED
 
 
-def validate_saved(thread_id):
-    if not isinstance(thread_id, str) or not claude_desktop.DESKTOP_ID.fullmatch(thread_id):
-        raise ValueError("Use the exact local Claude Desktop chat ID.")
-    config_root = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    root = config_root / "Claude/claude-code-sessions"
-    for path in root.glob(f"*/*/{thread_id}.json"):
-        row = claude_desktop.read_object(path)
-        if row.get("sessionId") == thread_id and row.get("isArchived") is False:
-            return
-    raise ValueError("No saved, unarchived Claude Desktop chat matches that ID.")
+def validate_saved(target: ClaudeChatId) -> None:
+    if not claude_desktop.saved_records(target):
+        raise ValueError("No saved, unarchived Claude Desktop chat matches that ID.")
 
 
-def wait_for_box(thread_id, timeout=OPEN_TIMEOUT):
-    until = time.monotonic() + timeout
+def wait_for_inbox(target: ClaudeChatId, timeout: float = OPEN_TIMEOUT) -> LiveChat | None:
+    deadline = time.monotonic() + timeout
     while True:
-        for chat in claude_desktop.live_sessions():
-            if chat["id"] == thread_id and chat["inbox"] is not None:
-                return chat
-        if time.monotonic() >= until:
+        for live in claude_desktop.live_sessions():
+            if live.chat.id == target and live.inbox is not None:
+                return live
+        if time.monotonic() >= deadline:
             return None
-        time.sleep(0.25)  # Recheck the registry without busy-spinning during startup.
+        time.sleep(0.25)
 
 
-def draft_url(prompt, folder=None):
-    params = {"q": prompt}
+def draft_url(prompt: str, folder: str | None = None) -> str:
+    parameters = {"q": prompt}
     if folder is not None:
         path = Path(folder).expanduser()
         if not path.is_absolute() or not path.is_dir():
             raise ValueError("Use an absolute path to an existing local folder.")
-        params["folder"] = str(path)
-    return "claude://code/new?" + urlencode(params)
+        parameters["folder"] = str(path)
+    # Native Code draft links populate the composer and leave submission to the person:
+    # https://support.claude.com/en/articles/14729294-open-claude-desktop-with-a-link
+    return "claude://code/new?" + urlencode(parameters)
 
 
-def open_draft(prompt, folder=None):
-    """Open the documented native Code draft. Desktop handles submission."""
+def open_draft(prompt: str, folder: str | None = None) -> DraftStatus:
     launch(draft_url(prompt, folder))
-    return {"status": "draft_requested"}
+    return DraftStatus.REQUESTED
 
 
-def wake(thread_id):
-    """Ask Desktop to reopen the exact saved chat and check for its inbox."""
-    if wait_for_box(thread_id, timeout=0):
-        return {"status": "already_running", "thread_id": thread_id}
-    validate_saved(thread_id)
-    # Installed Claude Desktop 5.11492.5 also accepts an exact local ID here.
-    # Measured against the app's native manager, not the CLI import/resume URI.
-    launch("claude://code/continue?" + urlencode({"session": thread_id}))
-    status = "inbox_ready" if wait_for_box(thread_id) is not None else "waiting_for_inbox"
-    return {"status": status, "thread_id": thread_id}
+def _ensure_inbox(target: ClaudeChatId) -> _ReadyInbox | None:
+    live = wait_for_inbox(target, timeout=0)
+    if live is not None:
+        return _ReadyInbox(live, opened_saved_chat=False)
+    validate_saved(target)
+    # Desktop 5.11492.5 accepts its own local ID here and keeps its own runtime.
+    launch("claude://code/continue?" + urlencode({"session": target}))
+    live = wait_for_inbox(target)
+    return _ReadyInbox(live, opened_saved_chat=True) if live is not None else None
 
 
-def notify(thread_id, message_id, *, sender=None):
-    """Wake an idle live chat, or ask Desktop to restore the saved chat first."""
-    result = wake(thread_id)
-    if result["status"] == "waiting_for_inbox":
-        return {
-            "status": "stored", "message_id": message_id,
-            "notification": result.get("reason") or "No live inbox appeared after requesting the saved chat.",
-            "opened_saved_chat": False,
-        }
-    return {
-        **claude_desktop.notify(thread_id, message_id, sender=sender),
-        "opened_saved_chat": result["status"] == "inbox_ready",
-    }
+def wake(target: ClaudeChatId) -> WakeResult:
+    ready = _ensure_inbox(target)
+    if ready is None:
+        return WakeResult(target, WakeStatus.WAITING_FOR_INBOX)
+    return WakeResult(target, WakeStatus.INBOX_READY if ready.opened_saved_chat else WakeStatus.ALREADY_RUNNING)
+
+
+def notify(target: ClaudeChatId, message_id: str, *, sender: CodexNoticeSender | None = None) -> NoticeResult:
+    """Notify the exact live inbox, or leave the message stored until it appears."""
+    ready = _ensure_inbox(target)
+    if ready is None:
+        return StoredNotice(message_id, "No live inbox appeared after requesting the saved chat.")
+    status = claude_desktop.submit_notice(ready.live, message_id, sender)
+    return AttemptedNotice(message_id, status, ready.opened_saved_chat)

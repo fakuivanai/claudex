@@ -1,0 +1,11 @@
+{
+  "pid": 12345,
+  "sessionId": "00000000-0000-4000-8000-000000000102",
+  "kind": "interactive",
+  "entrypoint": "claude-desktop",
+  "hostSessionId": "local_00000000-0000-4000-8000-000000000101",
+  "pidDomain": "linux:00000000000000000000000000000000:pid:[1000000000]",
+  "messagingSocketPath": "/tmp/claudex-fixture/inbox.sock",
+  "name": "Fixture chat",
+  "status": "idle"
+}
