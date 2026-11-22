@@ -86,7 +86,7 @@ CLAUDEX_CLAUDE_LAUNCHER = "/absolute/path/to/claude-launcher"
 | `send_message`, `read_messages` | Delivers Claude messages to any loaded Codex chat as attributed tool output. An unloaded Codex chat is reported as `not_loaded`. Stores Codex messages for the exact Claude chat and hands its worker a fixed notice. The recipient calls `read_messages` to fetch the body. |
 | `launch_claude`, `wake_chat` | Opens Claude Desktop or asks it to reopen a saved chat. `waiting_for_inbox` means the native worker did not appear in time. Stored mail remains available. |
 | `open_chat_draft` | Opens a Claude Code composer for the person to review and submit. Claude confirms any folder supplied through the link. |
-| `list_skills`, `read_skill` | Reads local user `SKILL.md` files as text, including user-installed links to skill directories. Scopes are `claude-user`, `codex-user`, and `agents-user`. |
+| `list_skills`, `read_skill` | Reads local user `SKILL.md` files as text, including links to read-only Home Manager skills in the Nix store. Scopes are `claude-user`, `codex-user`, and `agents-user`. |
 
 A submitted Claude inbox notice can still be held or declined by the app.
 A lost Codex acknowledgement leaves delivery uncertain. Check the recipient
@@ -125,11 +125,24 @@ read-only over the installed archive for that process tree. Keep the vendor
 package and unpacked resources available.
 
 Add `--disable` before `--` to launch stock through this wrapper. If the patch
-cannot be built or the mount cannot start, the wrapper reports the reason
+cannot be built or the mount cannot start, the wrapper reports the reason,
+notifies the graphical session when the notification service is available,
 and starts stock. Once the app starts, its own exit status is returned.
 By default the launcher refuses a second instance. With `--reuse-running`,
 one native Claude link can be handed to the existing app without a new
 launch.
+
+For a Home Manager setup, keep the original account helper as a separate
+stock command. Point the shared desktop entry, URL handler and account
+switcher's relaunch at the wrapper shown above. Use an installed Claudex
+environment in a persistent data directory and pass the archive from the
+currently installed Claude Desktop package. An app update can then reach
+the version check and fall back to stock when needed.
+
+To roll back for one session, quit Desktop and run the wrapper with
+`--disable` before the separator. The managed stock launch invalidates old
+quit snapshots. You can then switch back to a Home Manager generation with
+the original launcher for persistent rollback.
 
 The patch snapshots the exact local chats with Remote Control connected
 when Desktop quits. The next patched launch restores that account and
