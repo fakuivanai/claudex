@@ -58,6 +58,8 @@ SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # A managed stock run invalidates an older Remote Control shutdown snapshot.
 STOCK_LAUNCH_MARKER = "last-stock-launch"
 STOCK_LAUNCH_CUTOFF = "CLAUDEX_REMOTE_CONTROL_SINCE"
+# A stalled notification service should only briefly delay the stock launch.
+NOTIFICATION_TIMEOUT = 2
 
 
 def running_desktop(processes: Path = Path("/proc")) -> bool:
@@ -215,10 +217,35 @@ def start_patched(
         return Started(launched.returncode)
 
 
-def stock_launch(command: list[str], environment: dict[str, str], state: Path, reason: str) -> int:
+def notify_stock_fallback(environment: dict[str, str]) -> None:
+    busctl = shutil.which("busctl", path=environment["PATH"])
+    if busctl is None:
+        return
+    try:
+        # The notification protocol uses empty action and hint arrays and the desktop's display timeout.
+        # https://specifications.freedesktop.org/notification/latest/protocol.html#org.freedesktop.Notifications.Notify
+        subprocess.run(
+            [busctl, "--user", "--auto-start=no", "--", "call", "org.freedesktop.Notifications",
+             "/org/freedesktop/Notifications", "org.freedesktop.Notifications", "Notify", "susssasa{sv}i",
+             "Claudex", "0", "", "Claudex is launching stock Claude Desktop",
+             "The patch could not start. Automatic Remote Control restore is off.", "0", "0", "-1"],
+            env=environment, cwd=environment["HOME"], check=False,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=NOTIFICATION_TIMEOUT,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def stock_launch(
+    command: list[str], environment: dict[str, str], state: Path, fallback_reason: str | None = None,
+) -> int:
+    reason = fallback_reason if fallback_reason is not None else "Remote Control patch disabled"
     print(f"claudex: {reason}. Launching stock Claude Desktop.", file=sys.stderr)
     # Python and Electron both express this wall-clock cutoff in milliseconds.
     publish_bytes(state / STOCK_LAUNCH_MARKER, str(time.time_ns() // 1_000_000).encode())
+    if fallback_reason is not None:
+        notify_stock_fallback(environment)
     return subprocess.run(command, env=environment, cwd=environment["HOME"], check=False).returncode
 
 
@@ -258,7 +285,7 @@ def launch(source: Path, command: list[str], *, disabled: bool, reuse_running: b
         if running_desktop():
             return existing_launch(command, environment, reuse_running)
         if disabled:
-            return stock_launch(command, environment, state, "Remote Control patch disabled")
+            return stock_launch(command, environment, state)
         bubblewrap = shutil.which("bwrap", path=environment["PATH"])
         if bubblewrap is None:
             return stock_launch(command, environment, state, "bubblewrap unavailable in the desktop environment")

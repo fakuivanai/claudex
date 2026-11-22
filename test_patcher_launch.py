@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
@@ -15,7 +16,7 @@ from desktop_environment import clean_environment, parse_desktop_environment
 from patcher import build as archive_builder
 from patcher.archive import Directory, Packed, encode_header, integrity_of
 from patcher.build import Anchor, DesktopRelease
-from patcher.launch import LaunchRefused, STOCK_LAUNCH_MARKER, cached_archive, launch, running_desktop
+from patcher.launch import LaunchRefused, STOCK_LAUNCH_MARKER, cached_archive, launch, notify_stock_fallback, running_desktop
 
 
 class DesktopEnvironmentTests(unittest.TestCase):
@@ -59,6 +60,7 @@ class DesktopLaunchTests(unittest.TestCase):
         self.stock.touch()
         self.patched = self.root / "patched.asar"
         self.record = self.root / "launch-record"
+        self.notice_record = self.root / "notice-record"
         self.environment = {"HOME": str(self.root), "PATH": str(self.bin), "XDG_CACHE_HOME": str(self.root / "cache")}
 
     def executable(self, name: str, source: str) -> Path:
@@ -98,11 +100,33 @@ os.execv(arguments[0], arguments)
 """,
         )
 
+    def fake_notifier(self, *, exit_code: int = 0, environment_reply: str = "") -> None:
+        self.executable(
+            "busctl",
+            f"""\
+import json
+import os
+from pathlib import Path
+import sys
+
+if "get-property" in sys.argv:
+    print({environment_reply!r})
+    raise SystemExit(0)
+with Path({str(self.notice_record)!r}).open("a") as record:
+    print(json.dumps({{
+        "content": sys.argv[1:],
+        "path": os.environ.get("PATH"),
+        "agent_keys": [key for key in os.environ if key.startswith("CODEX_")],
+    }}), file=record)
+raise SystemExit({exit_code})
+""",
+        )
+
     def test_stock_cli_uses_clean_desktop_environment(self) -> None:
         args = self.fake_launcher()
         entries = [f"{key}={value}" for key, value in self.environment.items()]
         entries.extend(["DISPLAY=:999", "CODEX_CI=1"])
-        self.executable("busctl", f"print({json.dumps({'type': 'as', 'data': entries})!r})")
+        self.fake_notifier(environment_reply=json.dumps({"type": "as", "data": entries}))
         with (
             patch("desktop_environment.SYSTEM_PATH", str(self.bin)),
             patch.dict(os.environ, {"CODEX_APP_TOOLS_PIPE_PATH": "fixture", "CODEX_THREAD_ID": "fixture"}),
@@ -119,9 +143,11 @@ os.execv(arguments[0], arguments)
             "patched_launch": False,
         })
         self.assertTrue((self.state / STOCK_LAUNCH_MARKER).is_file())
+        self.assertFalse(self.notice_record.exists())
 
     def test_nonzero_after_app_start_does_not_relaunch_stock(self) -> None:
         self.fake_bubblewrap()
+        self.fake_notifier()
         args = self.fake_launcher(exit_code=23)
         with (
             patch("patcher.launch.desktop_environment", return_value=self.environment),
@@ -131,6 +157,7 @@ os.execv(arguments[0], arguments)
             self.assertEqual(launch(self.stock, args, disabled=False), 23)
         self.assertEqual(len(self.record.read_text().splitlines()), 1)
         self.assertTrue(json.loads(self.record.read_text())["patched_launch"])
+        self.assertFalse(self.notice_record.exists())
 
     def test_disabled_launch_works_with_an_unusable_archive_cache(self) -> None:
         self.cache.parent.mkdir(parents=True)
@@ -172,6 +199,7 @@ os.execv(arguments[0], arguments)
 
     def test_build_failure_falls_back_to_stock_with_a_reason(self) -> None:
         self.fake_bubblewrap()
+        self.fake_notifier()
         args = self.fake_launcher()
         stderr = io.StringIO()
         with (
@@ -183,6 +211,35 @@ os.execv(arguments[0], arguments)
             self.assertEqual(launch(self.stock, args, disabled=False), 0)
         self.assertIn("unsupported archive). Launching stock Claude Desktop.", stderr.getvalue())
         self.assertFalse(json.loads(self.record.read_text())["patched_launch"])
+        self.assertEqual(json.loads(self.notice_record.read_text()), {
+            "content": [
+                "--user", "--auto-start=no", "--", "call", "org.freedesktop.Notifications",
+                "/org/freedesktop/Notifications", "org.freedesktop.Notifications", "Notify", "susssasa{sv}i",
+                "Claudex", "0", "", "Claudex is launching stock Claude Desktop",
+                "The patch could not start. Automatic Remote Control restore is off.", "0", "0", "-1",
+            ],
+            "path": str(self.bin),
+            "agent_keys": [],
+        })
+
+    def test_notification_failure_leaves_stock_launch_status_intact(self) -> None:
+        self.fake_notifier(exit_code=4)
+        args = self.fake_launcher(exit_code=23)
+        stderr = io.StringIO()
+        with (
+            patch("patcher.launch.desktop_environment", return_value=self.environment),
+            patch("patcher.launch.running_desktop", return_value=False),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(launch(self.stock, args, disabled=False), 23)
+        self.assertIn("bubblewrap unavailable", stderr.getvalue())
+        self.assertTrue(self.notice_record.is_file())
+
+    def test_notification_exec_error_or_timeout_does_not_escape(self) -> None:
+        self.fake_notifier()
+        for failure in (PermissionError("not executable"), subprocess.TimeoutExpired("busctl", 2)):
+            with self.subTest(failure=failure), patch("patcher.launch.subprocess.run", side_effect=failure):
+                notify_stock_fallback(self.environment)
 
     def test_account_exec_failure_before_app_start_falls_back(self) -> None:
         self.executable(
