@@ -41,6 +41,8 @@ MAX_SKILL_BYTES = 64 * 1024
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY
 _FILE_FLAGS = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
 _UNAVAILABLE = {errno.ENOENT, errno.ENOTDIR, errno.ELOOP, errno.EACCES, errno.EPERM}
+# Home Manager installs links to immutable skill directories below this root.
+_NIX_STORE = Path("/nix/store")
 
 
 def _root(scope: SkillScope) -> Path:
@@ -61,8 +63,12 @@ def _valid_name(name: str) -> bool:
 def _directory(path: str | Path, parent: int | None = None) -> Iterator[int]:
     descriptor = os.open(path, _DIRECTORY_FLAGS, dir_fd=parent)
     try:
-        if os.fstat(descriptor).st_uid != os.getuid():
-            raise PermissionError(errno.EACCES, "Skill directories must be owned by the local user.")
+        info = os.fstat(descriptor)
+        if info.st_uid != os.getuid():
+            # Check the opened directory, after following the installed link.
+            target = Path(os.readlink(f"/proc/self/fd/{descriptor}"))
+            if info.st_mode & 0o222 or not target.is_relative_to(_NIX_STORE):
+                raise PermissionError(errno.EACCES, "Expected a user-owned or read-only Nix store skill directory.")
         yield descriptor
     finally:
         os.close(descriptor)
