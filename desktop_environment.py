@@ -67,7 +67,7 @@ def clean_environment(properties: Mapping[str, str], home: Path) -> dict[str, st
 
     environment = {
         key: value for key, value in properties.items()
-        if key != "CODEX" and not key.startswith("CODEX_") and key != "CLAUDEX_REMOTE_CONTROL_SINCE"
+        if key != "CODEX" and not key.startswith("CODEX_")
     }
     environment["PATH"] = os.pathsep.join(
         entry for entry in properties.get("PATH", "").split(os.pathsep) if desktop_path(entry)

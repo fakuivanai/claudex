@@ -140,18 +140,14 @@ currently installed Claude Desktop package. An app update can then reach
 the version check and fall back to stock when needed.
 
 To roll back for one session, quit Desktop and run the wrapper with
-`--disable` before the separator. The managed stock launch invalidates old
-quit snapshots. You can then switch back to a Home Manager generation with
-the original launcher for persistent rollback.
+`--disable` before the separator. You can then switch back to a Home
+Manager generation with the original launcher for persistent rollback.
 
-The patch snapshots the exact local chats with Remote Control connected
-when Desktop quits. The next patched launch restores that account and
-organization's snapshot through Desktop's native Remote Control policy.
-Desktop's worker limit can leave some of those chats for reopening. The
-patch skips stopped or archived chats and respects workspace trust, account
-policy and the Off setting. The first patched launch starts tracking
-connections for its next quit. Use the wrapper for stock launches as well,
-so switching to stock invalidates any older patched snapshot.
+At launch, the patch restores local chats with Remote Control saved On for
+the signed-in account and organization. The same setting survives an
+ordinary quit or a crash. The patch skips stopped or archived chats and
+respects workspace trust, Desktop's Remote Control policy and the Off
+setting. Desktop's worker limit can leave some chats for reopening.
 
 To verify after a restart, look for `[claudex] Remote Control claudex_restart`
 and the chat’s native connection in Claude Desktop’s main log. Reopen

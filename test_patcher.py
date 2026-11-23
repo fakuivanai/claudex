@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from patcher.archive import Directory, Packed, Unpacked, encode_header, integrity_of, packed_entry, read_header
-from patcher.build import Anchor, DesktopRelease, MODULE_NAME, QUIT_CAPTURE_HOOK, STARTUP_HOOK, build, patch_chunk
+from patcher.build import Anchor, DEFERRED_ROSTER_HOOK, DesktopRelease, MODULE_NAME, STARTUP_HOOK, build, patch_chunk
 
 
 class PatcherTests(unittest.TestCase):
@@ -22,15 +22,28 @@ class PatcherTests(unittest.TestCase):
         harness = """
         const assert = require("node:assert/strict");
         const events = [];
-        const vendor = { I0: () => "signed-in account" };
+        const featureFlags = new Map([["976614668", true]]);
+        const vendor = {
+          I0: () => "signed-in account",
+          ldt: key => featureFlags.get(key) ?? false,
+          DSt: () => ({ overlayApplied: async () => {} }),
+          ATt: async overlay => overlay,
+        };
+        const policy = { l: () => undefined, o: async () => "allowed" };
         const injectedRequire = () => ({
-          restoreAtLaunch: (_manager, epoch, platform) => {
+          restoreAtLaunch: async (_manager, epoch, platform) => {
             events.push([platform.account(), epoch]);
+            assert.equal(await platform.canRestore(), true);
+            featureFlags.set("976614668", false);
+            assert.equal(await platform.canRestore(), false);
+            featureFlags.set("976614668", true);
+            featureFlags.set("4267904482", true);
+            assert.equal(await platform.canRestore(), false);
           },
         });
         const owner = new Function(
-          "t", "require", "return ({" + process.argv[1] + "});"
-        )(vendor, injectedRequire);
+          "t", "se", "require", "return ({" + process.argv[1] + "});"
+        )(vendor, policy, injectedRequire);
         owner.launchPassChain = Promise.resolve();
         owner.launchPass = { runLaunchPass: async () => events.push("stock") };
         owner.resumeQuitInterruptedSessionsAtLaunch(3).then(() => {
@@ -42,24 +55,21 @@ class PatcherTests(unittest.TestCase):
         """
         self.run_node(harness, STARTUP_HOOK)
 
-    def test_quit_hook_captures_before_stock_stops_its_workers(self) -> None:
+    def test_deferred_roster_hook_considers_saved_on_and_native_markers(self) -> None:
         harness = """
         const assert = require("node:assert/strict");
-        const events = [];
-        const patchedQuit = new Function(
-          "t", "require", "events",
-          "return ({stop(){ " + process.argv[1] + " { events.push('stop worker'); } } catch {} }})"
-        )(
-          { EEt: { warn: () => undefined } },
-          () => ({ captureAtQuit: () => events.push("capture current workers") }),
-          events
-        );
-        patchedQuit.markAppQuitting = () => events.push("mark quitting");
-        patchedQuit.heldSessions = () => [{}];
-        patchedQuit.stop();
-        assert.deepEqual(events, ["mark quitting", "capture current workers", "stop worker"]);
+        const seen = [];
+        const check = new Function("w", "e", process.argv[1]).bind({
+          resumeQuitInterruptedSessionsAtLaunch: epoch => seen.push(epoch),
+        });
+        check([{ remoteControlUserEnabled: true }], 1);
+        check([{ remoteControlUserEnabled: false, remoteControlUserRequested: true }], 2);
+        check([{ remoteControlUserRequested: true }], 3);
+        check([{ interruptedByQuitAt: 123 }], 4);
+        check([{ remoteControlLiveAtUpdateQuit: {} }], 5);
+        assert.deepEqual(seen, [1, 4, 5]);
         """
-        self.run_node(harness, QUIT_CAPTURE_HOOK)
+        self.run_node(harness, DEFERRED_ROSTER_HOOK)
 
     def test_build_preserves_alias_offsets_and_unpacked_entries(self) -> None:
         prefix, old, tail = b"prefix", b"stock hook", b"identical resource"

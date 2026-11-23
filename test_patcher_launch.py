@@ -17,7 +17,7 @@ from patcher import build as archive_builder
 from patcher.archive import Directory, Packed, encode_header, integrity_of
 from patcher.build import Anchor, DesktopRelease
 from patcher.launch import (
-    CachedArchive, LaunchRefused, STOCK_LAUNCH_MARKER, cached_archive, launch, notify_stock_fallback, running_desktop,
+    CachedArchive, LaunchRefused, cached_archive, launch, notify_stock_fallback, running_desktop,
 )
 
 
@@ -83,7 +83,6 @@ with Path({str(self.record)!r}).open("a") as record:
     print(json.dumps({{
         "parent_codex_keys": sorted(key for key in os.environ if key.startswith("CODEX_")),
         "path": os.environ.get("PATH"),
-        "patched_launch": "CLAUDEX_REMOTE_CONTROL_SINCE" in os.environ,
     }}), file=record)
 raise SystemExit({exit_code})
 """,
@@ -142,9 +141,7 @@ raise SystemExit({exit_code})
         self.assertEqual(payload, {
             "parent_codex_keys": [],
             "path": str(self.bin),
-            "patched_launch": False,
         })
-        self.assertTrue((self.state / STOCK_LAUNCH_MARKER).is_file())
         self.assertFalse(self.notice_record.exists())
 
     def test_nonzero_after_app_start_does_not_relaunch_stock(self) -> None:
@@ -158,7 +155,6 @@ raise SystemExit({exit_code})
         ):
             self.assertEqual(launch(self.stock, args, disabled=False), 23)
         self.assertEqual(len(self.record.read_text().splitlines()), 1)
-        self.assertTrue(json.loads(self.record.read_text())["patched_launch"])
         self.assertFalse(self.notice_record.exists())
 
     def test_disabled_launch_works_with_an_unusable_archive_cache(self) -> None:
@@ -171,7 +167,23 @@ raise SystemExit({exit_code})
             redirect_stderr(io.StringIO()),
         ):
             self.assertEqual(launch(self.stock, args, disabled=True), 0)
-        self.assertTrue((self.state / STOCK_LAUNCH_MARKER).is_file())
+
+    def test_old_stock_launch_marker_is_removed_without_reading_it(self) -> None:
+        self.state.mkdir(mode=0o700, parents=True)
+        marker = self.state / "last-stock-launch"
+        marker.write_text("invalid old timestamp")
+        self.fake_bubblewrap()
+        args = self.fake_launcher()
+        stderr = io.StringIO()
+        with (
+            patch("patcher.launch.desktop_environment", return_value=self.environment),
+            patch("patcher.launch.running_desktop", return_value=False),
+            patch("patcher.launch.cached_archive", return_value=self.patched),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(launch(self.stock, args, disabled=False), 0)
+        self.assertFalse(marker.exists())
+        self.assertNotIn("Launching stock", stderr.getvalue())
 
     def test_clean_exit_after_app_start_does_not_relaunch_stock(self) -> None:
         self.fake_bubblewrap()
@@ -183,7 +195,6 @@ raise SystemExit({exit_code})
         ):
             self.assertEqual(launch(self.stock, args, disabled=False), 0)
         self.assertEqual(len(self.record.read_text().splitlines()), 1)
-        self.assertTrue(json.loads(self.record.read_text())["patched_launch"])
 
     def test_mount_failure_falls_back_to_stock_with_a_reason(self) -> None:
         self.executable("bwrap", "raise SystemExit(13)")
@@ -197,7 +208,7 @@ raise SystemExit({exit_code})
         ):
             self.assertEqual(launch(self.stock, args, disabled=False), 0)
         self.assertIn("patch mount setup failed (exit 13). Launching stock Claude Desktop.", stderr.getvalue())
-        self.assertFalse(json.loads(self.record.read_text())["patched_launch"])
+        self.assertEqual(len(self.record.read_text().splitlines()), 1)
 
     def test_build_failure_falls_back_to_stock_with_a_reason(self) -> None:
         self.fake_bubblewrap()
@@ -212,7 +223,7 @@ raise SystemExit({exit_code})
         ):
             self.assertEqual(launch(self.stock, args, disabled=False), 0)
         self.assertIn("unsupported archive). Launching stock Claude Desktop.", stderr.getvalue())
-        self.assertFalse(json.loads(self.record.read_text())["patched_launch"])
+        self.assertEqual(len(self.record.read_text().splitlines()), 1)
         self.assertEqual(json.loads(self.notice_record.read_text()), {
             "content": [
                 "--user", "--auto-start=no", "--", "call", "org.freedesktop.Notifications",

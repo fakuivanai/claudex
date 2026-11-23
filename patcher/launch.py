@@ -14,7 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
+from typing import assert_never
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -61,9 +61,6 @@ class CachedArchive:
 FILE_IDENTITY = TypeAdapter(FileIdentity)
 CACHE_RECORD = TypeAdapter(CacheRecord)
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
-# A managed stock run invalidates an older Remote Control shutdown snapshot.
-STOCK_LAUNCH_MARKER = "last-stock-launch"
-STOCK_LAUNCH_CUTOFF = "CLAUDEX_REMOTE_CONTROL_SINCE"
 # A stalled notification service should only briefly delay the stock launch.
 NOTIFICATION_TIMEOUT = 2
 
@@ -216,6 +213,8 @@ class Fallback:
 class Disabled:
     """The caller chose to launch Claude Desktop in stock mode."""
 
+    reason: str = "Remote Control patch disabled"
+
 
 def start_patched(
     bubblewrap: str, patched: Path, stock: Path, command: list[str], environment: dict[str, str], cache: Path,
@@ -259,23 +258,16 @@ def notify_stock_fallback(environment: dict[str, str]) -> None:
         pass
 
 
-def stock_launch(
-    command: list[str], environment: dict[str, str], state: Path, selection: Disabled | Fallback,
-) -> int:
-    reason = selection.reason if isinstance(selection, Fallback) else "Remote Control patch disabled"
-    print(f"claudex: {reason}. Launching stock Claude Desktop.", file=sys.stderr)
-    # Python and Electron both express this wall-clock cutoff in milliseconds.
-    publish_bytes(state / STOCK_LAUNCH_MARKER, str(time.time_ns() // 1_000_000).encode())
-    if isinstance(selection, Fallback):
-        notify_stock_fallback(environment)
+def stock_launch(command: list[str], environment: dict[str, str], selection: Disabled | Fallback) -> int:
+    print(f"claudex: {selection.reason}. Launching stock Claude Desktop.", file=sys.stderr)
+    match selection:
+        case Disabled():
+            pass
+        case Fallback():
+            notify_stock_fallback(environment)
+        case _:
+            assert_never(selection)
     return subprocess.run(command, env=environment, cwd=environment["HOME"], check=False).returncode
-
-
-def stock_cutoff(state: Path) -> str:
-    try:
-        return str(int((state / STOCK_LAUNCH_MARKER).read_text()))
-    except FileNotFoundError:
-        return "0"
 
 
 def existing_launch(command: list[str], environment: dict[str, str], reuse_running: bool) -> int:
@@ -301,34 +293,35 @@ def launch(source: Path, command: list[str], *, disabled: bool, reuse_running: b
     if running_desktop():
         return existing_launch(command, environment, reuse_running)
     home = Path(environment["HOME"])
-    # A stock cutoff is state, so cache eviction must not discard it.
     state = desktop_data_directory(environment, "XDG_STATE_HOME", home / ".local" / "state")
     with launch_lock(state):
         if running_desktop():
             return existing_launch(command, environment, reuse_running)
+        try:
+            (state / "last-stock-launch").unlink(missing_ok=True)
+        except OSError as error:
+            print(f"claudex: Could not remove the old stock launch marker ({error}).", file=sys.stderr)
         if disabled:
-            return stock_launch(command, environment, state, Disabled())
+            return stock_launch(command, environment, Disabled())
         bubblewrap = shutil.which("bwrap", path=environment["PATH"])
         if bubblewrap is None:
-            return stock_launch(command, environment, state, Fallback("bubblewrap unavailable in the desktop environment"))
+            return stock_launch(command, environment, Fallback("bubblewrap unavailable in the desktop environment"))
         try:
             cache = desktop_data_directory(environment, "XDG_CACHE_HOME", home / ".cache")
             source = source.resolve(strict=True)
             patched = cached_archive(source, cache)
-            cutoff = stock_cutoff(state)
         except (OSError, ValueError) as error:
-            return stock_launch(command, environment, state, Fallback(f"Remote Control patch unavailable ({error})"))
+            return stock_launch(command, environment, Fallback(f"Remote Control patch unavailable ({error})"))
         if running_desktop():
             return existing_launch(command, environment, reuse_running)
         try:
             prune_cached_archives(cache, patched)
         except OSError as error:
             print(f"claudex: Could not remove an old cached patch ({error}).", file=sys.stderr)
-        patched_environment = {**environment, STOCK_LAUNCH_CUTOFF: cutoff}
-        result = start_patched(bubblewrap, patched.archive, source, command, patched_environment, cache)
+        result = start_patched(bubblewrap, patched.archive, source, command, environment, cache)
         match result:
             case Fallback():
-                return stock_launch(command, environment, state, result)
+                return stock_launch(command, environment, result)
             case Started(status):
                 return status
 

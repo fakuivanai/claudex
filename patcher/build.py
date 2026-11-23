@@ -30,8 +30,7 @@ class DesktopRelease:
 
 
 # These aliases are private to the pinned session-manager chunk.
-# The reference locations are the stock manager's runLaunchPass, wB,
-# gB, and the local-session-stop-all shutdown handler in that chunk.
+# The reference locations are the stock manager's runLaunchPass, wB and gB.
 STARTUP = (
     b"resumeQuitInterruptedSessionsAtLaunch(e){let t=this.launchPassChain.then((()=>"
     b"this.launchPass.runLaunchPass(e)));return this.launchPassChain=t.catch((()=>void 0)),t}"
@@ -49,6 +48,8 @@ STARTUP_HOOK = (
     b'waitForOrganizationPolicy:()=>gB(t.H1,()=>se.l()==="org_denied"&&se.u.state()==="pending"),'
     # wB names t.ldt("4267904482") as ccd_remote_control_restore_at_launch_disabled.
     b'canRestore:async()=>se.l()===void 0&&!t.ldt("4267904482")'
+    # Stock restoreBridgesAtLaunch requires this flag for saved user requests.
+    b'&&t.ldt("976614668")'
     # runLaunchPass bounds the policy overlay readiness wait with t.ATt and t.H1.
     # The barrier t.DSt().overlayApplied() fails closed if the overlay isn't ready.
     b'&&await t.ATt(t.DSt().overlayApplied().then(()=>!0,()=>!1),t.H1,!1)'
@@ -63,27 +64,13 @@ STARTUP_HOOK = (
     b'});return this.launchPassChain=claudexLaunchPass.catch(()=>void 0),claudexLaunchPass}'
 )
 DEFERRED_ROSTER = b"w.some((e=>e.interruptedByQuitAt!==void 0||e.remoteControlLiveAtUpdateQuit!==void 0))&&this.resumeQuitInterruptedSessionsAtLaunch(e)"
+# w contains active chats discovered by Desktop's deferred archive scan.
 DEFERRED_ROSTER_HOOK = DEFERRED_ROSTER.replace(
-    b"))&&",
-    b'))||require("./claudex-restore.cjs").shouldCheckDeferredRoster(this))&&',
-    1,
-).replace(b"w.some(", b"(w.some(", 1)
-
-# This runs immediately after Desktop marks itself as quitting, before it stops
-# any of the live local workers. _B is the eligibility test already used just
-# below this point by the native update-quit path. The patch leaves the native
-# remoteControlLiveAtUpdateQuit record alone because ordinary quits only mark
-# it if the separate mB experiment (3106428025) is enabled.
-QUIT_CAPTURE = b"this.markAppQuitting();try{let e=performance.now(),r=0,i=0;for(let e of this.heldSessions())"
-QUIT_CAPTURE_HOOK = QUIT_CAPTURE.replace(
-    b";try{",
-    b';try{require("./claudex-restore.cjs").captureAtQuit(this,{'
-    b'account:()=>t.I0(),'
-    b'connected:chat=>_B(chat,t.vI(chat.sessionId,id=>this.held(id))),'
-    b'log:message=>t.EEt.info(message)})}catch{'
-    b't.EEt.warn("[claudex] Remote Control could not inspect the native quit roster")}try{',
+    b"e.interruptedByQuitAt",
+    b"e.remoteControlUserEnabled===!0||e.interruptedByQuitAt",
     1,
 )
+
 # In zW.warmSession(e, r), e is the chat ID and i is its current roster entry.
 # W is the spawned SDK query assigned to i.query before the native attachment
 # installs it. R is the resolved spawn configuration passed to that call.
@@ -131,7 +118,6 @@ SUPPORTED_RELEASES = (
         anchors=(
             Anchor("startup pass", STARTUP, STARTUP_HOOK),
             Anchor("deferred active roster", DEFERRED_ROSTER, DEFERRED_ROSTER_HOOK),
-            Anchor("capture connected chats before stock quit", QUIT_CAPTURE, QUIT_CAPTURE_HOOK),
             Anchor("resumed worker installed", AFTER_WARM, AFTER_WARM_HOOK),
             Anchor("existing worker shown", VISIBLE_CHAT, VISIBLE_CHAT_HOOK),
         ),
