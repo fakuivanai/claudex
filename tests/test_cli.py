@@ -12,7 +12,7 @@ from claudex.claude.control import DesktopMutation, DesktopChat, DesktopChatList
 from claudex.models import parse_codex_chat_id
 
 
-CLAUDE_ID = "local_972b63b8-baa9-4b7c-b7d0-0ae63a0a4ec9"
+CLAUDE_ID = "local_00000000-0000-4000-8000-000000000201"
 CODEX_ID = parse_codex_chat_id("33d0f881-b4e7-4d66-badd-8192aa1dbd8f")
 
 
