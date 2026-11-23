@@ -42,21 +42,38 @@
           });
         })
       ]);
+      devEnvironment = pythonSet.mkVirtualEnv "claudex-dev" workspace.deps.groups;
     in
     {
       packages.${system}.default = pythonSet.mkVirtualEnv "claudex" workspace.deps.default;
 
-      checks.${system}.package = pkgs.runCommand "claudex-package-check" {
-        nativeBuildInputs = [ self.packages.${system}.default ];
-      } ''
-        claudex --help
-        claudex desktop --help
-        claudex codex --help
-        claudex-desktop --help
-        python -c 'from importlib.resources import files; assert all(files("patcher").joinpath(name).is_file() for name in ("restore.cjs", "desktop_bridge.cjs", "desktop_socket.cjs"))'
-        cli=$(python -c 'from importlib.resources import files; print(files("claude_agent_sdk").joinpath("_bundled", "claude"))')
-        HOME="$TMPDIR" "$cli" --version
-        touch "$out"
-      '';
+      checks.${system} = {
+        package = pkgs.runCommand "claudex-package-check" {
+          nativeBuildInputs = [ self.packages.${system}.default ];
+        } ''
+          claudex --help
+          claudex desktop --help
+          claudex codex --help
+          claudex-desktop --help
+          python -c 'from importlib.resources import files; assert all(files("patcher").joinpath(name).is_file() for name in ("restore.cjs", "desktop_bridge.cjs", "desktop_socket.cjs"))'
+          cli=$(python -c 'from importlib.resources import files; print(files("claude_agent_sdk").joinpath("_bundled", "claude"))')
+          HOME="$TMPDIR" "$cli" --version
+          touch "$out"
+        '';
+
+        tests = pkgs.runCommand "claudex-tests" {
+          src = ./.;
+          # Claude Desktop 5.11492.5 ships Electron 45.2.1, which embeds Node 24.
+          # https://releases.electronjs.org/release/v45.2.1
+          nativeBuildInputs = [ devEnvironment ];
+        } ''
+          cp -r "$src" source
+          chmod -R u+w source
+          cd source
+          export PATH="${pkgs.nodejs-slim_24.out}/bin:$PATH"
+          CLAUDEX_PYTHON=python ./check
+          touch "$out"
+        '';
+      };
     };
 }

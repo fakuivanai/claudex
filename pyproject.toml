@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools==80.10.1"]
+requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,13 @@ version = "0.1.0"
 description = "Local MCP bridge for Claude Code and Codex Desktop"
 readme = "README.md"
 requires-python = ">=3.12"
-dynamic = ["dependencies"]
+dependencies = [
+    # The v1 SDK is supported by the installed stdio clients and Claude Agent SDK.
+    "mcp==1.30.0",
+    "claude-agent-sdk==0.2.187",
+    "pydantic==2.14.4",
+    "starlette==1.10.0",
+]
 
 [project.scripts]
 claudex = "claudex:main"
@@ -23,9 +29,6 @@ py-modules = [
     "claude_desktop", "claude_lifecycle", "claudex", "claudex_cli", "codex_desktop", "codex_history",
     "codex_peer", "desktop_control", "desktop_environment", "models", "peer_mailbox", "skill_reader",
 ]
-
-[tool.setuptools.dynamic]
-dependencies = {file = ["requirements.in"]}
 
 [tool.setuptools.package-data]
 patcher = ["restore.cjs", "desktop_bridge.cjs", "desktop_socket.cjs"]

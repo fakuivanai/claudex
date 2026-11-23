@@ -2,7 +2,12 @@
 set -eu
 
 cd "$(dirname "$0")"
-claudex_python=${CLAUDEX_PYTHON:-python3}
+if [ -n "${CLAUDEX_PYTHON:-}" ]; then
+    claudex_python=$CLAUDEX_PYTHON
+else
+    uv sync --frozen
+    claudex_python=${UV_PROJECT_ENVIRONMENT:-.venv}/bin/python
+fi
 claudex_node=${CLAUDEX_NODE:-node}
 "$claudex_python" -m mypy .
 "$claudex_python" -B -m unittest discover -v
