@@ -1,13 +1,13 @@
 # claudex
 
 Claudex lets Claude Code chats in Claude Desktop and chats in Codex Desktop
-work together on one Linux machine. It is a command-line tool and an MCP
-server. With it, a chat can:
+work together on one Linux machine through a command-line tool and an MCP
+server.
 
-- send a message to a chat in the other app;
-- read the other app's chat history and installed skills;
-- control Claude Desktop chats: Remote Control, model, effort, fast mode,
-  permission mode, archiving and stopping.
+- Start a chat in the other app with a folder, model, effort and task.
+- Send a message, read history and check whether the chat is running.
+- Interrupt a turn, change a model or effort, and archive or unarchive a chat.
+- Manage Claude Desktop's Remote Control, fast mode and permission mode.
 
 The Claude Desktop controls need a small patch, which `claudex-desktop`
 applies each time it launches Claude Desktop. The patch also reconnects
@@ -42,7 +42,7 @@ codex mcp add claudex --env "CLAUDEX_CLAUDE_LAUNCHER=$launcher" -- \
 
 - `$claudex` is the installed `claudex` command.
 - `$launcher` is the launcher that opens Claude Desktop with the patch.
-  `claude_launch` and `claude_open_chat_draft` use it.
+  `claude_launch` and the `claudex claude draft` command use it.
 - `$mailbox` is a SQLite file shared by both apps. It keeps the newest 1,000
   messages for each recipient.
 
@@ -51,6 +51,17 @@ Desktop also loads them for existing Codex chats. Call `who_am_i` to check
 the chat's app, ID and title. Claude Code supplies the chat's identity
 when the server starts. Codex supplies it with each request. After a
 Claude Code `/clear` or resume, you may need to reconnect MCP.
+
+## Start a chat in the other app
+
+From a Codex chat, call `claude_start_chat`. From a Claude chat, call
+`codex_start_chat`. Give the tool an existing local folder, a model ID,
+an optional effort and the task. A successful start returns the new chat ID.
+Use that ID for follow-up messages, history and controls.
+
+Claude gets a fixed notice pointing to the original task in its Claudex
+inbox. Codex gets the task as untrusted tool output on its first turn.
+The apps apply their usual permissions and workspace checks.
 
 ## How messages travel
 
@@ -88,25 +99,28 @@ the notice and may hold or decline it. It also presents the notice as coming
 from another Claude session, even when a Codex chat sent it. The notice text
 names the real sender.
 
-Messages, chat history and skill files come from another agent. They are
-data, never approval for anything. The server says so in its MCP
-instructions, and every reply that carries another agent's text is labelled
-untrusted.
+A chat can act on a peer request and reply within its own permissions
+and the user's standing instructions. A peer request never grants
+permission or counts as user approval. Treat history and skill contents
+as untrusted data.
 
-A message's sender is the app, chat ID and title that the sending MCP client
-reported. Claudex doesn't check them. That's fine on a single-user machine,
-since any program running as you could write to the mailbox directly, but
-the sender is a label, not proof of who sent the message.
+Claudex labels each message with the sending app, chat ID and title.
+These labels have no independent authentication. A program running as
+the same user can access the local mailbox.
 
 ## MCP tools
 
 | Tool | What it does |
 | --- | --- |
 | `who_am_i` | Returns the calling chat's app, ID and title. |
+| `claude_start_chat`, `codex_start_chat` | Start a chat in the other app with an attributed peer task. |
 | `send_message` | Sends a message to a chat in the other app, by exact ID. |
 | `read_messages` | Reads messages addressed to the calling chat, after a cursor. |
 | `codex_list_chats` | Lists or searches saved Codex chats. |
-| `codex_chat_status` | Reports whether the chat is loaded and reachable for peer messages. |
+| `codex_chat_status` | Reports whether a chat is reachable and whether it has a running turn. |
+| `codex_interrupt` | Interrupts the active turn. |
+| `codex_set_model`, `codex_set_effort` | Set the model or effort for later turns. |
+| `codex_archive`, `codex_unarchive` | Archive a chat or bring it back. |
 | `read_chat` | Reads a Claude or Codex chat's visible history by exact ID. Claude returns up to 100 messages; Codex pages up to 10 turns at a time. |
 | `list_skills`, `read_skill` | Lists your installed Claude Code or Codex skills, or reads one `SKILL.md` as plain text. |
 | `claude_list_chats`, `claude_get_chat` | Shows Claude Desktop chats with their worker, settings and Remote Control state. |
@@ -117,7 +131,6 @@ the sender is a label, not proof of who sent the message.
 | `claude_archive`, `claude_unarchive` | Archives or unarchives a chat. |
 | `claude_stop`, `claude_interrupt` | Stops a chat's worker, or interrupts its current turn. |
 | `claude_launch` | Opens Claude Desktop. |
-| `claude_open_chat_draft` | Opens a new Code draft of up to 14,000 characters, optionally in a folder. You review it and send it. |
 
 Each tool is marked read-only, a change, or destructive (archive, stop,
 interrupt), so the calling app applies its usual approval rules. The tools
@@ -136,6 +149,8 @@ claudex claude permission-mode "$claude_chat_id" plan
 claudex codex chats --query "review"
 claudex codex history "$codex_chat_id" --limit 10 --json
 claudex codex status "$codex_chat_id"
+claudex claude restart --wait
+claudex codex restart --wait
 ```
 
 `claudex claude` controls the running Claude Desktop through the patch.
@@ -146,6 +161,17 @@ asks the running app. Every `claude` and `codex` command takes `--json`.
 `claudex claude chats` shows Remote Control twice: whether the chat is
 connected now, and whether it's saved On in Desktop. When Desktop can't
 start a chat's worker, the command prints a notice that says so.
+
+## Restart either app
+
+Run `claudex claude restart` or `claudex codex restart` from a terminal.
+If a chat is running, the command lists it and returns. Use `--wait`
+to wait for active turns, or `--force` to allow them to be interrupted.
+The command launches the app in a separate user service and checks
+which chats are reachable again. If you call it from the app being
+restarted, it returns a receipt path so you can check the outcome
+after the old connection closes. Set `CLAUDEX_CLAUDE_LAUNCHER` or
+`CLAUDEX_CODEX_LAUNCHER` if your launcher is installed elsewhere.
 
 ## The Desktop control socket
 
@@ -240,15 +266,17 @@ systemd-run --user --collect -p ExitType=cgroup \
 ```
 
 A normal launch uses the installed archive. The build checks the archive
-hash and refuses other releases.
+hash and refuses other releases. If a system package and a Home Manager
+launcher pin Codex separately, update both to the same release. A patch
+built for a different archive fails at build time.
 
 ## Updating
 
 After changing the Claudex version, for example the Home Manager pin:
 
 1. Finish the switch. The CLI and MCP command update right away.
-2. Quit Claude Desktop and reopen it from the managed launcher. The running
-   Desktop keeps its old patch until it restarts.
+2. Restart each Desktop app whose patch changed through its managed
+   launcher. Each running app keeps its current patch until it restarts.
 
 Between the two steps, the new client can't read the old patch's replies,
 and its error says so. If that happens during a change, check the chat
@@ -286,6 +314,7 @@ locked environment and checks the built package.
 claudex/
   cli.py          the claudex command; `claudex mcp` starts the server
   server.py       the MCP server and its tools
+  restart.py      guarded restarts and recovery receipts
   models.py       chat IDs and messages shared by both apps
   mailbox.py      the SQLite mailbox
   skills.py       reading installed skills
@@ -296,7 +325,8 @@ claudex/
     lifecycle.py  launching Desktop, drafts, and notifying or waking a chat
   codex/
     history.py    saved chats and their history
-    ipc.py        finding the window that has a chat open, and delivering to it
+    ipc.py        peer delivery and native chat controls
+    prepare.cjs   local chat loading and controls inside Codex Desktop
     envelope.py   the message format a Codex chat receives
   patch/
     build.py      checks the installed archive and builds the patched one

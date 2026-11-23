@@ -9,7 +9,7 @@ from unittest.mock import patch
 from claudex import cli
 from claudex import codex
 from claudex.claude.control import DesktopMutation, DesktopChat, DesktopChatList, Refused, Success
-from claudex.models import parse_codex_chat_id
+from claudex.models import Provider, parse_codex_chat_id
 
 
 CLAUDE_ID = "local_00000000-0000-4000-8000-000000000201"
@@ -125,3 +125,16 @@ class CodexCommands(unittest.TestCase):
         read_chat.assert_called_once_with(
             CODEX_ID, limit=codex.history.DEFAULT_TURN_PAGE, cursor=None, include_archived=True,
         )
+
+
+class RestartCommands(unittest.TestCase):
+    def test_both_apps_use_the_guarded_restart(self) -> None:
+        for app in Provider:
+            with self.subTest(app=app), patch("claudex.cli.restart.restart", return_value=0) as restart:
+                self.assertEqual(invoke(app.value, "restart", "--wait", "--json"), (0, "", ""))
+                restart.assert_called_once_with(app, wait=True, force=False, as_json=True)
+
+    def test_restart_rejects_wait_and_force_together(self) -> None:
+        with self.assertRaises(SystemExit) as failure, redirect_stderr(io.StringIO()):
+            cli.main(["codex", "restart", "--wait", "--force"])
+        self.assertEqual(failure.exception.code, 2)

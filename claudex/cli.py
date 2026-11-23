@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 from typing import Literal, assert_never
 
-from claudex import codex, server
+from claudex import claude, codex, restart, server
 from claudex.claude.control import (
     DesktopControl,
     DesktopResult,
@@ -39,6 +39,10 @@ class Arguments(argparse.Namespace):
     cursor: str | None
     archived: bool
     include_archived: bool
+    wait: bool
+    force: bool
+    prompt: str
+    folder: str | None
 
 
 type Result = (
@@ -69,6 +73,17 @@ def parser() -> argparse.ArgumentParser:
                          help="SQLite mailbox file shared by both apps")
     desktop_commands = claude_app.add_subparsers(dest="command", required=True)
     codex_commands = codex_app.add_subparsers(dest="command", required=True)
+
+    for commands in (desktop_commands, codex_commands):
+        app_restart = commands.add_parser("restart", help="Quit and reopen the app safely", allow_abbrev=False)
+        action = app_restart.add_mutually_exclusive_group()
+        action.add_argument("--wait", action="store_true", help="Wait for running chats to finish")
+        action.add_argument("--force", action="store_true", help="Allow quitting while chats are running")
+        app_restart.add_argument("--json", action="store_true", help="Print JSON")
+    draft = desktop_commands.add_parser("draft", help="Open a chat draft for you to review and send", allow_abbrev=False)
+    draft.add_argument("prompt", help="Draft text")
+    draft.add_argument("--folder", help="Absolute path to an existing folder")
+    draft.add_argument("--json", action="store_true", help="Print JSON")
 
     descriptions = {
         "chats": "List Claude Desktop chats and their Remote Control state",
@@ -240,7 +255,9 @@ def print_result(result: Result, as_json: bool) -> None:
                     print(f"{message.to_wire()['role']}: {text}" + (" [truncated]" if message.preview.truncated else ""))
             print_cursor(result.next_cursor)
         case codex.ipc.ChatStatus():
-            print(f"{result.chat_id}  {result.state.replace('_', ' ')}")
+            print(f"{result.chat_id}  {result.state.replace('_', ' ')}, {result.activity}")
+            if result.turn_id is not None:
+                print(f"Running turn {printable(result.turn_id)}")
         case _:
             assert_never(result)
 
@@ -273,5 +290,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv, namespace=Arguments())
     if args.app == "mcp":
         server.serve(args.client, args.state_file)
+        return 0
+    if args.command == "restart":
+        return restart.restart(Provider(args.app), wait=args.wait, force=args.force, as_json=args.json)
+    if args.command == "draft":
+        try:
+            claude.lifecycle.open_draft(args.prompt, args.folder)
+        except (OSError, ValueError) as error:
+            return print_error("error", str(error), args.json)
+        print(json.dumps({"status": "draft_requested"}) if args.json else "Opened a Claude Code draft.")
         return 0
     return run(args)
