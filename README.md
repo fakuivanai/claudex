@@ -88,6 +88,13 @@ If the patch cannot start, Claudex reports the reason, notifies the
 desktop if available, and starts stock. With `--reuse-running`, one
 Claude link can be handed to the existing instance.
 
+When updating the Claudex pin, finish the Home Manager switch, then quit
+and reopen Claude Desktop from the managed launcher. The switch updates
+the CLI and MCP command while the running Desktop keeps its mounted
+patch until it restarts. If a mutation reports a build mismatch, check
+the chat's state after restarting before retrying. The change may
+already have taken effect.
+
 At launch, the patch restores local chats with Remote Control saved On.
 It respects Desktop policy, workspace trust, and the current account.
 Desktop's worker limit can leave some chats cold. Check the roster and

@@ -128,6 +128,36 @@ class DesktopControlTests(unittest.TestCase):
                 self.desktop.get_chat(_CHAT_ID), InvalidResponse("Desktop returned an invalid response frame."),
             )
 
+    def test_legacy_roster_reply_reports_build_mismatch(self) -> None:
+        with self.reply(frame({"status": "ok", "result": {"sessions": [_ROW], "archived_pending": True}})):
+            result = self.desktop.list_chats()
+            assert isinstance(result, InvalidResponse)
+            self.assertIn("may be on different builds. Restart Claude Desktop.", result.reason)
+
+    def test_legacy_mutation_reply_warns_to_check_current_state_before_retrying(self) -> None:
+        with self.reply(frame({"status": "ok", "result": {"session": _ROW, "notice": "Example notice"}})):
+            result = self.desktop.warm_chat(_CHAT_ID)
+            assert isinstance(result, InvalidResponse)
+            self.assertIn("may be on different builds. Restart Claude Desktop.", result.reason)
+            self.assertIn("The change may already have taken effect. Check the chat's state before retrying.", result.reason)
+
+    def test_corrupt_legacy_shaped_replies_keep_invalid_response_diagnostic(self) -> None:
+        malformed_lists = (
+            {"result": {"sessions": [_ROW], "archived_pending": True}},
+            {"status": "ok", "result": {"sessions": [_ROW], "archived_pending": "yes"}},
+            {"status": "ok", "result": {"sessions": [_ROW], "chats": [], "archived_pending": True}},
+        )
+        for value in malformed_lists:
+            with self.reply(frame(value)):
+                self.assertEqual(self.desktop.list_chats(), InvalidResponse("Desktop returned an invalid response."))
+
+        with self.reply(frame({"status": "ok", "result": {"session": {"chat_id": _CHAT_ID}}})):
+            self.assertEqual(self.desktop.warm_chat(_CHAT_ID), InvalidResponse("Desktop returned an invalid response."))
+        with self.reply(frame({"status": "ok", "result": {"session": {**_ROW, "chat_id": _OTHER_CHAT_ID}}})):
+            self.assertEqual(
+                self.desktop.warm_chat(_CHAT_ID), InvalidResponse("Desktop returned a different chat than requested."),
+            )
+
     def test_rejects_malformed_arguments_before_connecting(self) -> None:
         for invalid in (_CHAT_ID.upper(), _CHAT_ID + "\n", "local_missing"):
             self.assertIsInstance(self.desktop.get_chat(invalid), InvalidRequest)
