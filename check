@@ -11,4 +11,4 @@ fi
 claudex_node=${CLAUDEX_NODE:-node}
 "$claudex_python" -m mypy .
 "$claudex_python" -B -m unittest discover -v
-"$claudex_node" --test --test-isolation=none patcher/*.test.cjs
+"$claudex_node" --test --test-isolation=none --test-timeout=10000 patcher/*.test.cjs
