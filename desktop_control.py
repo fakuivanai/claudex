@@ -12,8 +12,7 @@ from pathlib import Path
 from typing import Annotated, Generic, Literal, TypeVar, get_args
 
 from pydantic import (
-    AfterValidator, AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, RootModel, StringConstraints,
-    ValidationError,
+    AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, RootModel, StringConstraints, ValidationError,
 )
 
 from models import parse_claude_chat_id
@@ -62,8 +61,12 @@ class DesktopMutation(_WireModel):
     notice: str | None = None
 
 
-def _model_id(value: str) -> str:
-    value.encode("utf-8")
+def _model_id(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    # Surrogate code points cannot be encoded in the UTF-8 request.
+    if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+        raise ValueError("Enter a model ID without Unicode surrogate characters.")
     if value != value.strip() or any(ord(char) < 32 or ord(char) == 127 for char in value):
         raise ValueError("Enter a model ID without surrounding whitespace or control characters.")
     return value
@@ -78,7 +81,7 @@ class _EnabledInput(_ChatInput):
 
 
 class _ModelInput(_ChatInput):
-    model: Annotated[str, StringConstraints(min_length=1, max_length=128), AfterValidator(_model_id)]
+    model: Annotated[str, StringConstraints(min_length=1, max_length=128), BeforeValidator(_model_id)]
 
 
 class _EffortInput(_ChatInput):

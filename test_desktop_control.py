@@ -133,6 +133,17 @@ class DesktopControlTests(unittest.TestCase):
             self.assertIsInstance(self.desktop.get_session(invalid), InvalidRequest)
         self.assertIsInstance(self.desktop.set_remote_control(_CHAT_ID, cast(bool, "true")), InvalidRequest)
 
+    def test_model_id_rejects_surrogates_and_preserves_astral_characters(self) -> None:
+        for surrogate in ("\ud800", "\udfff"):
+            result = self.desktop.set_model(_CHAT_ID, f"model-{surrogate}")
+            assert isinstance(result, InvalidRequest)
+            self.assertIn("Unicode surrogate characters", result.reason)
+
+        model = "model-\U00010000"
+        with self.reply(frame({"status": "ok", "result": {"session": _ROW}})) as request:
+            self.assertIsInstance(self.desktop.set_model(_CHAT_ID, model), Success)
+            self.assertEqual(json.loads(request.result(3))["input"]["model"], model)
+
     def test_reports_an_unavailable_socket_and_a_timeout_separately(self) -> None:
         self.assertIsInstance(self.desktop.list_sessions(), Unavailable)
         release = Event()
