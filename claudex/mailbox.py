@@ -59,6 +59,14 @@ class Mailbox:
                 (recipient, recipient, RETENTION),
             )
 
+    def discard(self, recipient: str, message: PeerMessage) -> None:
+        """Remove a staged message after a native start definitively did not happen."""
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute(
+                "DELETE FROM peer_messages WHERE recipient=? AND message=?",
+                (recipient, PEER_MESSAGE.dump_json(message).decode("utf-8")),
+            )
+
     def read(self, recipient: str, after: int) -> MessagePage:
         if not self.path.is_file():
             return MessagePage((), after)

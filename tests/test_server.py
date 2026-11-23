@@ -12,7 +12,7 @@ from mcp.types import RequestParams
 
 from claudex.server import Bridge, build, codex_sender
 from claudex.claude.lifecycle import StoredNotice
-from claudex.claude.control import DesktopControl, DesktopMutation, DesktopChat, DesktopChatList, Success
+from claudex.claude.control import DesktopControl, DesktopMutation, DesktopChat, DesktopChatList, Success, TimedOut, Unavailable
 from claudex.models import Provider, Sender
 from claudex.mailbox import Mailbox
 
@@ -83,6 +83,26 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(receipt.delivery, StoredNotice("offline"))
 
 
+    def test_failed_claude_start_discards_only_a_definitively_unused_message(self) -> None:
+        self.control.start_chat.return_value = Unavailable("No control socket.")
+        response = self.bridge.start_claude(
+            CODEX_SENDER, str(self.bridge.mailbox.path.parent), "claude-opus-5-5", "xhigh", "Review the fixture.",
+        )
+        generated_chat = self.control.start_chat.call_args.args[0]
+        self.assertEqual(response["state"], "unavailable")
+        self.assertEqual(self.bridge.mailbox.read(generated_chat, 0).messages, ())
+
+    def test_uncertain_claude_start_preserves_the_message_and_attempted_chat_id(self) -> None:
+        self.control.start_chat.return_value = TimedOut("Response timed out.")
+        response = self.bridge.start_claude(
+            CODEX_SENDER, str(self.bridge.mailbox.path.parent), "claude-opus-5-5", "xhigh", "Review the fixture.",
+        )
+        generated_chat = self.control.start_chat.call_args.args[0]
+        saved = self.bridge.mailbox.read(generated_chat, 0).messages[0].message
+        self.assertEqual((response["state"], response["chat_id"], response["message_id"]),
+                         ("unknown", generated_chat, saved.message_id))
+
+
 class StdioTest(unittest.IsolatedAsyncioTestCase):
     async def test_chat_results_match_the_mcp_output_schemas(self) -> None:
         control = create_autospec(DesktopControl, instance=True)
@@ -111,11 +131,12 @@ class StdioTest(unittest.IsolatedAsyncioTestCase):
                     tools = await session.list_tools()
         self.assertEqual({tool.name for tool in tools.tools}, {
             "claude_launch", "codex_list_chats", "read_chat", "send_message", "read_messages",
-            "claude_open_chat_draft", "who_am_i", "list_skills", "read_skill",
+            "claude_start_chat", "codex_start_chat", "who_am_i", "list_skills", "read_skill",
             "claude_list_chats", "claude_get_chat", "claude_set_remote_control",
             "claude_wake_chat", "claude_set_model", "claude_set_effort", "claude_set_fast_mode",
             "claude_set_permission_mode", "claude_archive", "claude_unarchive", "claude_stop",
-            "claude_interrupt", "codex_chat_status",
+            "claude_interrupt", "codex_chat_status", "codex_interrupt", "codex_set_model",
+            "codex_set_effort", "codex_archive", "codex_unarchive",
         })
         reads = {"claude_list_chats", "claude_get_chat"}
         for tool in tools.tools:
