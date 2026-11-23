@@ -147,6 +147,30 @@ test("coalesces warm requests and confirms the native owner before reporting rea
   assert.equal(local.calls.filter(([operation]) => operation === "release").length, 1);
 });
 
+test("keeps preparation pending while Desktop loads execution configuration", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let resumes = 0;
+  let owned = false;
+  const local = fixture(t, {
+    getStreamRole: () => owned ? { role: "owner" } : null,
+    async resumeConversationForUnavailableOwner() {
+      if (++resumes === 1) return { status: "not-ready", reason: "execution-config-loading" };
+      owned = true;
+      return { status: "ready" };
+    },
+  });
+  assert.deepEqual(await local.request("warm"), { state: "warming" });
+  await nextTick();
+  assert.equal(resumes, 1);
+  assert.deepEqual(await local.request("warm"), { state: "warming" });
+  assert.equal(local.calls.filter(([operation]) => operation === "release").length, 0);
+  t.mock.timers.tick(500);
+  await nextTick();
+  assert.equal(resumes, 2);
+  assert.deepEqual(await local.request("warm"), { state: "ready" });
+  assert.equal(local.calls.filter(([operation]) => operation === "retain").length, 1);
+});
+
 test("never reports ready after a failed native resume, archive or account change", async (t) => {
   for (const change of [null, "archive", "retire"]) {
     const local = fixture(t);

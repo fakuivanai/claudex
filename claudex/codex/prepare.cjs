@@ -8,6 +8,8 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const DESKTOP_SOURCES = new Set(["vscode", "exec", "appServer", "app_server"]);
 // Native idle-thread eviction can otherwise race the client's next request.
 const RETENTION_MS = 60_000;
+// Desktop briefly refuses native resume before startup settings are ready.
+const EXECUTION_CONFIG_RETRY_MS = 400;
 
 function validRequest(params, frame) {
   return !!params && typeof params === "object" && Object.keys(params).length === 3 &&
@@ -65,7 +67,7 @@ function registerPrepareThread({ host, ipcClient, assertCurrent }) {
       const thread = await readEligibleThread(id);
       if (!thread || preparations.get(id) !== preparation) return;
       preparation.lease = host.retainActiveConversation(id);
-      if (!owns(id)) {
+      while (!owns(id)) {
         const result = await host.resumeConversationForUnavailableOwner({
           conversationId: id,
           model: null,
@@ -73,14 +75,24 @@ function registerPrepareThread({ host, ipcClient, assertCurrent }) {
           workspaceRoots: [thread.cwd],
           collaborationMode: host.getConversation(id)?.latestCollaborationMode ?? null,
         });
-        if (result?.status !== "ready") return;
+        if (result?.status === "ready") break;
+        if (result?.status !== "not-ready" || result.reason !== "execution-config-loading") {
+          host.logger?.debug?.("claudex_prepare_thread_not_ready", {
+            safe: { status: result?.status, reason: result?.reason },
+          });
+          return;
+        }
+        // Resume only. The relay cannot submit peer output until it rediscovers an owner.
+        await new Promise(resolve => setTimeout(resolve, EXECUTION_CONFIG_RETRY_MS));
+        assertCurrent();
+        if (preparations.get(id) !== preparation || !available(id)) return;
       }
       assertCurrent();
       if (preparations.get(id) === preparation && available(id) && owns(id)) {
         preparation.state = "ready";
       }
-    } catch {
-      // Invalid or retired hosts cannot prepare a thread.
+    } catch (error) {
+      host.logger?.debug?.("claudex_prepare_thread_failed", { safe: {}, sensitive: { error } });
     } finally {
       if (preparation.state !== "ready") {
         preparation.state = "unavailable";
