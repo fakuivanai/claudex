@@ -60,11 +60,13 @@ def page_size(value: str, maximum: int) -> int:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="claudex", description=__doc__, allow_abbrev=False)
     apps = root.add_subparsers(dest="app", required=True)
-    claude_app = apps.add_parser("claude", help="Control Claude Desktop", allow_abbrev=False)
+    claude_app = apps.add_parser("claude", help="Control Claude Desktop chats through the patch", allow_abbrev=False)
     codex_app = apps.add_parser("codex", help="Read local Codex Desktop chats", allow_abbrev=False)
     mcp_app = apps.add_parser("mcp", help="Run the local MCP server over stdio", allow_abbrev=False)
-    mcp_app.add_argument("--client", choices=list(Provider), type=Provider, required=True)
-    mcp_app.add_argument("--state", dest="state_file", type=Path, required=True, help="Shared message database path")
+    mcp_app.add_argument("--client", choices=list(Provider), type=Provider, required=True,
+                         help="The app that runs this server")
+    mcp_app.add_argument("--state", dest="state_file", type=Path, required=True,
+                         help="SQLite mailbox file shared by both apps")
     desktop_commands = claude_app.add_subparsers(dest="command", required=True)
     codex_commands = codex_app.add_subparsers(dest="command", required=True)
 
@@ -76,7 +78,7 @@ def parser() -> argparse.ArgumentParser:
         "model": "Set a chat's model",
         "effort": "Set a chat's reasoning effort",
         "fast-mode": "Set fast mode for a chat",
-        "permission-mode": "Set the same or a more restrictive permission mode",
+        "permission-mode": "Keep or lower a chat's permission mode",
         "archive": "Archive a chat",
         "unarchive": "Unarchive a chat",
         "stop": "Stop a chat's worker",
@@ -84,7 +86,7 @@ def parser() -> argparse.ArgumentParser:
     }
     for name, help_text in descriptions.items():
         command = desktop_commands.add_parser(name, help=help_text, description=help_text, allow_abbrev=False)
-        command.add_argument("--json", action="store_true", help="Write JSON")
+        command.add_argument("--json", action="store_true", help="Print JSON")
         if name != "chats":
             command.add_argument("chat_id", metavar="CHAT_ID", help="Exact Claude Desktop chat ID")
         match name:
@@ -101,18 +103,20 @@ def parser() -> argparse.ArgumentParser:
     threads.add_argument("--query", help="Title text or exact chat ID")
     threads.add_argument("--archived", action="store_true", help="List archived chats")
     threads.add_argument("--limit", type=lambda value: page_size(value, codex.history.MAX_LIST),
-                         default=codex.history.DEFAULT_CHAT_PAGE)
+                         default=codex.history.DEFAULT_CHAT_PAGE,
+                         help=f"Chats per page, at most {codex.history.MAX_LIST}")
     history = codex_commands.add_parser("history", help="Read the visible turns in a chat", allow_abbrev=False)
     history.add_argument("codex_chat_id", type=parse_codex_chat_id, metavar="CHAT_ID")
     history.add_argument("--include-archived", action="store_true", help="Allow an archived chat")
     history.add_argument("--limit", type=lambda value: page_size(value, codex.history.MAX_TURNS),
-                         default=codex.history.DEFAULT_TURN_PAGE)
+                         default=codex.history.DEFAULT_TURN_PAGE,
+                         help=f"Turns per page, at most {codex.history.MAX_TURNS}")
     for command in (threads, history):
         command.add_argument("--cursor", help="Continue from a previous page")
-        command.add_argument("--json", action="store_true", help="Write JSON")
-    status = codex_commands.add_parser("status", help="Check the loaded owner for a chat", allow_abbrev=False)
+        command.add_argument("--json", action="store_true", help="Print JSON")
+    status = codex_commands.add_parser("status", help="Check whether a Codex window has the chat open", allow_abbrev=False)
     status.add_argument("codex_chat_id", type=parse_codex_chat_id, metavar="CHAT_ID")
-    status.add_argument("--json", action="store_true", help="Write JSON")
+    status.add_argument("--json", action="store_true", help="Print JSON")
     return root
 
 
