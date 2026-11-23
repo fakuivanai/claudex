@@ -2,9 +2,6 @@
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
 const { restoreAfterOpening, restoreAtLaunch } = require("./restore.cjs");
 
 function savedChat(number, overrides = {}) {
@@ -22,10 +19,7 @@ function savedChat(number, overrides = {}) {
   };
 }
 
-function fixture(testContext, chats) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "claudex-restore-test-"));
-  testContext.after(() => fs.rmSync(directory, { force: true, recursive: true }));
-  const file = path.join(directory, ".claudex-remote-control-v1");
+function fixture(chats) {
   const events = [];
   const platform = {
     account: () => "account",
@@ -41,7 +35,6 @@ function fixture(testContext, chats) {
     sessionLoadEpoch: 7,
     currentAccountId: "account",
     currentOrgId: "organization",
-    getStorageDir: () => directory,
     sessions: new Map(chats.map((chat) => [chat.sessionId, chat])),
     awaitFreshFlagsForBackgroundPass: async () => {},
     heldInputChecks: { hasPendingUserInput: () => false },
@@ -61,10 +54,10 @@ function fixture(testContext, chats) {
       },
     },
   };
-  return { manager, platform, events, file };
+  return { manager, platform, events };
 }
 
-test("startup restores saved On chats without an earlier quit", async (context) => {
+test("startup restores saved On chats without an earlier quit", async () => {
   const savedOn = savedChat(1, { remoteControlAutoEligible: false });
   const automatic = savedChat(2, {
     remoteControlUserEnabled: undefined,
@@ -75,7 +68,7 @@ test("startup restores saved On chats without an earlier quit", async (context) 
   const unsentDraft = savedChat(3, {
     remoteControlUserEnabled: undefined, remoteControlStartChoice: true,
   });
-  const { manager, platform, events } = fixture(context, [savedOn, automatic, unsentDraft]);
+  const { manager, platform, events } = fixture([savedOn, automatic, unsentDraft]);
   await restoreAtLaunch(manager, 7, platform);
   assert.deepEqual(events, [
     ["warm", savedOn.sessionId, { warmTrigger: "launch_quit_resume" }],
@@ -83,23 +76,7 @@ test("startup restores saved On chats without an earlier quit", async (context) 
   ]);
 });
 
-test("startup deletes the legacy snapshot without using its contents", async (context) => {
-  const savedOn = savedChat(1);
-  const savedOff = savedChat(2, { remoteControlUserEnabled: false, remoteControlUserRequested: undefined });
-  const { manager, platform, events, file } = fixture(context, [savedOn, savedOff]);
-  fs.writeFileSync(file, JSON.stringify({
-    version: 1,
-    accountId: "account",
-    orgId: "organization",
-    capturedAt: Date.now(),
-    chats: [{ chatId: savedOff.sessionId, backendId: savedOff.cliSessionId }],
-  }));
-  await restoreAtLaunch(manager, 7, platform);
-  assert.equal(fs.existsSync(file), false);
-  assert.deepEqual(events.map(([, id]) => id), [savedOn.sessionId, savedOn.sessionId]);
-});
-
-test("startup skips ineligible chats even when Remote Control was saved On", async (context) => {
+test("startup skips ineligible chats even when Remote Control was saved On", async () => {
   const chats = [
     { homeTenancy: { accountId: "other", orgId: "organization" } },
     { homeTenancy: { accountId: "account", orgId: "other" } },
@@ -114,14 +91,14 @@ test("startup skips ineligible chats even when Remote Control was saved On", asy
     { remoteControlUserToggled: true },
     { remoteControlDisconnecting: true },
   ].map((overrides, number) => savedChat(number, overrides));
-  const { manager, platform, events } = fixture(context, chats);
+  const { manager, platform, events } = fixture(chats);
   await restoreAtLaunch(manager, 7, platform);
   assert.deepEqual(events, []);
 });
 
-test("setting Remote Control to Off during the worktree check stops restore", async (context) => {
+test("setting Remote Control to Off during the worktree check stops restore", async () => {
   const chat = savedChat(1);
-  const { manager, platform, events } = fixture(context, [chat]);
+  const { manager, platform, events } = fixture([chat]);
   platform.checkWorktree = async () => {
     chat.remoteControlUserEnabled = false;
     return false;
@@ -130,17 +107,17 @@ test("setting Remote Control to Off during the worktree check stops restore", as
   assert.deepEqual(events, []);
 });
 
-test("native managed policy can decline all background starts", async (context) => {
+test("native managed policy can decline all background starts", async () => {
   const chat = savedChat(1);
-  const { manager, platform, events } = fixture(context, [chat]);
+  const { manager, platform, events } = fixture([chat]);
   platform.canRestore = async () => false;
   await restoreAtLaunch(manager, 7, platform);
   assert.deepEqual(events, []);
 });
 
-test("an account epoch change while checking the worktree cancels the launch pass", async (context) => {
+test("an account epoch change while checking the worktree cancels the launch pass", async () => {
   const chat = savedChat(1);
-  const { manager, platform, events } = fixture(context, [chat]);
+  const { manager, platform, events } = fixture([chat]);
   platform.checkWorktree = async () => {
     manager.sessionLoadEpoch += 1;
     return false;
@@ -149,9 +126,9 @@ test("an account epoch change while checking the worktree cancels the launch pas
   assert.deepEqual(events, []);
 });
 
-test("a changed organization prevents warming a record from the previous organization", async (context) => {
+test("a changed organization prevents warming a record from the previous organization", async () => {
   const chat = savedChat(1);
-  const { manager, platform, events } = fixture(context, [chat]);
+  const { manager, platform, events } = fixture([chat]);
   platform.canRestore = async () => {
     manager.currentOrgId = "other";
     return true;
@@ -160,27 +137,27 @@ test("a changed organization prevents warming a record from the previous organiz
   assert.deepEqual(events, []);
 });
 
-test("worker limit still permits reconnecting an already warm worker", async (context) => {
+test("worker limit still permits reconnecting an already warm worker", async () => {
   const cold = savedChat(1);
   const warm = savedChat(2, { query: {}, lastSpawnResumed: true });
-  const { manager, platform, events } = fixture(context, [cold, warm]);
+  const { manager, platform, events } = fixture([cold, warm]);
   manager.cliGovernor.headroom = () => 1;
   await restoreAtLaunch(manager, 7, platform);
   assert.deepEqual(events, [["reconnect", warm.sessionId, warm.cliSessionId, "/workspace", "claudex_restart"]]);
 });
 
-test("startup leaves a chat with saved pending input stopped", async (context) => {
+test("startup leaves a chat with saved pending input stopped", async () => {
   const chat = savedChat(1);
-  const { manager, platform, events } = fixture(context, [chat]);
+  const { manager, platform, events } = fixture([chat]);
   manager.heldInputChecks.hasPendingUserInput = () => true;
   await restoreAtLaunch(manager, 7, platform);
   assert.deepEqual(events, []);
 });
 
-test("a deferred roster restores newly loaded saved On chats", async (context) => {
+test("a deferred roster restores newly loaded saved On chats", async () => {
   const active = savedChat(1);
   const deferred = savedChat(2);
-  const { manager, platform, events } = fixture(context, [active]);
+  const { manager, platform, events } = fixture([active]);
   await restoreAtLaunch(manager, 7, platform);
   manager.sessions.set(deferred.sessionId, deferred);
   await restoreAtLaunch(manager, 7, platform);
@@ -189,9 +166,9 @@ test("a deferred roster restores newly loaded saved On chats", async (context) =
   ]);
 });
 
-test("reopen uses the active worktree for a chat left cold at startup", async (context) => {
+test("reopen uses the active worktree for a chat left cold at startup", async () => {
   const chat = savedChat(1, { worktreePath: "/worktree" });
-  const { manager, platform, events } = fixture(context, [chat]);
+  const { manager, platform, events } = fixture([chat]);
   manager.cliGovernor.headroom = () => 1;
   await restoreAtLaunch(manager, 7, platform);
   chat.query = {};
@@ -200,7 +177,7 @@ test("reopen uses the active worktree for a chat left cold at startup", async (c
   assert.deepEqual(events, [["reconnect", chat.sessionId, chat.cliSessionId, "/worktree", "claudex_reopen"]]);
 });
 
-test("reopen skips an old chat without an explicit On setting", async (context) => {
+test("reopen skips an old chat without an explicit On setting", async () => {
   const relevant = savedChat(1);
   const loaded = savedChat(2, {
     query: {},
@@ -209,16 +186,16 @@ test("reopen skips an old chat without an explicit On setting", async (context) 
     remoteControlUserRequested: undefined,
     remoteControlAutoEligible: true,
   });
-  const { manager, platform, events } = fixture(context, [relevant, loaded]);
+  const { manager, platform, events } = fixture([relevant, loaded]);
   manager.cliGovernor.headroom = () => 1;
   await restoreAtLaunch(manager, 7, platform);
   await restoreAfterOpening(manager.sessions, loaded, loaded.query, manager.remoteControlLifecycle, () => true, platform.log);
   assert.deepEqual(events, []);
 });
 
-test("reopen does not attach a stale query", async (context) => {
+test("reopen does not attach a stale query", async () => {
   const chat = savedChat(1);
-  const { manager, platform, events } = fixture(context, [chat]);
+  const { manager, platform, events } = fixture([chat]);
   manager.cliGovernor.headroom = () => 1;
   await restoreAtLaunch(manager, 7, platform);
   chat.query = {};
@@ -227,9 +204,9 @@ test("reopen does not attach a stale query", async (context) => {
   assert.deepEqual(events, []);
 });
 
-test("reopen rechecks managed policy that changed after startup", async (context) => {
+test("reopen rechecks managed policy that changed after startup", async () => {
   const chat = savedChat(1);
-  const { manager, platform, events } = fixture(context, [chat]);
+  const { manager, platform, events } = fixture([chat]);
   manager.cliGovernor.headroom = () => 1;
   await restoreAtLaunch(manager, 7, platform);
   chat.query = {};

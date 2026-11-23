@@ -10,7 +10,7 @@ import tempfile
 from typing import BinaryIO
 
 from .archive import (
-    COPY_BLOCK, Header, PackedReplacement, blocks_from, encode_header, integrity_of,
+    COPY_BLOCK, Header, PackedReplacement, blocks_from, encode_header,
     packed_entry, read_exact, read_header, replace_files,
 )
 
@@ -18,6 +18,7 @@ from .archive import (
 MODULE_NAME = "claudex-restore.cjs"
 BRIDGE_MODULE = "claudex-desktop-bridge.cjs"
 SOCKET_MODULE = "claudex-desktop-socket.cjs"
+NIX_STORE = Path("/nix/store")
 
 
 @dataclass(frozen=True)
@@ -175,18 +176,13 @@ def apply_anchors(original: bytes, release: DesktopRelease, anchors: Sequence[An
 
 
 def patch_chunk(original: bytes, release: DesktopRelease) -> bytes:
-    if MODULE_NAME.encode() in original:
-        raise ValueError("source chunk already contains the reconnect patch")
     return apply_anchors(original, release, release.anchors)
 
 
 def source_chunk(source: BinaryIO, header: Header, path: tuple[str, ...]) -> PackedReplacement:
     original = packed_entry(header.root, path)
     source.seek(header.body_offset + original.offset)
-    content = read_exact(source, original.size)
-    if original.integrity != integrity_of(content, original.integrity.block_size):
-        raise ValueError("source ASAR chunk integrity did not match its header")
-    return PackedReplacement(path, original, content)
+    return PackedReplacement(path, original, read_exact(source, original.size))
 
 
 def patched_blocks(
@@ -204,10 +200,12 @@ def patched_blocks(
 
 
 def build(source_path: Path, output_path: Path) -> str:
+    source_path = source_path.resolve(strict=True)
     with source_path.open("rb") as source:
+        initial = os.fstat(source.fileno())
         release = identify_release(source)
         header = read_header(source)
-        body_size = os.fstat(source.fileno()).st_size - header.body_offset
+        body_size = initial.st_size - header.body_offset
         session = source_chunk(source, header, release.session_chunk)
         edited = [PackedReplacement(session.path, session.before, patch_chunk(session.content, release))]
         modules = {(*session.path[:-1], MODULE_NAME): Path(__file__).with_name("restore.cjs").read_bytes()}
@@ -226,18 +224,19 @@ def build(source_path: Path, output_path: Path) -> str:
         # overwrite either the installed archive or a previous build.
         with tempfile.TemporaryDirectory(dir=output_path.parent) as directory:
             temporary = Path(directory) / "app.asar"
-            with temporary.open("w+b") as candidate:
-                candidate.writelines(patched_blocks(source, header.body_offset, body_size, edited, new_header, added))
-                candidate.flush()
-                candidate.seek(0)
-                for expected in patched_blocks(source, header.body_offset, body_size, edited, new_header, added):
-                    if read_exact(candidate, len(expected)) != expected:
-                        raise ValueError("patched ASAR bytes did not round-trip")
-                if candidate.read(1):
-                    raise ValueError("unexpected bytes at the end of the patched ASAR")
-                digest = hash_archive(candidate)
+            digest = hashlib.sha256()
+            with temporary.open("wb") as candidate:
+                for block in patched_blocks(source, header.body_offset, body_size, edited, new_header, added):
+                    candidate.write(block)
+                    digest.update(block)
+            # Retain the standalone builder's support for mutable inputs. A
+            # change between the hash check and copy must not publish an archive.
+            if not source_path.is_relative_to(NIX_STORE):
+                current = os.fstat(source.fileno())
+                if (current.st_mtime_ns, current.st_ctime_ns) != (initial.st_mtime_ns, initial.st_ctime_ns):
+                    raise OSError("The source archive changed during the build.")
             os.link(temporary, output_path)
-            return digest
+            return digest.hexdigest()
 
 
 def main() -> None:

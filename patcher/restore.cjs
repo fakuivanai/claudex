@@ -1,23 +1,6 @@
 "use strict";
 
-const fs = require("node:fs");
-const path = require("node:path");
 const launchAttempts = new WeakMap();
-
-function removeLegacySnapshot(manager, log) {
-  // Desktop selects this directory by profile, account, and organization.
-  const directory = manager.getStorageDir();
-  if (directory == null) {
-    return;
-  }
-  try {
-    fs.unlinkSync(path.join(directory, ".claudex-remote-control-v1"));
-  } catch (error) {
-    if (error.code !== "ENOENT") {
-      log("[claudex] Could not remove the old Remote Control quit snapshot");
-    }
-  }
-}
 
 function matchesSavedChat(chat, pass) {
   return (
@@ -106,7 +89,6 @@ async function restoreAtLaunch(manager, epoch, platform) {
       platform,
     };
     launchAttempts.set(manager.sessions, pass);
-    removeLegacySnapshot(manager, platform.log);
   }
   const canResume = (chat) =>
     isSignedIn() &&

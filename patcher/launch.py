@@ -6,17 +6,15 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
 import hashlib
+import json
 import os
 from pathlib import Path
-import re
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 from typing import assert_never
-
-from pydantic import TypeAdapter, ValidationError
 
 from desktop_environment import desktop_environment
 
@@ -27,40 +25,6 @@ class LaunchRefused(RuntimeError):
     """A second launcher might hand off to a different existing instance."""
 
 
-@dataclass(frozen=True)
-class FileIdentity:
-    device: int
-    inode: int
-    size: int
-    modified: int
-    changed: int
-
-    @classmethod
-    def read(cls, path: Path) -> "FileIdentity":
-        metadata = path.lstat()
-        if not stat.S_ISREG(metadata.st_mode):
-            raise OSError(f"Expected a regular file at {path}")
-        return cls(
-            metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns, metadata.st_ctime_ns,
-        )
-
-
-@dataclass(frozen=True)
-class CacheRecord:
-    source_digest: str
-    artifact: FileIdentity
-
-
-@dataclass(frozen=True)
-class CachedArchive:
-    archive: Path
-    reference: Path
-
-
-# The archive is reused only when the source stat identity and patch inputs match.
-FILE_IDENTITY = TypeAdapter(FileIdentity)
-CACHE_RECORD = TypeAdapter(CacheRecord)
-SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 # A stalled notification service should only briefly delay the stock launch.
 NOTIFICATION_TIMEOUT = 2
 
@@ -108,17 +72,6 @@ def launch_lock(state: Path) -> Iterator[None]:
         yield
 
 
-def publish_bytes(path: Path, content: bytes) -> None:
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-        temporary = Path(stream.name)
-        try:
-            stream.write(content)
-            stream.close()
-            temporary.replace(path)
-        finally:
-            temporary.unlink(missing_ok=True)
-
-
 def patch_digest() -> str:
     # These package files define the bytes that will be mounted in the app.
     digest = hashlib.sha256()
@@ -129,41 +82,30 @@ def patch_digest() -> str:
     return digest.hexdigest()
 
 
-def cached_archive(source: Path, cache: Path) -> CachedArchive:
-    identity = FileIdentity.read(source)
-    patch = patch_digest()
-    source_key = hashlib.sha256(os.fsencode(source) + b"\0" + FILE_IDENTITY.dump_json(identity)).hexdigest()
-    reference = cache / f"{source_key}-{patch}.json"
-    try:
-        record = CACHE_RECORD.validate_json(reference.read_bytes(), strict=True)
-        supported = SHA256_HEX.fullmatch(record.source_digest) and any(
-            release.digest == record.source_digest for release in archive_builder.SUPPORTED_RELEASES
-        )
-        if supported:
-            candidate = cache / f"{record.source_digest}-{patch}.asar"
-            if FileIdentity.read(candidate) == record.artifact:
-                return CachedArchive(candidate, reference)
-    except (OSError, ValidationError):
-        pass
-
-    with source.open("rb") as stream:
-        release = archive_builder.identify_release(stream)
-    candidate = cache / f"{release.digest}-{patch}.asar"
+def cached_archive(source: Path, cache: Path) -> Path:
+    source_key = hashlib.sha256(os.fsencode(source)).hexdigest()
+    candidate = cache / f"{source_key}-{patch_digest()}.asar"
+    # Only resolved Nix store paths are immutable. Rebuild and verify any
+    # standalone input on each launch.
+    if source.is_relative_to(archive_builder.NIX_STORE):
+        try:
+            mode = candidate.lstat().st_mode
+            if stat.S_ISREG(mode) and stat.S_IMODE(mode) == 0o400:
+                return candidate
+        except FileNotFoundError:
+            pass
     with tempfile.TemporaryDirectory(dir=cache) as staging:
         output = Path(staging) / "app.asar"
         archive_builder.build(source, output)
-        if FileIdentity.read(source) != identity:
-            raise OSError("The installed Claude archive changed during the patch build.")
         output.chmod(0o400)
         output.replace(candidate)
-    publish_bytes(reference, CACHE_RECORD.dump_json(CacheRecord(release.digest, FileIdentity.read(candidate))))
-    return CachedArchive(candidate, reference)
+    return candidate
 
 
-def prune_cached_archives(cache: Path, current: CachedArchive) -> None:
+def prune_cached_archives(cache: Path, current: Path) -> None:
     """Trim the private cache with the launch lock held and Desktop stopped."""
     for entry in cache.iterdir():
-        if entry == current.archive or entry == current.reference:
+        if entry == current:
             continue
         if stat.S_ISDIR(entry.lstat().st_mode):
             shutil.rmtree(entry)
@@ -171,32 +113,12 @@ def prune_cached_archives(cache: Path, current: CachedArchive) -> None:
             entry.unlink()
 
 
-def mount_command(bubblewrap: str, patched: Path, stock: Path, command: list[str]) -> list[str]:
+def mount_command(bubblewrap: str, patched: Path, stock: Path, command: list[str], status_fd: int) -> list[str]:
     return [
-        bubblewrap, "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc",
+        bubblewrap, "--json-status-fd", str(status_fd),
+        "--bind", "/", "/", "--dev-bind", "/dev", "/dev", "--proc", "/proc",
         "--ro-bind", str(patched), str(stock), "--", *command,
     ]
-
-
-# A fresh marker records whether the account launcher was reached inside the
-# mount namespace. No exit code from an already-started launcher means fallback.
-START_ACCOUNT_LAUNCHER = """
-from pathlib import Path
-import subprocess
-import sys
-
-marker = Path(sys.argv[1])
-with marker.open("x") as stream:
-    stream.write("attempted")
-try:
-    process = subprocess.Popen(sys.argv[2:])
-except OSError as error:
-    marker.write_text("exec-failed")
-    print(f"claudex: Could not execute the account launcher ({error.strerror}).", file=sys.stderr)
-    raise SystemExit(1)
-status = process.wait()
-raise SystemExit(128 - status if status < 0 else status)
-"""
 
 
 @dataclass(frozen=True)
@@ -217,25 +139,33 @@ class Disabled:
 
 
 def start_patched(
-    bubblewrap: str, patched: Path, stock: Path, command: list[str], environment: dict[str, str], cache: Path,
+    bubblewrap: str, patched: Path, stock: Path, command: list[str], environment: dict[str, str],
 ) -> Started | Fallback:
-    with tempfile.TemporaryDirectory(prefix="launch-", dir=cache) as directory:
-        marker = Path(directory) / "account-launcher-start"
-        wrapped = mount_command(
-            bubblewrap, patched, stock,
-            [sys.executable, "-I", "-B", "-c", START_ACCOUNT_LAUNCHER, str(marker), *command],
-        )
+    with tempfile.TemporaryFile() as status:
+        fd = status.fileno()
+        wrapped = mount_command(bubblewrap, patched, stock, command, fd)
         try:
-            launched = subprocess.run(wrapped, env=environment, cwd=environment["HOME"], check=False)
+            launched = subprocess.run(wrapped, env=environment, cwd=environment["HOME"], pass_fds=(fd,), check=False)
         except OSError as error:
             return Fallback(f"could not start bubblewrap ({error.strerror})")
+        if launched.returncode <= 0:
+            return Started(launched.returncode)
+        status.seek(0)
         try:
-            stage = marker.read_text()
-        except FileNotFoundError:
-            return Fallback(f"patch mount setup failed (exit {launched.returncode})")
-        if stage == "exec-failed":
-            return Fallback("the account launcher could not start inside the patch mount")
-        return Started(launched.returncode)
+            reports = [json.loads(line) for line in status]
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise LaunchRefused("Could not determine whether Bubblewrap started the account launcher.") from error
+        # Bubblewrap reports child-pid before namespace setup. Only the
+        # exit-code record confirms that setup and exec both succeeded.
+        # https://github.com/containers/bubblewrap/blob/v0.11.2/bubblewrap.c
+        for report in reports:
+            if isinstance(report, dict):
+                if type(report.get("exit-code")) is int:
+                    return Started(launched.returncode)
+                if type(report.get("child-pid")) is int:
+                    continue
+            raise LaunchRefused("Could not determine whether Bubblewrap started the account launcher.")
+        return Fallback(f"patch mount setup or launcher exec failed (exit {launched.returncode})")
 
 
 def notify_stock_fallback(environment: dict[str, str]) -> None:
@@ -297,10 +227,6 @@ def launch(source: Path, command: list[str], *, disabled: bool, reuse_running: b
     with launch_lock(state):
         if running_desktop():
             return existing_launch(command, environment, reuse_running)
-        try:
-            (state / "last-stock-launch").unlink(missing_ok=True)
-        except OSError as error:
-            print(f"claudex: Could not remove the old stock launch marker ({error}).", file=sys.stderr)
         if disabled:
             return stock_launch(command, environment, Disabled())
         bubblewrap = shutil.which("bwrap", path=environment["PATH"])
@@ -318,7 +244,7 @@ def launch(source: Path, command: list[str], *, disabled: bool, reuse_running: b
             prune_cached_archives(cache, patched)
         except OSError as error:
             print(f"claudex: Could not remove an old cached patch ({error}).", file=sys.stderr)
-        result = start_patched(bubblewrap, patched.archive, source, command, environment, cache)
+        result = start_patched(bubblewrap, patched, source, command, environment)
         match result:
             case Fallback():
                 return stock_launch(command, environment, result)

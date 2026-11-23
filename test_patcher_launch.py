@@ -17,7 +17,7 @@ from patcher import build as archive_builder
 from patcher.archive import Directory, Packed, encode_header, integrity_of
 from patcher.build import Anchor, DesktopRelease
 from patcher.launch import (
-    CachedArchive, LaunchRefused, cached_archive, launch, notify_stock_fallback, running_desktop,
+    LaunchRefused, cached_archive, launch, notify_stock_fallback, running_desktop,
 )
 
 
@@ -57,10 +57,9 @@ class DesktopLaunchTests(unittest.TestCase):
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.cache = self.root / "cache" / "claudex" / "desktop"
-        self.state = self.root / ".local" / "state" / "claudex" / "desktop"
         self.stock = self.root / "stock.asar"
         self.stock.touch()
-        self.patched = CachedArchive(self.root / "patched.asar", self.root / "patched.json")
+        self.patched = self.root / "patched.asar"
         self.record = self.root / "launch-record"
         self.notice_record = self.root / "notice-record"
         self.environment = {"HOME": str(self.root), "PATH": str(self.bin), "XDG_CACHE_HOME": str(self.root / "cache")}
@@ -89,15 +88,27 @@ raise SystemExit({exit_code})
         )
         return [str(launcher)]
 
-    def fake_bubblewrap(self) -> None:
+    def fake_bubblewrap(self, *, command_override: str = "") -> None:
         self.executable(
             "bwrap",
-            """\
+            f"""\
+import json
 import os
+import subprocess
 import sys
 
 arguments = sys.argv[sys.argv.index("--") + 1:]
-os.execv(arguments[0], arguments)
+if {command_override!r}:
+    arguments[0] = {command_override!r}
+fd = int(sys.argv[sys.argv.index("--json-status-fd") + 1])
+os.write(fd, json.dumps({{"child-pid": 123}}).encode() + b"\\n")
+try:
+    status = subprocess.run(arguments, check=False).returncode
+except OSError:
+    raise SystemExit(1)
+status = 128 - status if status < 0 else status
+os.write(fd, json.dumps({{"exit-code": status}}).encode() + b"\\n")
+raise SystemExit(status)
 """,
         )
 
@@ -147,13 +158,13 @@ raise SystemExit({exit_code})
     def test_nonzero_after_app_start_does_not_relaunch_stock(self) -> None:
         self.fake_bubblewrap()
         self.fake_notifier()
-        args = self.fake_launcher(exit_code=23)
+        args = self.fake_launcher(exit_code=1)
         with (
             patch("patcher.launch.desktop_environment", return_value=self.environment),
             patch("patcher.launch.running_desktop", return_value=False),
             patch("patcher.launch.cached_archive", return_value=self.patched),
         ):
-            self.assertEqual(launch(self.stock, args, disabled=False), 23)
+            self.assertEqual(launch(self.stock, args, disabled=False), 1)
         self.assertEqual(len(self.record.read_text().splitlines()), 1)
         self.assertFalse(self.notice_record.exists())
 
@@ -168,23 +179,6 @@ raise SystemExit({exit_code})
         ):
             self.assertEqual(launch(self.stock, args, disabled=True), 0)
 
-    def test_old_stock_launch_marker_is_removed_without_reading_it(self) -> None:
-        self.state.mkdir(mode=0o700, parents=True)
-        marker = self.state / "last-stock-launch"
-        marker.write_text("invalid old timestamp")
-        self.fake_bubblewrap()
-        args = self.fake_launcher()
-        stderr = io.StringIO()
-        with (
-            patch("patcher.launch.desktop_environment", return_value=self.environment),
-            patch("patcher.launch.running_desktop", return_value=False),
-            patch("patcher.launch.cached_archive", return_value=self.patched),
-            redirect_stderr(stderr),
-        ):
-            self.assertEqual(launch(self.stock, args, disabled=False), 0)
-        self.assertFalse(marker.exists())
-        self.assertNotIn("Launching stock", stderr.getvalue())
-
     def test_clean_exit_after_app_start_does_not_relaunch_stock(self) -> None:
         self.fake_bubblewrap()
         args = self.fake_launcher()
@@ -197,7 +191,14 @@ raise SystemExit({exit_code})
         self.assertEqual(len(self.record.read_text().splitlines()), 1)
 
     def test_mount_failure_falls_back_to_stock_with_a_reason(self) -> None:
-        self.executable("bwrap", "raise SystemExit(13)")
+        self.executable("bwrap", """\
+import os
+import sys
+
+fd = int(sys.argv[sys.argv.index("--json-status-fd") + 1])
+os.write(fd, b'{"child-pid": 123}\\n')
+raise SystemExit(13)
+""")
         args = self.fake_launcher()
         stderr = io.StringIO()
         with (
@@ -207,7 +208,8 @@ raise SystemExit({exit_code})
             redirect_stderr(stderr),
         ):
             self.assertEqual(launch(self.stock, args, disabled=False), 0)
-        self.assertIn("patch mount setup failed (exit 13). Launching stock Claude Desktop.", stderr.getvalue())
+        self.assertIn("patch mount setup or launcher exec failed (exit 13). Launching stock Claude Desktop.",
+                      stderr.getvalue())
         self.assertEqual(len(self.record.read_text().splitlines()), 1)
 
     def test_build_failure_falls_back_to_stock_with_a_reason(self) -> None:
@@ -255,17 +257,7 @@ raise SystemExit({exit_code})
                 notify_stock_fallback(self.environment)
 
     def test_account_exec_failure_before_app_start_falls_back(self) -> None:
-        self.executable(
-            "bwrap",
-            """\
-import os
-import sys
-
-arguments = sys.argv[sys.argv.index("--") + 1:]
-arguments[6] = "/nonexistent/fixture-claude-launcher"
-os.execv(arguments[0], arguments)
-""",
-        )
+        self.fake_bubblewrap(command_override=str(self.root / "missing-launcher"))
         args = self.fake_launcher()
         stderr = io.StringIO()
         with (
@@ -275,7 +267,8 @@ os.execv(arguments[0], arguments)
             redirect_stderr(stderr),
         ):
             self.assertEqual(launch(self.stock, args, disabled=False), 0)
-        self.assertIn("account launcher could not start inside the patch mount", stderr.getvalue())
+        self.assertIn("patch mount setup or launcher exec failed (exit 1)", stderr.getvalue())
+        self.assertEqual(len(self.record.read_text().splitlines()), 1)
 
     def test_running_desktop_refuses_an_implicit_handoff(self) -> None:
         args = self.fake_launcher()
@@ -338,7 +331,7 @@ os.execv(arguments[0], arguments)
 
     def test_verified_cached_archive_avoids_rehash_and_rebuild(self) -> None:
         release = self.cache_fixture()
-        with patch("patcher.build.SUPPORTED_RELEASES", (release,)):
+        with (patch("patcher.build.SUPPORTED_RELEASES", (release,)), patch("patcher.build.NIX_STORE", self.root)):
             first = cached_archive(self.stock, self.cache)
             with (
                 patch("patcher.build.identify_release", wraps=archive_builder.identify_release) as identify,
@@ -363,16 +356,16 @@ os.execv(arguments[0], arguments)
             with patch("patcher.launch.patch_digest", return_value="different-patch"):
                 self.assertNotEqual(cached_archive(self.stock, self.cache), first)
 
-    def test_changed_cache_archive_is_rebuilt_before_use(self) -> None:
+    def test_writable_cached_archive_is_rebuilt_before_use(self) -> None:
         release = self.cache_fixture()
-        with patch("patcher.build.SUPPORTED_RELEASES", (release,)):
+        with (patch("patcher.build.SUPPORTED_RELEASES", (release,)), patch("patcher.build.NIX_STORE", self.root)):
             original = cached_archive(self.stock, self.cache)
-            original.archive.chmod(0o600)
-            original.archive.write_bytes(b"tampered archive")
+            original.chmod(0o600)
+            original.write_bytes(b"tampered archive")
             rebuilt = cached_archive(self.stock, self.cache)
-            self.assertNotEqual(rebuilt.archive.read_bytes(), b"tampered archive")
+            self.assertNotEqual(rebuilt.read_bytes(), b"tampered archive")
 
-    def test_launch_keeps_only_the_current_cache_pair(self) -> None:
+    def test_launch_keeps_only_the_current_cached_archive(self) -> None:
         release = self.cache_fixture()
         self.fake_bubblewrap()
         args = self.fake_launcher()
@@ -403,31 +396,28 @@ os.execv(arguments[0], arguments)
 
             current = cached_archive(self.stock, self.cache)
 
-        self.assertEqual(set(self.cache.iterdir()), {current.archive, current.reference})
+        self.assertEqual(set(self.cache.iterdir()), {current})
         self.assertTrue((external / "kept").is_file())
 
-    def test_cache_hit_prunes_stale_references_to_the_current_archive(self) -> None:
+    def test_cache_hit_prunes_a_stale_reference_file(self) -> None:
         release = self.cache_fixture()
         self.fake_bubblewrap()
         args = self.fake_launcher()
         current_patch = "f" * 64
         with (
             patch("patcher.build.SUPPORTED_RELEASES", (release,)),
+            patch("patcher.build.NIX_STORE", self.root),
             patch("patcher.launch.patch_digest", return_value=current_patch),
             patch("patcher.launch.desktop_environment", return_value=self.environment),
             patch("patcher.launch.running_desktop", return_value=False),
         ):
             current = cached_archive(self.stock, self.cache)
-            reference, = self.cache.glob("*.json")
-            obsolete = self.cache / f"{'e' * 64}-{current_patch}.json"
-            payload = json.loads(reference.read_text())
-            payload["artifact"]["inode"] = -1
-            obsolete.write_text(json.dumps(payload))
+            obsolete = self.cache / "old-cache-reference.json"
+            obsolete.write_text("{}")
             with patch("patcher.build.build") as build:
                 self.assertEqual(launch(self.stock, args, disabled=False), 0)
             build.assert_not_called()
-        self.assertTrue(current.archive.is_file())
-        self.assertTrue(reference.is_file())
+        self.assertTrue(current.is_file())
         self.assertFalse(obsolete.exists())
 
 
