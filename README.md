@@ -75,7 +75,7 @@ reports the control socket as unavailable.
 ## Claude Desktop launch and restore
 
 The Linux patch supports Claude Desktop `5.11492.5`. The pinned archive hash
-and native hooks are in [patcher/build.py](patcher/build.py). Build the
+and native hooks are in [claudex/patch/build.py](claudex/patch/build.py). Build the
 package with `nix build .#`. When running the launcher outside Home
 Manager, pass `--source /absolute/path/to/installed/app.asar` before `--`
 and the absolute stock account launcher after it. Bubblewrap must be on

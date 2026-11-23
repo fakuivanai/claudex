@@ -10,5 +10,7 @@ else
 fi
 claudex_node=${CLAUDEX_NODE:-node}
 "$claudex_python" -m mypy .
-"$claudex_python" -B -m unittest discover -v
-"$claudex_node" --test --test-isolation=none --test-timeout=10000 patcher/*.test.cjs
+"$claudex_python" -B -m unittest discover -s tests -t . -v
+# The whole JavaScript suite takes well under a second. Ten seconds per test
+# turns a stuck async wait into a failure instead of a hung build.
+"$claudex_node" --test --test-isolation=none --test-timeout=10000 tests/patch/*.test.cjs
