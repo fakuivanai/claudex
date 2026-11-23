@@ -41,8 +41,8 @@ function fixture() {
     getSession: async (chatId) => manager.sessions.get(chatId),
     toggleRemoteControl: async (chatId, enabled) => {
       calls.push(["toggle", chatId, enabled]);
-      native.row.remoteControlUserEnabled = enabled;
       if (enabled && !native.row.query) return { ok: false, reason: "no_active_session" };
+      native.row.remoteControlUserEnabled = enabled;
       native.row.bridgeSessionUrl = enabled ? "private URL" : undefined;
       return { ok: true };
     },
@@ -99,11 +99,16 @@ test("forwards warm and cold toggles to the exact native methods", async () => {
 test("recognizes an auto-attached worker and reports a missing worker separately", async () => {
   const { api, native, run, calls } = fixture();
   api.warmSession = async () => {};
+  const unavailable = await run("toggleRemoteControl", { enabled: true });
+  assert.equal(unavailable.status, "refused");
+  assert.equal(native.row.remoteControlUserEnabled, false);
+
+  native.row.remoteControlUserEnabled = true;
   const pending = await run("toggleRemoteControl", { enabled: true });
   assert.equal(pending.result.session.remote_control_saved, true);
   assert.equal(pending.result.session.remote_control, "off");
   assert.match(pending.result.notice, /did not start a worker/);
-  assert.deepEqual(calls, [["toggle", id, true]]);
+  assert.deepEqual(calls, [["toggle", id, true], ["toggle", id, true]]);
 
   api.warmSession = async () => {
     native.row.query = {};
@@ -111,12 +116,13 @@ test("recognizes an auto-attached worker and reports a missing worker separately
   };
   const on = await run("toggleRemoteControl", { enabled: true });
   assert.equal(on.result.session.remote_control, "on");
-  assert.deepEqual(calls, [["toggle", id, true], ["toggle", id, true]]);
+  assert.deepEqual(calls, [["toggle", id, true], ["toggle", id, true], ["toggle", id, true]]);
 });
 
 test("does not retry a cold toggle across an account switch or an explicit Off", async () => {
   for (const change of ["account", "off", "replacement", "archive"]) {
     const { api, native, run, calls, manager } = fixture();
+    native.row.remoteControlUserEnabled = true;
     api.warmSession = async () => {
       if (change === "account") native.signedIn = "another account";
       if (change === "off") native.row.remoteControlUserEnabled = false;

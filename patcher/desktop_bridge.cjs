@@ -125,19 +125,22 @@ function createDesktopBridge(api, manager, { account, windowActive = () => true 
         const enabled = request.input.enabled;
         let result = await api.toggleRemoteControl(id, enabled);
         if (!ownsTarget()) return SCOPE_CHANGED;
-        if (enabled && result?.reason === "no_active_session" && chat.remoteControlUserEnabled === true) {
+        if (enabled && result?.reason === "no_active_session") {
           if (chat.isArchived) return refusal("The chat was archived during the request.");
-          // The first native call saved On. Ask Desktop to warm exactly this
-          // chat, then retry only if the saved choice still agrees.
+          // A cold local toggle can leave the saved choice unchanged. The
+          // native no-active-session result has already passed policy checks.
+          const saved = chat.remoteControlUserEnabled;
           await api.warmSession(id);
           if (!ownsTarget()) return SCOPE_CHANGED;
           if (chat.isArchived) return refusal("The chat was archived during the request.");
-          if (chat.remoteControlUserEnabled !== true) {
+          if (chat.remoteControlUserEnabled !== saved) {
             return refusal("The chat's Remote Control setting changed while Desktop warmed it.");
           }
           if (!chat.query) {
-            notice = "Remote Control is saved On. Desktop did not start a worker and the chat is disconnected.";
-          } else if (!chat.bridgeSessionUrl) {
+            if (saved === true) {
+              notice = "Remote Control is saved On. Desktop did not start a worker and the chat is disconnected.";
+            }
+          } else if (!chat.bridgeSessionUrl || saved !== true) {
             // Native warm may be attaching through the saved-on path already.
             // Native toggle serializes with that same Remote Control transition.
             result = await api.toggleRemoteControl(id, true);
