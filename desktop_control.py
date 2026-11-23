@@ -6,6 +6,7 @@ import math
 import os
 import socket
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Generic, Literal, TypeVar, get_args
@@ -148,12 +149,11 @@ class _Interrupt(_WireModel):
     input: _ChatInput
 
 
-type _Request = Annotated[
-    _ListSessions | _GetSession | _ToggleRemoteControl | _WarmSession | _SetModel |
-    _SetEffort | _SetFastMode | _SetPermissionMode | _Archive | _Unarchive | _Stop | _Interrupt,
-    Field(discriminator="tool"),
-]
-_REQUEST = RootModel[_Request]
+type _MutationRequest = (
+    _ToggleRemoteControl | _WarmSession | _SetModel | _SetEffort | _SetFastMode |
+    _SetPermissionMode | _Archive | _Unarchive | _Stop | _Interrupt
+)
+type _Request = _ListSessions | _GetSession | _MutationRequest
 
 _Result = TypeVar("_Result", bound=_WireModel)
 
@@ -212,60 +212,69 @@ class DesktopControl:
         self._timeout = timeout
 
     def list_sessions(self) -> DesktopResult[DesktopSessionRoster]:
-        return self._request("getSessionList", {}, _ROSTER_RESPONSE)
+        return self._request(_ListSessions(tool="getSessionList", input=_WireModel()), _ROSTER_RESPONSE)
 
     def get_session(self, chat_id: str) -> DesktopResult[DesktopSession]:
-        result = self._request("getSession", {"chat_id": chat_id}, _SESSION_RESPONSE)
+        try:
+            request = _GetSession(tool="getSession", input=_ChatInput(chat_id=chat_id))
+        except ValidationError as error:
+            return _invalid_request(error)
+        result = self._request(request, _SESSION_RESPONSE)
         if isinstance(result, Success) and result.result.chat_id != chat_id:
             return InvalidResponse("Desktop returned a different chat than requested.")
         return result
 
     def set_remote_control(self, chat_id: str, enabled: bool) -> DesktopResult[DesktopMutation]:
-        return self._mutate("toggleRemoteControl", chat_id, enabled=enabled)
+        return self._mutate(lambda: _ToggleRemoteControl(
+            tool="toggleRemoteControl", input=_EnabledInput(chat_id=chat_id, enabled=enabled),
+        ))
 
     def warm_session(self, chat_id: str) -> DesktopResult[DesktopMutation]:
-        return self._mutate("warmSession", chat_id)
+        return self._mutate(lambda: _WarmSession(tool="warmSession", input=_ChatInput(chat_id=chat_id)))
 
     def set_model(self, chat_id: str, model: str) -> DesktopResult[DesktopMutation]:
-        return self._mutate("setModel", chat_id, model=model)
+        return self._mutate(lambda: _SetModel(tool="setModel", input=_ModelInput(chat_id=chat_id, model=model)))
 
     def set_effort(self, chat_id: str, effort: Effort | None) -> DesktopResult[DesktopMutation]:
-        return self._mutate("setEffort", chat_id, effort=effort)
+        return self._mutate(lambda: _SetEffort(tool="setEffort", input=_EffortInput(chat_id=chat_id, effort=effort)))
 
     def set_fast_mode(self, chat_id: str, enabled: bool) -> DesktopResult[DesktopMutation]:
-        return self._mutate("setFastMode", chat_id, enabled=enabled)
+        return self._mutate(lambda: _SetFastMode(
+            tool="setFastMode", input=_EnabledInput(chat_id=chat_id, enabled=enabled),
+        ))
 
     def set_permission_mode(self, chat_id: str, mode: PermissionMode) -> DesktopResult[DesktopMutation]:
-        return self._mutate("setPermissionMode", chat_id, mode=mode)
+        return self._mutate(lambda: _SetPermissionMode(
+            tool="setPermissionMode", input=_ModeInput(chat_id=chat_id, mode=mode),
+        ))
 
     def archive(self, chat_id: str) -> DesktopResult[DesktopMutation]:
-        return self._mutate("archive", chat_id)
+        return self._mutate(lambda: _Archive(tool="archive", input=_ChatInput(chat_id=chat_id)))
 
     def unarchive(self, chat_id: str) -> DesktopResult[DesktopMutation]:
-        return self._mutate("unarchive", chat_id)
+        return self._mutate(lambda: _Unarchive(tool="unarchive", input=_ChatInput(chat_id=chat_id)))
 
     def stop(self, chat_id: str) -> DesktopResult[DesktopMutation]:
-        return self._mutate("stop", chat_id)
+        return self._mutate(lambda: _Stop(tool="stop", input=_ChatInput(chat_id=chat_id)))
 
     def interrupt(self, chat_id: str) -> DesktopResult[DesktopMutation]:
-        return self._mutate("interrupt", chat_id)
+        return self._mutate(lambda: _Interrupt(tool="interrupt", input=_ChatInput(chat_id=chat_id)))
 
-    def _mutate(self, tool: str, chat_id: str, **fields: object) -> DesktopResult[DesktopMutation]:
-        result = self._request(tool, {"chat_id": chat_id, **fields}, _MUTATION_RESPONSE)
+    def _mutate(self, make_request: Callable[[], _MutationRequest]) -> DesktopResult[DesktopMutation]:
+        try:
+            request = make_request()
+        except ValidationError as error:
+            return _invalid_request(error)
+        result = self._request(request, _MUTATION_RESPONSE)
         if isinstance(result, Success):
             session = result.result.session
-            if session is not None and session.chat_id != chat_id:
+            if session is not None and session.chat_id != request.input.chat_id:
                 return InvalidResponse("Desktop returned a different chat than requested.")
         return result
 
     def _request(
-        self, tool: str, payload: dict[str, object], response: type[RootModel[_Response[_Result]]],
+        self, request: _Request, response: type[RootModel[_Response[_Result]]],
     ) -> DesktopResult[_Result]:
-        try:
-            request = _REQUEST.model_validate({"tool": tool, "input": payload})
-        except ValidationError as error:
-            details = error.errors(include_input=False, include_url=False, include_context=False)
-            return InvalidRequest(details[0]["msg"])
         wire = request.model_dump_json().encode("utf-8") + b"\n"
         if len(wire) > MAX_REQUEST_BYTES:
             return InvalidRequest("Desktop request exceeds the size limit.")
@@ -295,6 +304,11 @@ class DesktopControl:
             return response.model_validate_json(frame).root
         except ValidationError:
             return InvalidResponse("Desktop returned an invalid response.")
+
+
+def _invalid_request(error: ValidationError) -> InvalidRequest:
+    details = error.errors(include_input=False, include_url=False, include_context=False)
+    return InvalidRequest(details[0]["msg"])
 
 
 def _remaining(deadline: float) -> float:
