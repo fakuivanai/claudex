@@ -15,6 +15,7 @@ from pydantic import (
     BaseModel, BeforeValidator, ConfigDict, Field, RootModel, StringConstraints, ValidationError,
 )
 
+from claudex.environment import systemd_runtime_directory
 from claudex.models import parse_claude_chat_id
 
 # One small JSON request and one roster per connection. The JS tests check
@@ -279,9 +280,14 @@ class DesktopControl:
         if len(wire) > MAX_REQUEST_BYTES:
             return InvalidRequest("Desktop request exceeds the size limit.")
 
-        runtime = self._runtime_directory or Path(os.environ.get("XDG_RUNTIME_DIR", ""))
-        if not runtime.is_absolute():
-            return Unavailable("Set an absolute XDG_RUNTIME_DIR to use the Desktop socket.")
+        runtime = self._runtime_directory
+        if runtime is None:
+            configured = Path(os.environ.get("XDG_RUNTIME_DIR", ""))
+            runtime = configured if configured.is_absolute() else systemd_runtime_directory()
+        if runtime is None or not runtime.is_absolute():
+            return Unavailable(
+                "Set an absolute XDG_RUNTIME_DIR or use a user-owned /run/user/<uid> directory with mode 0700."
+            )
         endpoint = runtime / "claudex" / "desktop.sock"
         deadline = time.monotonic() + self._timeout
         try:

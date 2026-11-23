@@ -6,6 +6,7 @@ from pathlib import Path
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 from typing import Literal
 
@@ -17,6 +18,7 @@ SYSTEM_PATH = "/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin"
 # A local user-manager property should return promptly or the launch stops.
 MANAGER_TIMEOUT = 5
 ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
+_SYSTEMD_RUNTIME_ROOT = Path("/run/user")
 
 
 class ManagerEnvironment(BaseModel):
@@ -77,11 +79,26 @@ def clean_environment(properties: Mapping[str, str], home: Path) -> dict[str, st
     return environment
 
 
+def systemd_runtime_directory() -> Path | None:
+    """Find the private per-user runtime directory created by systemd-logind."""
+    uid = os.getuid()
+    directory = _SYSTEMD_RUNTIME_ROOT / str(uid)
+    try:
+        metadata = directory.lstat()
+    except OSError:
+        return None
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != uid or stat.S_IMODE(metadata.st_mode) != 0o700:
+        return None
+    return directory
+
+
 def desktop_environment() -> dict[str, str]:
     """Read systemd's user Manager.Environment without invoking a shell."""
     account = pwd.getpwuid(os.getuid())
     home = Path(account.pw_dir)
-    runtime = Path("/run/user") / str(account.pw_uid)
+    runtime = systemd_runtime_directory()
+    if runtime is None:
+        raise OSError("Could not find the signed-in user's private systemd runtime directory.")
     busctl = shutil.which("busctl", path=SYSTEM_PATH)
     if busctl is None:
         raise OSError("Could not locate busctl to read the user desktop environment.")
@@ -102,6 +119,7 @@ def desktop_environment() -> dict[str, str]:
     environment = parse_desktop_environment(response.stdout, home)
     if not environment["PATH"] or not (environment.get("DISPLAY") or environment.get("WAYLAND_DISPLAY")):
         raise OSError("The user manager has no graphical login environment.")
-    environment.setdefault("XDG_RUNTIME_DIR", str(runtime))
+    if not Path(environment.get("XDG_RUNTIME_DIR", "")).is_absolute():
+        environment["XDG_RUNTIME_DIR"] = str(runtime)
     environment.setdefault("DBUS_SESSION_BUS_ADDRESS", bootstrap["DBUS_SESSION_BUS_ADDRESS"])
     return environment

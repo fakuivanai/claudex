@@ -139,7 +139,9 @@ raise SystemExit({exit_code})
         entries = [f"{key}={value}" for key, value in self.environment.items()]
         entries.extend(["DISPLAY=:999", "CODEX_CI=1"])
         self.fake_notifier(environment_reply=json.dumps({"type": "as", "data": entries}))
+        (self.root / str(os.getuid())).mkdir(mode=0o700)
         with (
+            patch("claudex.environment._SYSTEMD_RUNTIME_ROOT", self.root),
             patch("claudex.environment.SYSTEM_PATH", str(self.bin)),
             patch.dict(os.environ, {"CODEX_APP_TOOLS_PIPE_PATH": "fixture", "CODEX_THREAD_ID": "fixture"}),
             patch("claudex.patch.launch.running_desktop", return_value=False),

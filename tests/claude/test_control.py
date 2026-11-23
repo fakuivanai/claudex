@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 import json
+import os
 import re
 from pathlib import Path
 import socket
@@ -11,6 +12,7 @@ from tempfile import TemporaryDirectory
 from threading import Event
 from typing import cast
 import unittest
+from unittest.mock import patch
 
 from claudex.claude.control import (
     EFFORTS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PERMISSION_MODES, DesktopControl, DesktopFailure, DesktopMutation,
@@ -47,7 +49,8 @@ class DesktopControlTests(unittest.TestCase):
     def setUp(self) -> None:
         runtime = TemporaryDirectory()
         self.addCleanup(runtime.cleanup)
-        self.runtime = Path(runtime.name)
+        self.runtime = Path(runtime.name) / str(os.getuid())
+        self.runtime.mkdir(mode=0o700)
         directory = self.runtime / "claudex"
         directory.mkdir(mode=0o700)
         self.endpoint = directory / "desktop.sock"
@@ -157,6 +160,48 @@ class DesktopControlTests(unittest.TestCase):
         with self.reply(frame({"status": "ok", "result": {"chat": _ROW}})) as request:
             self.assertIsInstance(self.desktop.set_model(_CHAT_ID, model), Success)
             self.assertEqual(json.loads(request.result(3))["input"]["model"], model)
+
+    def test_connects_through_systemd_runtime_when_xdg_is_missing_or_relative(self) -> None:
+        for environment in ({}, {"XDG_RUNTIME_DIR": "relative"}):
+            with (
+                self.subTest(environment=environment),
+                patch.dict(os.environ, environment, clear=True),
+                patch("claudex.environment._SYSTEMD_RUNTIME_ROOT", self.runtime.parent),
+                self.reply(frame({"status": "ok", "result": _ROW})),
+            ):
+                self.assertIsInstance(DesktopControl(timeout=3).get_chat(_CHAT_ID), Success)
+
+    def test_uses_an_absolute_xdg_runtime_in_preference_to_systemd(self) -> None:
+        with (
+            patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.runtime)}),
+            patch("claudex.environment._SYSTEMD_RUNTIME_ROOT", self.runtime / "missing"),
+            self.reply(frame({"status": "ok", "result": _ROW})),
+        ):
+            self.assertIsInstance(DesktopControl(timeout=3).get_chat(_CHAT_ID), Success)
+
+    def test_rejects_missing_or_insecure_systemd_runtime_directories(self) -> None:
+        self.runtime.chmod(0o755)
+        actual_uid = os.getuid()
+        other_uid = actual_uid + 1
+        (self.runtime.parent / str(other_uid)).mkdir(mode=0o700)
+        aliases = self.runtime.parent / "aliases"
+        aliases.mkdir()
+        (aliases / str(actual_uid)).symlink_to(self.runtime)
+        for root, uid in (
+            (self.runtime.parent / "missing", actual_uid),
+            (self.runtime.parent, actual_uid),
+            (self.runtime.parent, other_uid),
+            (aliases, actual_uid),
+        ):
+            with (
+                self.subTest(root=root, uid=uid),
+                patch.dict(os.environ, {}, clear=True),
+                patch("claudex.environment._SYSTEMD_RUNTIME_ROOT", root),
+                patch("claudex.environment.os.getuid", return_value=uid),
+            ):
+                self.assertEqual(DesktopControl(timeout=3).list_chats(), Unavailable(
+                    "Set an absolute XDG_RUNTIME_DIR or use a user-owned /run/user/<uid> directory with mode 0700."
+                ))
 
     def test_reports_an_unavailable_socket_and_a_timeout_separately(self) -> None:
         self.assertIsInstance(self.desktop.list_chats(), Unavailable)
