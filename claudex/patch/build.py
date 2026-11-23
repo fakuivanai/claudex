@@ -205,7 +205,6 @@ def build(source_path: Path, output_path: Path) -> str:
         initial = os.fstat(source.fileno())
         release = identify_release(source)
         header = read_header(source)
-        body_size = initial.st_size - header.body_offset
         session = source_chunk(source, header, release.session_chunk)
         edited = [PackedReplacement(session.path, session.before, patch_chunk(session.content, release))]
         modules = {(*session.path[:-1], MODULE_NAME): Path(__file__).with_name("restore.cjs").read_bytes()}
@@ -216,27 +215,38 @@ def build(source_path: Path, output_path: Path) -> str:
             ))
             modules[(*window.path[:-1], BRIDGE_MODULE)] = Path(__file__).with_name("bridge.cjs").read_bytes()
             modules[(*window.path[:-1], SOCKET_MODULE)] = Path(__file__).with_name("socket.cjs").read_bytes()
-        edited.sort(key=lambda change: change.before.offset)
-        new_header = encode_header(replace_files(header.root, edited, body_size, modules))
-        added = tuple(modules.values())
+        return publish_archive(source_path, source, initial, header, edited, modules, output_path)
 
-        # Publish only a complete verified archive. Linking refuses to
-        # overwrite either the installed archive or a previous build.
-        with tempfile.TemporaryDirectory(dir=output_path.parent) as directory:
-            temporary = Path(directory) / "app.asar"
-            digest = hashlib.sha256()
-            with temporary.open("wb") as candidate:
-                for block in patched_blocks(source, header.body_offset, body_size, edited, new_header, added):
-                    candidate.write(block)
-                    digest.update(block)
-            # Retain the standalone builder's support for mutable inputs. A
-            # change between the hash check and copy must not publish an archive.
-            if not source_path.is_relative_to(NIX_STORE):
-                current = os.fstat(source.fileno())
-                if (current.st_mtime_ns, current.st_ctime_ns) != (initial.st_mtime_ns, initial.st_ctime_ns):
-                    raise OSError("The source archive changed during the build.")
-            os.link(temporary, output_path)
-            return digest.hexdigest()
+
+def publish_archive(
+    source_path: Path,
+    source: BinaryIO,
+    initial: os.stat_result,
+    header: Header,
+    replacements: Sequence[PackedReplacement],
+    added_files: dict[tuple[str, ...], bytes],
+    output_path: Path,
+) -> str:
+    """Publish a complete patched archive without replacing an existing file."""
+    body_size = initial.st_size - header.body_offset
+    edited = sorted(replacements, key=lambda change: change.before.offset)
+    new_header = encode_header(replace_files(header.root, edited, body_size, added_files))
+    with tempfile.TemporaryDirectory(dir=output_path.parent) as directory:
+        temporary = Path(directory) / "app.asar"
+        digest = hashlib.sha256()
+        with temporary.open("wb") as candidate:
+            blocks = patched_blocks(
+                source, header.body_offset, body_size, edited, new_header, tuple(added_files.values()),
+            )
+            for block in blocks:
+                candidate.write(block)
+                digest.update(block)
+        if not source_path.is_relative_to(NIX_STORE):
+            current = os.fstat(source.fileno())
+            if (current.st_mtime_ns, current.st_ctime_ns) != (initial.st_mtime_ns, initial.st_ctime_ns):
+                raise OSError("The source archive changed during the build.")
+        os.link(temporary, output_path)
+        return digest.hexdigest()
 
 
 def main() -> None:

@@ -18,10 +18,11 @@ Claudex is built and tested on x86-64 NixOS.
 
 ## Install
 
-`nix build .#` builds the two commands from the flake and `uv.lock`:
+`nix build .#` builds the commands from the flake and `uv.lock`:
 
 - `claudex`: the CLI and the MCP server.
 - `claudex-desktop`: the Claude Desktop launcher that applies the patch.
+- `claudex-codex-patch`: builds an optional Codex Desktop patch for unopened chats.
 
 To use Home Manager, add this flake as an input and install
 `packages.x86_64-linux.default`. Then point Claude Desktop's menu entry and
@@ -55,19 +56,21 @@ Claude Code `/clear` or resume, you may need to reconnect MCP.
 
 **From a Claude chat to a Codex chat:**
 
-1. Claudex asks Codex Desktop which window owns the loaded chat.
-2. It sends the message as untrusted tool output from `claudex.peer_message`.
-   Codex starts a turn or adds the output to the turn already running.
+1. Claudex asks Codex Desktop which client owns the chat. With the
+   [optional Codex patch](#deliver-to-unopened-codex-chats), the Desktop
+   host manager can load a saved local chat in the background.
+2. Once Desktop confirms an owner, Claudex sends untrusted tool output
+   from `claudex.peer_message`. Codex starts a turn or adds the output to
+   the turn already running.
 
-A Codex window has to load the chat before it can receive messages.
-After restarting Codex Desktop, open any chat that reports `not_loaded`.
-`codex_chat_status` reports whether the chat is loaded and whether its
-owner can receive peer messages.
+`codex_chat_status` returns both `loaded` and `reachable`. An unopened
+chat that Desktop can load in the background has `loaded: false` and
+`reachable: true`. Checking status does not load the chat.
 
 - `submitted` includes the ID of the receiving turn. `joined_existing`
   is true when the confirmed turn ID matches one already running before
   the send. It is null when Claudex can't tell.
-- `not_loaded` means no window owns the loaded chat.
+- `not_loaded` means Desktop could not confirm a loaded owner.
 - `refused` reports a rejected request.
 - `unknown` means Codex didn't confirm. Check the chat before sending again.
 
@@ -215,6 +218,30 @@ logged in `~/.config/Claude/logs/main.log`, as
 `[claudex] Remote Control claudex_restart <chat> <result>` at launch or
 `claudex_reopen` on opening.
 
+## Deliver to unopened Codex chats
+
+The optional patch for Codex Desktop 26.1103.60933 registers a local IPC
+method that can prepare a saved, unarchived chat through Desktop's own
+host manager. It leaves the current window and focus alone. The method
+takes only a chat ID and a preparation action. Claudex uses the existing
+owner IPC to send the message after Desktop confirms ownership.
+
+Build the patch from the installed archive, then launch it after quitting
+Codex Desktop. Use an absolute path to the archive in the installed
+package and a separate writable output path.
+
+```sh
+source=/absolute/path/to/codex/resources/app.asar
+patched=/absolute/path/to/patched-codex.asar
+claudex-codex-patch --source "$source" --output "$patched"
+systemd-run --user --collect -p ExitType=cgroup \
+  bwrap --bind / / --dev-bind /dev /dev --proc /proc \
+  --ro-bind "$patched" "$source" -- chatgpt
+```
+
+A normal launch uses the installed archive. The build checks the archive
+hash and refuses other releases.
+
 ## Updating
 
 After changing the Claudex version, for example the Home Manager pin:
@@ -234,7 +261,7 @@ been applied.
 | --- | --- | --- |
 | Claude Desktop | 5.11492.5, Electron 45.2.1 | The patch. The archive hash and the native hook points are pinned in [claudex/patch/build.py](claudex/patch/build.py). |
 | Claude Code | 2.1.325 workers | The chat inbox and caller identity records. |
-| Codex Desktop | 26.1103.60933 | Local chat history and the IPC used to deliver messages. |
+| Codex Desktop | 26.1103.60933 | Local chat history, peer IPC and the optional [host patch](claudex/codex/desktop_patch.py). |
 | Python | 3.12 | Claudex itself. |
 | Node | 24 | The patch tests. This is the Node major version in that Electron. |
 

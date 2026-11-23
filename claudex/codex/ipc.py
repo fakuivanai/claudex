@@ -23,6 +23,9 @@ from claudex.models import CodexChatId, PeerMessage, parse_uuid
 MAX_FRAME_BYTES = 4 * 1024 * 1024
 # Bound discovery and delivery together, including responses from renderer clients.
 TIMEOUT_SECONDS = 12.0
+# Leave room for the turn request within the default 60-second MCP call.
+COLD_LOAD_TIMEOUT_SECONDS = 35.0
+COLD_POLL_SECONDS = 0.25
 # The router bounds a single request independently of the client deadline.
 ROUTER_TIMEOUT_MILLISECONDS = 10_000
 # Read large frames in chunks and keep one socket read bounded.
@@ -73,7 +76,10 @@ class NotLoaded:
     chat_id: CodexChatId
 
     def to_wire(self) -> dict[str, object]:
-        return {"state": "not_loaded", "chat_id": self.chat_id, "error": "Open this chat in Codex Desktop before sending."}
+        return {
+            "state": "not_loaded", "chat_id": self.chat_id,
+            "error": "Codex Desktop could not load this chat for peer delivery.",
+        }
 
 
 @dataclass(frozen=True)
@@ -100,6 +106,8 @@ class Method(Enum):
     INITIALIZE = ("initialize", 0)
     # Discovery version 1 reports the owner's untrusted-app-input capability.
     DISCOVER_OWNER = ("thread-owner-discovery", 1)
+    # The optional pinned host-manager patch can load an owner without navigation.
+    PREPARE_THREAD = ("claudex-prepare-thread", 0)
     # Start-turn version 2 accepts output separate from user input.
     START_TURN = ("thread-follower-start-turn", 2)
 
@@ -133,6 +141,13 @@ class OwnerCapability(RouterPayload):
     supports_tool_output: bool = Field(default=False, validation_alias="supportsUntrustedAppInput")
 
 
+type PrepareState = Literal["available", "warming", "ready", "unavailable"]
+
+
+class PrepareReply(RouterPayload):
+    state: PrepareState
+
+
 class StartedTurn(RouterPayload):
     turn_id: WireIdentifier = Field(validation_alias=AliasPath("result", "turn", "id"))
 
@@ -143,7 +158,7 @@ class RouterRejection:
     no_owner: bool
 
 
-type Reply = Initialization | OwnerCapability | StartedTurn
+type Reply = Initialization | OwnerCapability | PrepareReply | StartedTurn
 
 
 @dataclass(frozen=True)
@@ -178,6 +193,8 @@ def parse_router_frame(payload: bytes) -> IncomingFrame | None:
                 reply = Initialization.model_validate(response.result)
             case Method.DISCOVER_OWNER.wire_name:
                 reply = OwnerCapability.model_validate(response.result)
+            case Method.PREPARE_THREAD.wire_name:
+                reply = PrepareReply.model_validate(response.result)
             case Method.START_TURN.wire_name:
                 reply = StartedTurn.model_validate(response.result)
             case _:
@@ -281,8 +298,32 @@ class DesktopClient:
             raise UnsupportedOwner("Codex Desktop owner does not advertise untrusted tool input support")
         return response.handled_by
 
+    def prepare_thread(self, chat_id: CodexChatId, action: Literal["check", "warm"]) -> PrepareState:
+        response = self.request(
+            Method.PREPARE_THREAD, {"hostId": "local", "conversationId": chat_id, "action": action},
+        )
+        if not isinstance(response.reply, PrepareReply) or response.handled_by == self.client_id:
+            raise CodexDesktopError("Codex Desktop did not confirm thread preparation")
+        if response.reply.state == "unavailable":
+            raise OwnerNotLoaded("Codex Desktop could not prepare that chat.")
+        return response.reply.state
+
+    def owner_for_delivery(self, chat_id: CodexChatId) -> ClientId:
+        try:
+            return self.owner(chat_id)
+        except OwnerNotLoaded:
+            pass
+        cold_deadline = time.monotonic() + COLD_LOAD_TIMEOUT_SECONDS
+        self.deadline = cold_deadline
+        while self.prepare_thread(chat_id, "warm") != "ready":
+            if time.monotonic() + COLD_POLL_SECONDS >= cold_deadline:
+                raise OwnerNotLoaded("Codex Desktop did not finish loading that chat.")
+            time.sleep(COLD_POLL_SECONDS)
+        self.deadline = time.monotonic() + TIMEOUT_SECONDS
+        return self.owner(chat_id)
+
     def deliver(self, chat_id: CodexChatId, output: ToolOutput) -> Submitted:
-        owner = self.owner(chat_id)
+        owner = self.owner_for_delivery(chat_id)
         try:
             prior_turn_id = history.projected_running_turn_id(chat_id)
         except history.HistoryError:
@@ -324,25 +365,29 @@ def desktop_client(socket_path: Path | None) -> Iterator[DesktopClient]:
 @dataclass(frozen=True)
 class ChatStatus:
     chat_id: CodexChatId
-    state: Literal["reachable", "not_loaded", "unsupported_owner"]
+    state: Literal["reachable", "loadable", "not_loaded", "unsupported_owner"]
 
     @property
     def loaded(self) -> bool:
-        return self.state != "not_loaded"
+        return self.state in ("reachable", "unsupported_owner")
 
     @property
     def reachable(self) -> bool:
-        return self.state == "reachable"
+        return self.state in ("reachable", "loadable")
 
     def to_wire(self) -> dict[str, object]:
         return {"chat_id": self.chat_id, "loaded": self.loaded, "reachable": self.reachable}
 
 
 def chat_status(chat_id: CodexChatId, *, socket_path: Path | None = None) -> ChatStatus:
-    """Check whether Codex Desktop has a loaded owner eligible for peer delivery."""
+    """Check for an eligible owner or an available background load, without starting one."""
     try:
         with desktop_client(socket_path) as client:
-            client.owner(chat_id)
+            try:
+                client.owner(chat_id)
+            except OwnerNotLoaded:
+                client.prepare_thread(chat_id, "check")
+                return ChatStatus(chat_id, "loadable")
     except OwnerNotLoaded:
         return ChatStatus(chat_id, "not_loaded")
     except UnsupportedOwner:
@@ -351,7 +396,7 @@ def chat_status(chat_id: CodexChatId, *, socket_path: Path | None = None) -> Cha
 
 
 def deliver(chat_id: CodexChatId, message: PeerMessage, *, socket_path: Path | None = None) -> Delivery:
-    """Submit an already-authorized peer message through the existing owner."""
+    """Submit an authorized peer message after Desktop confirms a loaded owner."""
     try:
         with desktop_client(socket_path) as client:
             return client.deliver(chat_id, tool_output(message))

@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 from claudex.codex import history, ipc
+from claudex.codex.envelope import tool_output
 from claudex.models import CodexChatId, PeerMessage, Provider, Sender
 
 
@@ -32,6 +33,8 @@ class FakeSocket:
     def __init__(self, *, capability: bool = True, outcome: str = "success") -> None:
         self.capability = capability
         self.outcome = outcome
+        self.warm_requests = 0
+        self.owner_ready = not outcome.startswith("cold-")
         self.pending = bytearray()
         self.frames: list[dict[str, object]] = []
         self.closed = False
@@ -72,16 +75,29 @@ class FakeSocket:
             response.update(handledByClientId=CLIENT, result={"clientId": CLIENT})
         elif method == "thread-owner-discovery":
             self.queue({"type": "client-discovery-request", "requestId": "fixture-discovery"})
-            if self.outcome == "missing-during-discovery":
+            if self.outcome == "missing-during-discovery" or not self.owner_ready:
                 response.update(resultType="error", error="no-client-found")
             else:
                 response.update(handledByClientId=OWNER, result={"supportsUntrustedAppInput": self.capability})
+        elif method == "claudex-prepare-thread":
+            action = fields(request["params"])["action"]
+            if not self.outcome.startswith("cold-"):
+                response.update(resultType="error", error="no-client-found")
+            elif self.outcome == "cold-unavailable":
+                response.update(handledByClientId=OWNER, result={"state": "unavailable"})
+            elif action == "check":
+                response.update(handledByClientId=OWNER, result={"state": "available"})
+            else:
+                self.warm_requests += 1
+                ready = self.warm_requests > 1
+                self.owner_ready = ready and self.outcome == "cold-ready"
+                response.update(handledByClientId=OWNER, result={"state": "ready" if ready else "warming"})
         elif self.outcome == "disconnect":
             return
         elif self.outcome == "no-client-found":
             response.update(resultType="error", error="no-client-found")
         else:
-            owner = OWNER if self.outcome == "success" else CLIENT
+            owner = OWNER if self.outcome in ("success", "cold-ready") else CLIENT
             response.update(handledByClientId=owner, result={"result": {"turn": {"id": TURN}}})
         self.queue(response)
 
@@ -92,6 +108,7 @@ class FakeSocket:
 
 class DesktopRelayTest(unittest.TestCase):
     def setUp(self) -> None:
+        self.enterContext(mock.patch("claudex.codex.ipc.COLD_POLL_SECONDS", 0))
         self.running_turn = self.enterContext(mock.patch(
             "claudex.codex.ipc.history.projected_running_turn_id", return_value=None,
         ))
@@ -150,6 +167,8 @@ class DesktopRelayTest(unittest.TestCase):
         cases = (
             (FakeSocket(), True, True),
             (FakeSocket(outcome="missing-during-discovery"), False, False),
+            (FakeSocket(outcome="cold-ready"), False, True),
+            (FakeSocket(outcome="cold-unavailable"), False, False),
             (FakeSocket(capability=False), True, False),
         )
         for socket, loaded, reachable in cases:
@@ -159,6 +178,30 @@ class DesktopRelayTest(unittest.TestCase):
             ):
                 status = ipc.chat_status(CHAT, socket_path=SOCKET)
                 self.assertEqual(status.to_wire(), {"chat_id": CHAT, "loaded": loaded, "reachable": reachable})
+                self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in socket.frames])
+                self.assertEqual(socket.warm_requests, 0)
+
+    def test_cold_delivery_waits_for_preparation_and_rediscovers_the_native_owner(self) -> None:
+        socket = FakeSocket(outcome="cold-ready")
+        self.assertEqual(self.submit(socket), ipc.Submitted(CHAT, TURN))
+        requests = [request for request in socket.frames if request.get("type") == "request"]
+        self.assertEqual([request["method"] for request in requests], [
+            "initialize", "thread-owner-discovery", "claudex-prepare-thread", "claudex-prepare-thread",
+            "thread-owner-discovery", "thread-follower-start-turn",
+        ])
+        for preparation in requests[2:4]:
+            self.assertEqual(preparation["params"], {"hostId": "local", "conversationId": CHAT, "action": "warm"})
+        start = requests[-1]
+        self.assertEqual(start["targetClientId"], OWNER)
+        turn = fields(fields(fields(start["params"])["turnStart"])["request"])
+        self.assertEqual(turn["input"], [])
+        self.assertEqual(turn["toolOutput"], tool_output(MESSAGE))
+
+    def test_cold_preparation_without_a_confirmed_owner_never_sends_content(self) -> None:
+        for outcome in ("cold-unavailable", "cold-owner-lost"):
+            socket = FakeSocket(outcome=outcome)
+            with self.subTest(outcome=outcome):
+                self.assertEqual(self.submit(socket), ipc.NotLoaded(CHAT))
                 self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in socket.frames])
 
     def test_owner_must_support_untrusted_tool_output(self) -> None:

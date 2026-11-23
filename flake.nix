@@ -56,7 +56,9 @@
           claudex codex --help
           claudex mcp --help
           claudex-desktop --help
+          claudex-codex-patch --help
           python -c 'from importlib.resources import files; assert all(files("claudex.patch").joinpath(name).is_file() for name in ("restore.cjs", "bridge.cjs", "socket.cjs"))'
+          python -c 'from importlib.resources import files; assert files("claudex.codex").joinpath("prepare.cjs").is_file()'
           cli=$(python -c 'from importlib.resources import files; print(files("claude_agent_sdk").joinpath("_bundled", "claude"))')
           HOME="$TMPDIR" "$cli" --version
           touch "$out"

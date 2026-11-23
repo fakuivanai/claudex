@@ -13,4 +13,4 @@ claudex_node=${CLAUDEX_NODE:-node}
 "$claudex_python" -B -m unittest discover -s tests -t . -v
 # The whole JavaScript suite takes well under a second. Ten seconds per test
 # turns a stuck async wait into a failure instead of a hung build.
-"$claudex_node" --test --test-isolation=none --test-timeout=10000 tests/patch/*.test.cjs
+"$claudex_node" --test --test-isolation=none --test-timeout=10000 tests/patch/*.test.cjs tests/codex/*.test.cjs

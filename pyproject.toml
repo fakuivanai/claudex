@@ -20,6 +20,7 @@ dependencies = [
 [project.scripts]
 claudex = "claudex.cli:main"
 claudex-desktop = "claudex.patch.launch:main"
+claudex-codex-patch = "claudex.codex.desktop_patch:main"
 
 [dependency-groups]
 dev = ["mypy==1.20.1", "setuptools==80.10.1"]
@@ -29,6 +30,7 @@ packages = ["claudex", "claudex.claude", "claudex.codex", "claudex.patch"]
 
 [tool.setuptools.package-data]
 "claudex.patch" = ["restore.cjs", "bridge.cjs", "socket.cjs"]
+"claudex.codex" = ["prepare.cjs"]
 
 [tool.mypy]
 python_version = "3.12"
