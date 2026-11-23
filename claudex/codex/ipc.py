@@ -16,7 +16,7 @@ from pydantic import AliasPath, BaseModel, BeforeValidator, ConfigDict, Field, S
 
 from claudex.codex import history
 from claudex.codex.envelope import ToolOutput, tool_output
-from claudex.models import CodexChatId, PeerMessage, parse_uuid
+from claudex.models import CodexChatId, PeerMessage, parse_codex_chat_id, parse_uuid
 
 
 # Reject oversized frame lengths before allocating storage for the payload.
@@ -33,6 +33,11 @@ READ_CHUNK_BYTES = 64 * 1024
 # Request and turn identifiers are opaque strings, including vendor-prefixed IDs.
 WireIdentifier = Annotated[str, StringConstraints(min_length=1, max_length=128)]
 ClientId = NewType("ClientId", str)
+CheckedChatId = Annotated[CodexChatId, BeforeValidator(parse_codex_chat_id)]
+NOT_LOADED_GUIDANCE = "Open the chat in Codex Desktop or install the matching Claudex Codex Desktop patch."
+PATCH_GUIDANCE = "Install the matching Claudex Codex Desktop patch to use this operation."
+EFFORTS = frozenset(("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"))
+type Activity = Literal["idle", "running", "unknown"]
 
 
 def parse_client_id(value: object) -> ClientId:
@@ -78,7 +83,7 @@ class NotLoaded:
     def to_wire(self) -> dict[str, object]:
         return {
             "state": "not_loaded", "chat_id": self.chat_id,
-            "error": "Codex Desktop could not load this chat for peer delivery.",
+            "error": NOT_LOADED_GUIDANCE,
         }
 
 
@@ -108,8 +113,15 @@ class Method(Enum):
     DISCOVER_OWNER = ("thread-owner-discovery", 1)
     # The optional pinned host-manager patch can load an owner without navigation.
     PREPARE_THREAD = ("claudex-prepare-thread", 0)
+    START_CHAT = ("claudex-start-chat", 0)
+    CONTROL_CHAT = ("claudex-control-chat", 0)
+    BUSY_CHATS = ("claudex-busy-chats", 0)
     # Start-turn version 2 accepts output separate from user input.
     START_TURN = ("thread-follower-start-turn", 2)
+
+    @property
+    def can_mutate(self) -> bool:
+        return self in (Method.START_TURN, Method.START_CHAT, Method.CONTROL_CHAT)
 
     def __init__(self, wire_name: str, version: int) -> None:
         self.wire_name = wire_name
@@ -152,13 +164,61 @@ class StartedTurn(RouterPayload):
     turn_id: WireIdentifier = Field(validation_alias=AliasPath("result", "turn", "id"))
 
 
+class OperationReply(RouterPayload):
+    state: Literal["pending", "submitted", "created", "applied", "refused", "unknown"]
+    chat_id: CheckedChatId | None = Field(default=None, validation_alias="chatId")
+    turn_id: WireIdentifier | None = Field(default=None, validation_alias="turnId")
+    reason: str | None = None
+    activity: Activity = "unknown"
+
+
+class BusyReply(RouterPayload):
+    state: Literal["known", "unknown"]
+    chat_ids: list[CheckedChatId] | None = Field(default=None, validation_alias="chatIds")
+    pending: bool | None = None
+
+
+@dataclass(frozen=True)
+class StartResult:
+    state: Literal["submitted", "created", "refused", "unknown"]
+    chat_id: CodexChatId | None = None
+    turn_id: str | None = None
+    error: str | None = None
+
+    def to_wire(self) -> dict[str, object]:
+        result: dict[str, object] = {"state": self.state}
+        if self.chat_id is not None:
+            result["chat_id"] = self.chat_id
+        if self.turn_id is not None:
+            result["turn_id"] = self.turn_id
+        if self.error is not None:
+            result["error"] = self.error
+        return result
+
+
+@dataclass(frozen=True)
+class ControlResult:
+    state: Literal["applied", "refused", "unknown"]
+    chat_id: CodexChatId
+    turn_id: str | None = None
+    error: str | None = None
+
+    def to_wire(self) -> dict[str, object]:
+        result: dict[str, object] = {"state": self.state, "chat_id": self.chat_id}
+        if self.turn_id is not None:
+            result["turn_id"] = self.turn_id
+        if self.error is not None:
+            result["error"] = self.error
+        return result
+
+
 @dataclass(frozen=True)
 class RouterRejection:
     request_id: str
     no_owner: bool
 
 
-type Reply = Initialization | OwnerCapability | PrepareReply | StartedTurn
+type Reply = Initialization | OwnerCapability | PrepareReply | StartedTurn | OperationReply | BusyReply
 
 
 @dataclass(frozen=True)
@@ -197,6 +257,10 @@ def parse_router_frame(payload: bytes) -> IncomingFrame | None:
                 reply = PrepareReply.model_validate(response.result)
             case Method.START_TURN.wire_name:
                 reply = StartedTurn.model_validate(response.result)
+            case Method.START_CHAT.wire_name | Method.CONTROL_CHAT.wire_name:
+                reply = OperationReply.model_validate(response.result)
+            case Method.BUSY_CHATS.wire_name:
+                reply = BusyReply.model_validate(response.result)
             case _:
                 return None
         return RouterResponse(response.request_id, parse_client_id(response.handled_by), reply)
@@ -276,12 +340,12 @@ class DesktopClient:
                 elif incoming is not None and incoming.request_id == request_id:
                     break
         except (CodexDesktopError, OSError) as error:
-            failure = UnconfirmedDelivery if method is Method.START_TURN else CodexDesktopError
+            failure = UnconfirmedDelivery if method.can_mutate else CodexDesktopError
             raise failure("Codex Desktop IPC closed, timed out, or returned invalid data") from error
         if isinstance(incoming, RouterRejection):
             if incoming.no_owner:
                 raise OwnerNotLoaded("Codex Desktop has no loaded owner for that local chat")
-            failure = UnconfirmedDelivery if method is Method.START_TURN else CodexDesktopError
+            failure = UnconfirmedDelivery if method.can_mutate else CodexDesktopError
             raise failure("Codex Desktop did not confirm the request")
         if target is not None and incoming.handled_by != target:
             raise UnconfirmedDelivery("Codex Desktop acknowledgement did not match the request")
@@ -321,6 +385,60 @@ class DesktopClient:
             time.sleep(COLD_POLL_SECONDS)
         self.deadline = time.monotonic() + TIMEOUT_SECONDS
         return self.owner(chat_id)
+
+    def operation_reply(self, response: RouterResponse) -> OperationReply:
+        if not isinstance(response.reply, OperationReply) or response.handled_by == self.client_id:
+            raise UnconfirmedDelivery("Codex Desktop returned an invalid operation receipt.")
+        return response.reply
+
+    def busy_chats(self) -> tuple[tuple[CodexChatId, ...], bool] | None:
+        try:
+            response = self.request(Method.BUSY_CHATS, {"hostId": "local"})
+        except OwnerNotLoaded:
+            # A stock or older patched router has no handler for this request.
+            return None
+        reply = response.reply
+        if (not isinstance(reply, BusyReply) or reply.state != "known" or response.handled_by == self.client_id
+                or reply.chat_ids is None or reply.pending is None):
+            raise CodexDesktopError("Codex Desktop could not confirm its activity.")
+        return tuple(dict.fromkeys(reply.chat_ids)), reply.pending
+
+    def start_chat(self, folder: Path, model: str, effort: str | None, message: PeerMessage) -> StartResult:
+        request: dict[str, object] = {"hostId": "local", "operationId": message.message_id}
+        response = self.request(Method.START_CHAT, {
+            **request, "action": "start", "folder": str(folder), "model": model,
+            "effort": effort, "toolOutput": tool_output(message),
+        })
+        reply = self.operation_reply(response)
+        if reply.state == "pending":
+            self.deadline = time.monotonic() + COLD_LOAD_TIMEOUT_SECONDS
+            try:
+                while reply.state == "pending":
+                    time.sleep(COLD_POLL_SECONDS)
+                    reply = self.operation_reply(self.request(
+                        Method.START_CHAT, {**request, "action": "poll"}, target=response.handled_by,
+                    ))
+            except CodexDesktopError as error:
+                # The creation request already reached Desktop. Never dispatch a
+                # second one if the host changed or the receipt did not arrive.
+                raise UnconfirmedDelivery("Codex Desktop did not confirm chat creation.") from error
+        if reply.state == "submitted" and reply.chat_id is not None and reply.turn_id:
+            return StartResult("submitted", reply.chat_id, reply.turn_id)
+        if reply.state == "created" and reply.chat_id is not None:
+            return StartResult("created", reply.chat_id, error=reply.reason)
+        if reply.state in ("refused", "unknown"):
+            return StartResult(reply.state, error=reply.reason)
+        raise UnconfirmedDelivery("Codex Desktop did not confirm chat creation.")
+
+    def control(self, chat_id: CodexChatId, action: str, **options: object) -> OperationReply:
+        reply = self.operation_reply(self.request(Method.CONTROL_CHAT, {
+            "hostId": "local", "conversationId": chat_id, "action": action, **options,
+        }))
+        if reply.state == "applied" and reply.chat_id == chat_id:
+            return reply
+        if reply.state in ("refused", "unknown") and reply.chat_id in (None, chat_id):
+            return reply
+        raise UnconfirmedDelivery("Codex Desktop did not confirm the requested chat operation.")
 
     def deliver(self, chat_id: CodexChatId, output: ToolOutput) -> Submitted:
         owner = self.owner_for_delivery(chat_id)
@@ -366,6 +484,8 @@ def desktop_client(socket_path: Path | None) -> Iterator[DesktopClient]:
 class ChatStatus:
     chat_id: CodexChatId
     state: Literal["reachable", "loadable", "not_loaded", "unsupported_owner"]
+    activity: Activity = "unknown"
+    turn_id: str | None = None
 
     @property
     def loaded(self) -> bool:
@@ -376,23 +496,44 @@ class ChatStatus:
         return self.state in ("reachable", "loadable")
 
     def to_wire(self) -> dict[str, object]:
-        return {"chat_id": self.chat_id, "loaded": self.loaded, "reachable": self.reachable}
+        result: dict[str, object] = {
+            "chat_id": self.chat_id, "loaded": self.loaded, "reachable": self.reachable,
+            "activity": self.activity, "turn_id": self.turn_id,
+        }
+        if self.state == "not_loaded":
+            result["error"] = NOT_LOADED_GUIDANCE
+        return result
+
+
+def busy_chats(*, socket_path: Path | None = None) -> tuple[tuple[CodexChatId, ...], bool] | None:
+    """Read local native work in progress, or return None for a build without the query."""
+    with desktop_client(socket_path) as client:
+        return client.busy_chats()
 
 
 def chat_status(chat_id: CodexChatId, *, socket_path: Path | None = None) -> ChatStatus:
     """Check for an eligible owner or an available background load, without starting one."""
-    try:
-        with desktop_client(socket_path) as client:
+    with desktop_client(socket_path) as client:
+        state: Literal["reachable", "loadable", "not_loaded", "unsupported_owner"] = "reachable"
+        try:
+            client.owner(chat_id)
+        except OwnerNotLoaded:
             try:
-                client.owner(chat_id)
-            except OwnerNotLoaded:
                 client.prepare_thread(chat_id, "check")
-                return ChatStatus(chat_id, "loadable")
-    except OwnerNotLoaded:
-        return ChatStatus(chat_id, "not_loaded")
-    except UnsupportedOwner:
-        return ChatStatus(chat_id, "unsupported_owner")
-    return ChatStatus(chat_id, "reachable")
+                state = "loadable"
+            except OwnerNotLoaded:
+                state = "not_loaded"
+        except UnsupportedOwner:
+            state = "unsupported_owner"
+        try:
+            reply = client.control(chat_id, "status")
+        except CodexDesktopError:
+            # Stock builds or a retiring host can leave activity unknown. Reachability can still
+            # be determined above without starting or warming a chat.
+            return ChatStatus(chat_id, state)
+        if reply.state != "applied":
+            return ChatStatus(chat_id, state)
+        return ChatStatus(chat_id, state, reply.activity, reply.turn_id if reply.activity == "running" else None)
 
 
 def deliver(chat_id: CodexChatId, message: PeerMessage, *, socket_path: Path | None = None) -> Delivery:
@@ -406,3 +547,86 @@ def deliver(chat_id: CodexChatId, message: PeerMessage, *, socket_path: Path | N
         return Unknown(str(error))
     except CodexDesktopError as error:
         return Refused(str(error))
+
+
+def validate_model(value: str) -> None:
+    if not 0 < len(value) <= 128 or any(character.isspace() or ord(character) < 32 or ord(character) == 127
+                                         for character in value):
+        raise ValueError("Enter an exact Codex model identifier.")
+
+
+def validate_effort(value: str | None) -> None:
+    if value is not None and value not in EFFORTS:
+        raise ValueError("Enter a supported Codex reasoning effort.")
+
+
+def start_chat(
+    folder: Path, model: str, effort: str | None, message: PeerMessage, *, socket_path: Path | None = None,
+) -> StartResult:
+    """Create a local Codex chat with native defaults and submit only peer tool output."""
+    try:
+        validate_model(model)
+        validate_effort(effort)
+        folder = folder.resolve(strict=True)
+        if not folder.is_dir():
+            raise ValueError("The Codex working folder does not exist.")
+        with desktop_client(socket_path) as client:
+            return client.start_chat(folder, model, effort, message)
+    except OwnerNotLoaded:
+        return StartResult("refused", error=PATCH_GUIDANCE)
+    except UnconfirmedDelivery as error:
+        return StartResult("unknown", error=str(error))
+    except (OSError, RuntimeError):
+        return StartResult("refused", error="The Codex working folder could not be resolved.")
+    except ValueError as error:
+        return StartResult("refused", error=str(error))
+
+
+def _control(
+    chat_id: CodexChatId, action: str, socket_path: Path | None, **options: object,
+) -> ControlResult:
+    try:
+        with desktop_client(socket_path) as client:
+            if action in ("model", "effort"):
+                client.owner_for_delivery(chat_id)
+            reply = client.control(chat_id, action, **options)
+        if reply.state == "applied" and (action != "interrupt" or reply.turn_id):
+            return ControlResult("applied", chat_id, turn_id=reply.turn_id)
+        if reply.state in ("refused", "unknown"):
+            return ControlResult(reply.state, chat_id, error=reply.reason)
+        raise UnconfirmedDelivery("Codex Desktop did not confirm the active turn was interrupted.")
+    except OwnerNotLoaded:
+        guidance = NOT_LOADED_GUIDANCE if action in ("model", "effort") else PATCH_GUIDANCE
+        return ControlResult("refused", chat_id, error=guidance)
+    except UnconfirmedDelivery as error:
+        return ControlResult("unknown", chat_id, error=str(error))
+    except CodexDesktopError as error:
+        return ControlResult("refused", chat_id, error=str(error))
+
+
+def interrupt(chat_id: CodexChatId, *, socket_path: Path | None = None) -> ControlResult:
+    return _control(chat_id, "interrupt", socket_path)
+
+
+def set_model(chat_id: CodexChatId, model: str, *, socket_path: Path | None = None) -> ControlResult:
+    try:
+        validate_model(model)
+    except ValueError as error:
+        return ControlResult("refused", chat_id, error=str(error))
+    return _control(chat_id, "model", socket_path, value=model)
+
+
+def set_effort(chat_id: CodexChatId, effort: str | None, *, socket_path: Path | None = None) -> ControlResult:
+    try:
+        validate_effort(effort)
+    except ValueError as error:
+        return ControlResult("refused", chat_id, error=str(error))
+    return _control(chat_id, "effort", socket_path, value=effort)
+
+
+def archive(chat_id: CodexChatId, *, socket_path: Path | None = None) -> ControlResult:
+    return _control(chat_id, "archive", socket_path)
+
+
+def unarchive(chat_id: CodexChatId, *, socket_path: Path | None = None) -> ControlResult:
+    return _control(chat_id, "unarchive", socket_path)

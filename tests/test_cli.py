@@ -99,7 +99,9 @@ class CodexCommands(unittest.TestCase):
         with patch("claudex.codex.ipc.chat_status", return_value=reachable) as status:
             code, output, errors = invoke("codex", "status", CODEX_ID, "--json")
             self.assertEqual((code, errors), (0, ""))
-            self.assertEqual(json.loads(output), {"chat_id": CODEX_ID, "loaded": True, "reachable": True})
+            self.assertEqual(json.loads(output), {
+                "chat_id": CODEX_ID, "loaded": True, "reachable": True, "activity": "unknown", "turn_id": None,
+            })
             status.assert_called_once_with(CODEX_ID)
 
     def test_threads_passes_search_archives_and_pagination(self) -> None:

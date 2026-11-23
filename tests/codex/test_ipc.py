@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import struct
+from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
 
@@ -92,6 +93,35 @@ class FakeSocket:
                 ready = self.warm_requests > 1
                 self.owner_ready = ready and self.outcome == "cold-ready"
                 response.update(handledByClientId=OWNER, result={"state": "ready" if ready else "warming"})
+        elif method == "claudex-start-chat":
+            action = fields(request["params"])["action"]
+            if self.outcome == "start-refused":
+                response.update(resultType="error", error="no-client-found")
+            elif action == "start":
+                response.update(handledByClientId=OWNER, result={"state": "pending"})
+            elif self.outcome == "lost-start":
+                response.update(resultType="error", error="no-client-found")
+            else:
+                response.update(handledByClientId=OWNER, result={"state": "submitted", "chatId": CHAT, "turnId": TURN})
+        elif method == "claudex-busy-chats":
+            if self.outcome == "busy":
+                response.update(handledByClientId=OWNER, result={"state": "known", "chatIds": [CHAT], "pending": True})
+            elif self.outcome == "busy-unknown":
+                response.update(handledByClientId=OWNER, result={"state": "unknown"})
+            else:
+                response.update(resultType="error", error="no-client-found")
+        elif method == "claudex-control-chat":
+            action = fields(request["params"])["action"]
+            if self.outcome != "control-ready":
+                response.update(resultType="error", error="no-client-found")
+            elif action == "status":
+                response.update(handledByClientId=OWNER, result={
+                    "state": "applied", "activity": "running", "chatId": CHAT, "turnId": TURN,
+                })
+            elif action == "interrupt":
+                response.update(handledByClientId=OWNER, result={"state": "applied", "chatId": CHAT, "turnId": TURN})
+            else:
+                response.update(handledByClientId=OWNER, result={"state": "applied", "chatId": CHAT})
         elif self.outcome == "disconnect":
             return
         elif self.outcome == "no-client-found":
@@ -177,7 +207,13 @@ class DesktopRelayTest(unittest.TestCase):
                 mock.patch("claudex.codex.ipc.socket.socket", return_value=socket),
             ):
                 status = ipc.chat_status(CHAT, socket_path=SOCKET)
-                self.assertEqual(status.to_wire(), {"chat_id": CHAT, "loaded": loaded, "reachable": reachable})
+                expected: dict[str, object] = {
+                    "chat_id": CHAT, "loaded": loaded, "reachable": reachable,
+                    "activity": "unknown", "turn_id": None,
+                }
+                if not loaded and not reachable:
+                    expected["error"] = ipc.NOT_LOADED_GUIDANCE
+                self.assertEqual(status.to_wire(), expected)
                 self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in socket.frames])
                 self.assertEqual(socket.warm_requests, 0)
 
@@ -224,6 +260,44 @@ class DesktopRelayTest(unittest.TestCase):
         socket = FakeSocket(outcome="missing-during-discovery")
         self.assertEqual(self.submit(socket), ipc.NotLoaded(CHAT))
         self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in socket.frames])
+
+    def test_start_uses_one_dispatch_and_polls_only_the_same_owner(self) -> None:
+        socket = FakeSocket()
+        with TemporaryDirectory() as folder, mock.patch("claudex.codex.ipc.socket.socket", return_value=socket):
+            result = ipc.start_chat(Path(folder), "gpt-6.2-sol", "high", MESSAGE, socket_path=SOCKET)
+        self.assertEqual(result, ipc.StartResult("submitted", CHAT, TURN))
+        start, poll = socket.frames[1:]
+        self.assertEqual(start["params"], {
+            "hostId": "local", "action": "start", "operationId": MESSAGE.message_id,
+            "folder": folder, "model": "gpt-6.2-sol", "effort": "high", "toolOutput": tool_output(MESSAGE),
+        })
+        self.assertEqual(poll["targetClientId"], OWNER)
+        self.assertEqual(poll["params"], {"hostId": "local", "action": "poll", "operationId": MESSAGE.message_id})
+
+    def test_lost_start_receipt_is_unknown_and_never_dispatches_again(self) -> None:
+        socket = FakeSocket(outcome="lost-start")
+        with TemporaryDirectory() as folder, mock.patch("claudex.codex.ipc.socket.socket", return_value=socket):
+            result = ipc.start_chat(Path(folder), "fixture", None, MESSAGE, socket_path=SOCKET)
+        self.assertEqual(result.state, "unknown")
+        self.assertEqual([fields(frame["params"]).get("action") for frame in socket.frames[1:]], ["start", "poll"])
+
+    def test_native_status_and_interrupt_return_confirmed_active_turn(self) -> None:
+        with mock.patch("claudex.codex.ipc.socket.socket", return_value=FakeSocket(outcome="control-ready")):
+            status = ipc.chat_status(CHAT, socket_path=SOCKET)
+        self.assertEqual(status, ipc.ChatStatus(CHAT, "reachable", "running", TURN))
+        with mock.patch("claudex.codex.ipc.socket.socket", return_value=FakeSocket(outcome="control-ready")):
+            self.assertEqual(ipc.interrupt(CHAT, socket_path=SOCKET), ipc.ControlResult("applied", CHAT, TURN))
+
+    def test_native_busy_guard_distinguishes_unsupported_from_unknown_work(self) -> None:
+        with mock.patch("claudex.codex.ipc.socket.socket", return_value=FakeSocket(outcome="busy")):
+            self.assertEqual(ipc.busy_chats(socket_path=SOCKET), ((CHAT,), True))
+        with mock.patch("claudex.codex.ipc.socket.socket", return_value=FakeSocket()):
+            self.assertIsNone(ipc.busy_chats(socket_path=SOCKET))
+        with (
+            mock.patch("claudex.codex.ipc.socket.socket", return_value=FakeSocket(outcome="busy-unknown")),
+            self.assertRaises(ipc.CodexDesktopError),
+        ):
+            ipc.busy_chats(socket_path=SOCKET)
 
     def test_initialization_rejects_non_uuid_client_ids(self) -> None:
         frame = {

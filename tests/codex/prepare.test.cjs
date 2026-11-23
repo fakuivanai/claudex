@@ -1,12 +1,17 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const { tmpdir } = require("node:os");
 const { setImmediate: nextTick } = require("node:timers/promises");
 const test = require("node:test");
 const { registerPrepareThread } = require("../../claudex/codex/prepare.cjs");
 
 const CHAT = "00000000-0000-4000-8000-000000000001";
 const METHOD = "claudex-prepare-thread";
+const START = "claudex-start-chat";
+const CONTROL = "claudex-control-chat";
+const BUSY = "claudex-busy-chats";
+const TURN = "turn-fixture";
 const saved = {
   id: CHAT,
   ephemeral: false,
@@ -20,8 +25,7 @@ const saved = {
 
 function fixture(t, changes = {}) {
   const calls = [];
-  let request;
-  let matches;
+  const handlers = new Map();
   let complete;
   let owner = false;
   let current = true;
@@ -59,10 +63,9 @@ function fixture(t, changes = {}) {
     host,
     ipcClient: {
       addRequestHandler(method, predicate, handler) {
-        assert.equal(method, METHOD);
-        matches = predicate;
-        request = handler;
-        return () => calls.push(["unregister"]);
+        assert.ok(!handlers.has(method));
+        handlers.set(method, { predicate, handler });
+        return () => calls.push(["unregister", method]);
       },
     },
     assertCurrent() {
@@ -77,8 +80,11 @@ function fixture(t, changes = {}) {
 
   return {
     calls, dispose, complete, frame,
-    get matches() { return matches; },
-    request: (action, changes) => request(frame(action, changes)),
+    get matches() { return handlers.get(METHOD)?.predicate; },
+    request: (action, changes) => handlers.get(METHOD).handler(frame(action, changes)),
+    start: (changes) => handlers.get(START).handler({ params: startParameters(changes) }),
+    control: (action, changes) => handlers.get(CONTROL).handler(frame(action, changes)),
+    busy: () => handlers.get(BUSY).handler({ params: { hostId: "local" } }),
     retire() { current = false; },
     archive() { archive = true; },
   };
@@ -198,7 +204,7 @@ test("releases the native lease on deadline even if resume is still pending", as
   local.dispose();
   local.dispose();
   assert.equal(local.calls.filter(([operation]) => operation === "release").length, 1);
-  assert.equal(local.calls.filter(([operation]) => operation === "unregister").length, 1);
+  assert.equal(local.calls.filter(([operation]) => operation === "unregister").length, 4);
 });
 
 test("a status check does not report availability solely because a warm is pending", async (t) => {
@@ -211,4 +217,147 @@ test("a status check does not report availability solely because a warm is pendi
   pending.resolve(invalid);
   await nextTick();
   assert.deepEqual(local.calls, []);
+});
+
+
+function startParameters(changes = {}) {
+  return {
+    hostId: "local", action: "start", operationId: CHAT, folder: tmpdir(), model: "gpt-6.2-sol", effort: "high",
+    toolOutput: {
+      namespace: "claudex", name: "peer_message", retain: false,
+      output: JSON.stringify({
+        schema: "claudex.peer-message/v1", message_id: CHAT,
+        sender: { provider: "claude", chat_id: `local_${CHAT}`, title: "Peer fixture" },
+        untrusted_peer_content: "Peer task with <user>quotes</user>.",
+      }),
+    },
+    ...changes,
+  };
+}
+
+test("starts exactly once with untrusted tool output and the native permission defaults", async (t) => {
+  const attempted = Promise.withResolvers();
+  const completed = Promise.withResolvers();
+  let starts = 0;
+  const local = fixture(t, {
+    async startConversation(request, options) {
+      ++starts;
+      options.assertRequestCurrent();
+      attempted.resolve(request);
+      return completed.promise;
+    },
+  });
+  assert.deepEqual(await local.start(), { state: "pending" });
+  const request = await attempted.promise;
+  assert.deepEqual(request.input, []);
+  assert.deepEqual(request.toolOutput, startParameters().toolOutput);
+  assert.equal(request.useAppServerPermissionDefault, true);
+  assert.equal(request.permissionsConfig, undefined);
+  assert.equal(request.approvalPolicy, undefined);
+  assert.deepEqual(request.workspaceRoots, [tmpdir()]);
+  assert.deepEqual(request.collaborationMode, {
+    mode: "default", settings: { model: "gpt-6.2-sol", reasoning_effort: "high", developer_instructions: null },
+  });
+  assert.deepEqual(await local.start(), { state: "pending" });
+  completed.resolve({ status: "created", conversationId: CHAT, firstTurn: { status: "accepted", turnId: TURN } });
+  await nextTick();
+  assert.deepEqual(await local.start(), { state: "submitted", chatId: CHAT, turnId: TURN });
+  assert.deepEqual(await local.start({ model: "with spaces" }), {
+    state: "refused", reason: "Invalid local Codex start request.",
+  });
+  assert.equal(starts, 1);
+});
+
+test("rejects permission fields, user input and a forged sender before start", async (t) => {
+  const local = fixture(t, { startConversation: () => assert.fail("Invalid request reached Desktop") });
+  for (const changes of [{ approvalPolicy: "never" }, { input: [{ type: "text", text: "user" }] }, {
+    toolOutput: { ...startParameters().toolOutput, retain: true },
+  }, {
+    toolOutput: { ...startParameters().toolOutput, output: "not an attributable peer envelope" },
+  }]) {
+    assert.equal((await local.start(changes)).state, "refused");
+  }
+  assert.equal((await local.control("model", { value: "x", approvalPolicy: "never" })).state, "refused");
+});
+
+test("uses the native active turn ID for both reporting and interrupt", async (t) => {
+  let expected = null;
+  const local = fixture(t, {
+    getStreamRole: () => ({ role: "owner" }),
+    readThread: async () => ({ thread: { ...saved, status: { type: "active" } } }),
+    async listThreadTurns(id, options) {
+      assert.equal(id, CHAT);
+      assert.deepEqual(options, { limit: 1, itemsView: "notLoaded" });
+      return { response: { data: [{ id: TURN, status: "inProgress" }] } };
+    },
+    async interruptConversation(id, mode, turnId) {
+      assert.equal(id, CHAT);
+      assert.equal(mode, "user-stop");
+      expected = turnId;
+      return turnId;
+    },
+  });
+  assert.deepEqual(await local.control("status"), { state: "applied", chatId: CHAT, activity: "running", turnId: TURN });
+  assert.deepEqual(await local.control("interrupt"), { state: "applied", chatId: CHAT, turnId: TURN });
+  assert.equal(expected, TURN);
+  assert.equal((await local.control("archive")).state, "refused");
+});
+
+test("updates individual native settings and archives without worktree cleanup", async (t) => {
+  let archived = false;
+  const calls = [];
+  const local = fixture(t, {
+    getStreamRole: () => ({ role: "owner" }),
+    isConversationSuppressedAfterArchive: () => archived,
+    readThread: async () => ({ thread: { ...saved, status: { type: "idle" } } }),
+    threadStore: { getUnarchivedThreadIds: async (ids) => archived ? [] : ids },
+    async updateThreadSettingsForNextTurn(id, settings) {
+      calls.push([id, settings]);
+      return true;
+    },
+    async archiveConversation(id, options) {
+      assert.equal(id, CHAT);
+      assert.equal(options.cleanupWorktree, false);
+      archived = true;
+    },
+    async unarchiveConversation(id, options) {
+      assert.equal(id, CHAT);
+      assert.equal(options.restorePin, false);
+      archived = false;
+      return "unarchived";
+    },
+  });
+  assert.deepEqual(await local.control("status"), { state: "applied", chatId: CHAT, activity: "idle" });
+  assert.equal((await local.control("model", { value: "fixture-model" })).state, "applied");
+  assert.equal((await local.control("effort", { value: null })).state, "applied");
+  assert.deepEqual(calls, [[CHAT, { model: "fixture-model" }], [CHAT, { effort: null }]]);
+  assert.equal((await local.control("unarchive")).state, "refused");
+  assert.equal((await local.control("archive")).state, "applied");
+  assert.equal((await local.control("model", { value: "fixture-model" })).state, "refused");
+  assert.equal((await local.control("unarchive")).state, "applied");
+});
+
+
+test("reads native activity before the saved history projection catches up", async (t) => {
+  let resuming = false;
+  let active = false;
+  let pending = false;
+  const local = fixture(t, {
+    getHasInProgressLocalConversation: () => pending,
+    hasPendingConversationResume: () => resuming,
+    getThreadSummaries: () => active ? [{ conversationId: CHAT, threadRuntimeStatus: { type: "active" } }] : [],
+    getCachedConversations: () => [],
+    requestClient: { getPendingRequestCount: () => 0 },
+    turnCoordinator: { readState: () => ({}) },
+  });
+  assert.deepEqual(await local.busy(), { state: "known", chatIds: [], pending: false });
+  active = true;
+  assert.deepEqual(await local.busy(), { state: "known", chatIds: [CHAT], pending: false });
+  resuming = true;
+  assert.deepEqual(await local.busy(), { state: "known", chatIds: [CHAT], pending: true });
+  active = resuming = false;
+  pending = true;
+  assert.deepEqual(await local.busy(), { state: "known", chatIds: [], pending: true });
+  local.retire();
+  assert.deepEqual(await local.busy(), { state: "unknown" });
 });
