@@ -9,11 +9,12 @@ from pathlib import Path
 import socket
 import struct
 import time
-from typing import Annotated, NewType
+from typing import Annotated, Literal, NewType
 import uuid
 
 from pydantic import AliasPath, BaseModel, BeforeValidator, ConfigDict, Field, StringConstraints, TypeAdapter
 
+from claudex.codex import history
 from claudex.codex.envelope import ToolOutput, tool_output
 from claudex.models import CodexChatId, PeerMessage, parse_uuid
 
@@ -46,6 +47,10 @@ class OwnerNotLoaded(CodexDesktopError):
     pass
 
 
+class UnsupportedOwner(CodexDesktopError):
+    pass
+
+
 class UnconfirmedDelivery(CodexDesktopError):
     pass
 
@@ -54,9 +59,13 @@ class UnconfirmedDelivery(CodexDesktopError):
 class Submitted:
     chat_id: CodexChatId
     turn_id: str
+    joined_existing: Literal[True] | None = None
 
     def to_wire(self) -> dict[str, object]:
-        return {"state": "submitted", "chat_id": self.chat_id, "turn_id": self.turn_id}
+        return {
+            "state": "submitted", "chat_id": self.chat_id, "turn_id": self.turn_id,
+            "joined_existing": self.joined_existing,
+        }
 
 
 @dataclass(frozen=True)
@@ -269,11 +278,15 @@ class DesktopClient:
         if response.handled_by == self.client_id:
             raise CodexDesktopError("Codex Desktop returned the relay as chat owner")
         if not reply.supports_tool_output:
-            raise CodexDesktopError("Codex Desktop owner does not advertise untrusted tool input support")
+            raise UnsupportedOwner("Codex Desktop owner does not advertise untrusted tool input support")
         return response.handled_by
 
     def deliver(self, chat_id: CodexChatId, output: ToolOutput) -> Submitted:
         owner = self.owner(chat_id)
+        try:
+            prior_turn_id = history.projected_running_turn_id(chat_id)
+        except history.HistoryError:
+            prior_turn_id = None
         response = self.request(
             Method.START_TURN,
             {
@@ -284,7 +297,10 @@ class DesktopClient:
         )
         if not isinstance(response.reply, StartedTurn):
             raise UnconfirmedDelivery("Codex Desktop acknowledgement did not include a turn ID")
-        return Submitted(chat_id, response.reply.turn_id)
+        # Desktop acknowledges the turn ID for both a new turn and a join.
+        # A lagging local projection may miss a join, so report only confirmed matches.
+        turn_id = response.reply.turn_id
+        return Submitted(chat_id, turn_id, joined_existing=True if turn_id == prior_turn_id else None)
 
 
 @contextmanager
@@ -308,10 +324,18 @@ def desktop_client(socket_path: Path | None) -> Iterator[DesktopClient]:
 @dataclass(frozen=True)
 class ChatStatus:
     chat_id: CodexChatId
-    loaded: bool
+    state: Literal["reachable", "not_loaded", "unsupported_owner"]
+
+    @property
+    def loaded(self) -> bool:
+        return self.state != "not_loaded"
+
+    @property
+    def reachable(self) -> bool:
+        return self.state == "reachable"
 
     def to_wire(self) -> dict[str, object]:
-        return {"chat_id": self.chat_id, "loaded": self.loaded}
+        return {"chat_id": self.chat_id, "loaded": self.loaded, "reachable": self.reachable}
 
 
 def chat_status(chat_id: CodexChatId, *, socket_path: Path | None = None) -> ChatStatus:
@@ -320,8 +344,10 @@ def chat_status(chat_id: CodexChatId, *, socket_path: Path | None = None) -> Cha
         with desktop_client(socket_path) as client:
             client.owner(chat_id)
     except OwnerNotLoaded:
-        return ChatStatus(chat_id, False)
-    return ChatStatus(chat_id, True)
+        return ChatStatus(chat_id, "not_loaded")
+    except UnsupportedOwner:
+        return ChatStatus(chat_id, "unsupported_owner")
+    return ChatStatus(chat_id, "reachable")
 
 
 def deliver(chat_id: CodexChatId, message: PeerMessage, *, socket_path: Path | None = None) -> Delivery:

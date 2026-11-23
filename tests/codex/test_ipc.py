@@ -6,7 +6,7 @@ import struct
 import unittest
 from unittest import mock
 
-from claudex.codex import ipc
+from claudex.codex import history, ipc
 from claudex.models import CodexChatId, PeerMessage, Provider, Sender
 
 
@@ -91,6 +91,11 @@ class FakeSocket:
 
 
 class DesktopRelayTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.running_turn = self.enterContext(mock.patch(
+            "claudex.codex.ipc.history.projected_running_turn_id", return_value=None,
+        ))
+
     def submit(self, socket: FakeSocket, chat_id: CodexChatId = CHAT) -> ipc.Delivery:
         with mock.patch("claudex.codex.ipc.socket.socket", return_value=socket):
             return ipc.deliver(chat_id, MESSAGE, socket_path=SOCKET)
@@ -129,6 +134,32 @@ class DesktopRelayTest(unittest.TestCase):
             },
             "untrusted_peer_content": MESSAGE.body,
         })
+
+    def test_reports_join_only_when_the_confirmed_turn_was_running_before_send(self) -> None:
+        self.running_turn.return_value = TURN
+        self.assertEqual(self.submit(FakeSocket()), ipc.Submitted(CHAT, TURN, joined_existing=True))
+        self.running_turn.assert_called_once_with(CHAT)
+        self.running_turn.return_value = "a-different-turn"
+        self.assertEqual(self.submit(FakeSocket()), ipc.Submitted(CHAT, TURN))
+
+    def test_delivery_succeeds_even_if_the_local_turn_projection_is_unavailable(self) -> None:
+        self.running_turn.side_effect = history.HistoryError("History projection unavailable")
+        self.assertEqual(self.submit(FakeSocket()), ipc.Submitted(CHAT, TURN))
+
+    def test_status_distinguishes_reachability_from_loading_and_never_sends(self) -> None:
+        cases = (
+            (FakeSocket(), True, True),
+            (FakeSocket(outcome="missing-during-discovery"), False, False),
+            (FakeSocket(capability=False), True, False),
+        )
+        for socket, loaded, reachable in cases:
+            with (
+                self.subTest(loaded=loaded, reachable=reachable),
+                mock.patch("claudex.codex.ipc.socket.socket", return_value=socket),
+            ):
+                status = ipc.chat_status(CHAT, socket_path=SOCKET)
+                self.assertEqual(status.to_wire(), {"chat_id": CHAT, "loaded": loaded, "reachable": reachable})
+                self.assertNotIn("thread-follower-start-turn", [frame.get("method") for frame in socket.frames])
 
     def test_owner_must_support_untrusted_tool_output(self) -> None:
         socket = FakeSocket(capability=False)

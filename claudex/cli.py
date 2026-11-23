@@ -114,7 +114,7 @@ def parser() -> argparse.ArgumentParser:
     for command in (threads, history):
         command.add_argument("--cursor", help="Continue from a previous page")
         command.add_argument("--json", action="store_true", help="Print JSON")
-    status = codex_commands.add_parser("status", help="Check whether a Codex window has the chat open", allow_abbrev=False)
+    status = codex_commands.add_parser("status", help="Check whether a Codex chat can receive peer messages", allow_abbrev=False)
     status.add_argument("codex_chat_id", type=parse_codex_chat_id, metavar="CHAT_ID")
     status.add_argument("--json", action="store_true", help="Print JSON")
     return root
@@ -240,7 +240,7 @@ def print_result(result: Result, as_json: bool) -> None:
                     print(f"{message.to_wire()['role']}: {text}" + (" [truncated]" if message.preview.truncated else ""))
             print_cursor(result.next_cursor)
         case codex.ipc.ChatStatus():
-            print(f"{result.chat_id}  {'loaded' if result.loaded else 'unloaded'}")
+            print(f"{result.chat_id}  {result.state.replace('_', ' ')}")
         case _:
             assert_never(result)
 

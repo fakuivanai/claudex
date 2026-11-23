@@ -129,6 +129,13 @@ class CodexHistoryTest(unittest.TestCase):
         index.write_text("\n".join(["malformed", *entries]), encoding="utf-8")
         self.assertEqual(history.chat_title(chat_id(1), root=self.root), "Renamed")
 
+    def test_running_turn_lookup_reads_only_the_latest_turn_for_the_chat(self) -> None:
+        self.add_turn(1, 11, [], status="inProgress")
+        self.add_turn(2, 12, [], status="inProgress")
+        self.assertEqual(history.projected_running_turn_id(chat_id(1), root=self.root), chat_id(11))
+        self.add_turn(1, 13, [], status="completed")
+        self.assertIsNone(history.projected_running_turn_id(chat_id(1), root=self.root))
+
     def test_history_discards_hidden_and_ordinary_tool_data(self) -> None:
         self.add_chat(1, title="Chat")
         self.add_turn(1, 11, [

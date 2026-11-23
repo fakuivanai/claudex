@@ -95,8 +95,11 @@ class ClaudeCommands(unittest.TestCase):
 
 class CodexCommands(unittest.TestCase):
     def test_status_reuses_native_owner_discovery(self) -> None:
-        with patch("claudex.codex.ipc.chat_status", return_value=codex.ipc.ChatStatus(CODEX_ID, True)) as status:
-            self.assertEqual(invoke("codex", "status", CODEX_ID, "--json")[:1], (0,))
+        reachable = codex.ipc.ChatStatus(CODEX_ID, "reachable")
+        with patch("claudex.codex.ipc.chat_status", return_value=reachable) as status:
+            code, output, errors = invoke("codex", "status", CODEX_ID, "--json")
+            self.assertEqual((code, errors), (0, ""))
+            self.assertEqual(json.loads(output), {"chat_id": CODEX_ID, "loaded": True, "reachable": True})
             status.assert_called_once_with(CODEX_ID)
 
     def test_threads_passes_search_archives_and_pagination(self) -> None:

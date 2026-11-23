@@ -492,6 +492,19 @@ def visible_messages(connection: sqlite3.Connection, chat_id: CodexChatId, turn:
     return Turn(turn, tuple(message for _, message in sorted(messages, key=lambda item: item[0])), over_cap, skipped)
 
 
+def projected_running_turn_id(chat_id: CodexChatId, *, root: Path | None = None) -> str | None:
+    """Read the newest turn without loading history items or resuming the chat."""
+    with database(root, HISTORY_DATABASE) as connection:
+        row = connection.execute(
+            "SELECT turn_id, status FROM thread_turns "
+            "WHERE thread_id = ? ORDER BY rollout_ordinal DESC LIMIT 1", (chat_id,),
+        ).fetchone()
+    if row is None or row["status"] != "inProgress":
+        return None
+    turn_id = row["turn_id"]
+    return turn_id if isinstance(turn_id, str) else None
+
+
 def read_chat(
     chat_id: CodexChatId, *, limit: int = DEFAULT_TURN_PAGE, cursor: str | None = None,
     include_archived: bool = False, root: Path | None = None,
