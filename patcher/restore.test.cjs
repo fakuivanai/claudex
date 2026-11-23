@@ -76,6 +76,91 @@ test("startup restores saved On chats without an earlier quit", async () => {
   ]);
 });
 
+test("startup waits for account flags invalidated during the first warm", async () => {
+  const first = savedChat(1);
+  const second = savedChat(2);
+  const { manager, platform, events } = fixture([first, second]);
+  let flagsReady = true;
+  let finishRefresh;
+  let waitingForRefresh;
+  const refresh = new Promise((resolve) => { finishRefresh = resolve; });
+  const waited = new Promise((resolve) => { waitingForRefresh = resolve; });
+  platform.flagsReady = () => flagsReady;
+  const warm = manager.warmSession;
+  manager.warmSession = async (id, options) => {
+    await warm(id, options);
+    if (id === first.sessionId) flagsReady = false;
+  };
+  manager.awaitFreshFlagsForBackgroundPass = async () => {
+    if (flagsReady) return;
+    waitingForRefresh();
+    await refresh;
+    flagsReady = true;
+  };
+  let policyChecks = 0;
+  platform.canRestore = async () => { policyChecks += 1; return true; };
+
+  const restoring = restoreAtLaunch(manager, 7, platform);
+  await waited;
+  assert.deepEqual(events.map(([op, id]) => [op, id]), [["warm", first.sessionId]]);
+  finishRefresh();
+  await restoring;
+  assert.deepEqual(events.map(([op, id]) => [op, id]), [
+    ["warm", first.sessionId], ["reconnect", first.sessionId],
+    ["warm", second.sessionId], ["reconnect", second.sessionId],
+  ]);
+  assert.equal(policyChecks, 2);
+});
+
+test("startup checks the same account, saved choice and warmed query after flags refresh", async () => {
+  for (const change of ["account", "off", "query", "policy"]) {
+    const chat = savedChat(1);
+    const { manager, platform, events } = fixture([chat]);
+    let flagsReady = true;
+    let allowed = true;
+    platform.flagsReady = () => flagsReady;
+    platform.canRestore = async () => allowed;
+    const warm = manager.warmSession;
+    manager.warmSession = async (id, options) => {
+      await warm(id, options);
+      flagsReady = false;
+    };
+    manager.awaitFreshFlagsForBackgroundPass = async () => {
+      if (flagsReady) return;
+      if (change === "account") manager.currentAccountId = "other";
+      if (change === "off") chat.remoteControlUserEnabled = false;
+      if (change === "query") chat.query = {};
+      if (change === "policy") allowed = false;
+      flagsReady = true;
+    };
+
+    await restoreAtLaunch(manager, 7, platform);
+    assert.deepEqual(events.map(([op]) => op), ["warm"], change);
+  }
+});
+
+test("startup honors the native flag wait limit without warming additional workers", async () => {
+  const first = savedChat(1);
+  const second = savedChat(2);
+  const { manager, platform, events } = fixture([first, second]);
+  let flagsReady = true;
+  platform.flagsReady = () => flagsReady;
+  const warm = manager.warmSession;
+  manager.warmSession = async (id, options) => {
+    await warm(id, options);
+    if (id === first.sessionId) flagsReady = false;
+  };
+
+  await restoreAtLaunch(manager, 7, platform);
+  assert.deepEqual(events.map(([op, id]) => [op, id]), [["warm", first.sessionId]]);
+  flagsReady = true;
+  await restoreAtLaunch(manager, 7, platform);
+  assert.deepEqual(events.map(([op, id]) => [op, id]), [
+    ["warm", first.sessionId], ["reconnect", first.sessionId],
+    ["warm", second.sessionId], ["reconnect", second.sessionId],
+  ]);
+});
+
 test("startup skips ineligible chats even when Remote Control was saved On", async () => {
   const chats = [
     { homeTenancy: { accountId: "other", orgId: "organization" } },

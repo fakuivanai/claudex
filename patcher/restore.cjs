@@ -112,22 +112,36 @@ async function restoreAtLaunch(manager, epoch, platform) {
     return;
   }
 
-  try {
-    platform.log(`[claudex] Remote Control restart inspecting ${candidates.length} chats with Remote Control saved On`);
-    await manager.awaitFreshFlagsForBackgroundPass();
-    if (!isSignedIn()) {
-      return;
+  const flagsAreReady = () => {
+    if (platform.flagsReady()) {
+      return true;
     }
-    if (!platform.flagsReady()) {
-      platform.log("[claudex] Remote Control restart waiting for native flags");
-      return;
+    platform.log("[claudex] Remote Control restart waiting for native flags");
+    return false;
+  };
+  const waitForLaunchReadiness = async () => {
+    await manager.awaitFreshFlagsForBackgroundPass();
+    if (!isSignedIn() || !flagsAreReady()) {
+      return false;
     }
     await platform.waitForOrganizationPolicy();
     if (!isSignedIn()) {
-      return;
+      return false;
     }
-    if (!(await platform.canRestore())) {
+    const allowed = await platform.canRestore();
+    if (!isSignedIn()) {
+      return false;
+    }
+    if (!allowed) {
       platform.log("[claudex] Remote Control restart declined by native background checks");
+      return false;
+    }
+    return flagsAreReady();
+  };
+
+  try {
+    platform.log(`[claudex] Remote Control restart inspecting ${candidates.length} chats with Remote Control saved On`);
+    if (!(await waitForLaunchReadiness())) {
       return;
     }
     let timedOutWorktree = false;
@@ -175,9 +189,23 @@ async function restoreAtLaunch(manager, epoch, platform) {
         }
       }
       if (chat.query != null && canResume(chat)) {
+        const query = chat.query;
+        // Desktop can invalidate its feature flags during warm-up. Native
+        // maybeAutoEnableRemoteControl returns not_run until they are fresh.
+        if (!platform.flagsReady()) {
+          platform.log(`[claudex] Remote Control restart ${chat.sessionId} waiting for refreshed native flags`);
+          if (!(await waitForLaunchReadiness())) {
+            pass.attempted.delete(chat);
+            return;
+          }
+          if (chat.query !== query || !canResume(chat)) {
+            pass.attempted.delete(chat);
+            continue;
+          }
+        }
         pass.attempted.add(chat);
         await reconnect(
-          chat, chat.query, manager.remoteControlLifecycle, pass, () => canResume(chat),
+          chat, query, manager.remoteControlLifecycle, pass, () => platform.flagsReady() && canResume(chat),
           platform.log, "claudex_restart",
         );
       }
