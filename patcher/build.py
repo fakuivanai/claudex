@@ -1,6 +1,7 @@
 """Build a separate ASAR from a supported Claude Desktop installation."""
 
 import argparse
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 import hashlib
 import os
@@ -8,10 +9,15 @@ from pathlib import Path
 import tempfile
 from typing import BinaryIO
 
-from .archive import COPY_BLOCK, blocks_from, encode_header, integrity_of, packed_entry, read_exact, read_header, replace_file
+from .archive import (
+    COPY_BLOCK, Header, PackedReplacement, blocks_from, encode_header, integrity_of,
+    packed_entry, read_exact, read_header, replace_files,
+)
 
 
 MODULE_NAME = "claudex-restore.cjs"
+BRIDGE_MODULE = "claudex-desktop-bridge.cjs"
+SOCKET_MODULE = "claudex-desktop-socket.cjs"
 
 
 @dataclass(frozen=True)
@@ -27,6 +33,7 @@ class DesktopRelease:
     digest: str
     session_chunk: tuple[str, ...]
     anchors: tuple[Anchor, ...]
+    window_chunk: tuple[str, ...] | None = None
 
 
 # These aliases are private to the pinned session-manager chunk.
@@ -110,11 +117,27 @@ VISIBLE_CHAT_HOOK = (
     b'&&this.currentOrgId===a.homeTenancy.orgId,message=>t.EEt.info(message))),'
 )
 
+# Ei(e, y, C) is the renderer's native LocalSessions factory. The main
+# process passes its window WebContents wrapper, its local session manager,
+# and the window dispatcher. t.I0()/t.EEt belong to the main process's signed-in
+# account provider and logger. Preserve the factory object original callers use.
+WINDOW_API = Anchor(
+    "LocalSessions window API factory",
+    b"exports.createLocalSessionsApi=Ei;",
+    b"exports.createLocalSessionsApi=function(window,manager,dispatcher){"
+    b"const api=Ei(window,manager,dispatcher);"
+    b'try{require("./claudex-desktop-bridge.cjs").attachDesktopWindow('
+    b'window,api,manager,()=>t.I0(),message=>t.EEt.info(message))}'
+    b'catch{t.EEt.warn("[claudex] Could not attach the Desktop control socket")}return api};',
+)
+
+
 SUPPORTED_RELEASES = (
     DesktopRelease(
         version="5.11492.5",
         digest="33a8a05f5704a7159711c7aa9ab99086ea2b04f17ac9e494fb1df54c19a142e6",
         session_chunk=(".vite", "build", "index.chunk-DkwynUE7.js"),
+        window_chunk=(".vite", "build", "index.chunk-DKhxeID8.js"),
         anchors=(
             Anchor("startup pass", STARTUP, STARTUP_HOOK),
             Anchor("deferred active roster", DEFERRED_ROSTER, DEFERRED_ROSTER_HOOK),
@@ -142,68 +165,77 @@ def identify_release(source: BinaryIO) -> DesktopRelease:
     raise ValueError(f"unsupported Claude Desktop ASAR SHA-256 {digest}; supported version: {versions}")
 
 
-def patch_chunk(original: bytes, release: DesktopRelease) -> bytes:
-    if MODULE_NAME.encode() in original:
-        raise ValueError("source chunk already contains the reconnect patch")
+def apply_anchors(original: bytes, release: DesktopRelease, anchors: Sequence[Anchor]) -> bytes:
     result = original
-    for anchor in release.anchors:
+    for anchor in anchors:
         if result.count(anchor.stock) != 1:
             raise ValueError(f"{release.version} reconnect patch anchor changed: {anchor.description}")
         result = result.replace(anchor.stock, anchor.patched, 1)
     return result
 
 
-def verify_candidate(
-    source: BinaryIO, candidate: BinaryIO, original_body: int, start: int, end: int, tail_size: int,
-    encoded_header: bytes, replacement: bytes, module: bytes,
-) -> str:
-    candidate.flush()
-    candidate.seek(0)
-    if read_exact(candidate, len(encoded_header)) != encoded_header:
-        raise ValueError("patched ASAR header did not round-trip")
-    for data in blocks_from(source, original_body, start):
-        if read_exact(candidate, len(data)) != data:
-            raise ValueError("unmodified ASAR bytes changed before the patch")
-    if read_exact(candidate, len(replacement)) != replacement:
-        raise ValueError("patched ASAR chunk did not round-trip")
-    for data in blocks_from(source, original_body + end, tail_size):
-        if read_exact(candidate, len(data)) != data:
-            raise ValueError("unmodified ASAR bytes changed after the patch")
-    if read_exact(candidate, len(module)) != module or candidate.read(1):
-        raise ValueError("embedded reconnect module did not round-trip")
-    return hash_archive(candidate)
+def patch_chunk(original: bytes, release: DesktopRelease) -> bytes:
+    if MODULE_NAME.encode() in original:
+        raise ValueError("source chunk already contains the reconnect patch")
+    return apply_anchors(original, release, release.anchors)
+
+
+def source_chunk(source: BinaryIO, header: Header, path: tuple[str, ...]) -> PackedReplacement:
+    original = packed_entry(header.root, path)
+    source.seek(header.body_offset + original.offset)
+    content = read_exact(source, original.size)
+    if original.integrity != integrity_of(content, original.integrity.block_size):
+        raise ValueError("source ASAR chunk integrity did not match its header")
+    return PackedReplacement(path, original, content)
+
+
+def patched_blocks(
+    source: BinaryIO, body_offset: int, body_size: int, edited: Sequence[PackedReplacement],
+    header: bytes, modules: Sequence[bytes],
+) -> Iterator[bytes]:
+    yield header
+    offset = 0
+    for change in edited:
+        yield from blocks_from(source, body_offset + offset, change.before.offset - offset)
+        yield change.content
+        offset = change.end
+    yield from blocks_from(source, body_offset + offset, body_size - offset)
+    yield from modules
 
 
 def build(source_path: Path, output_path: Path) -> str:
-    module = Path(__file__).with_name("restore.cjs").read_bytes()
     with source_path.open("rb") as source:
         release = identify_release(source)
         header = read_header(source)
         body_size = os.fstat(source.fileno()).st_size - header.body_offset
-        target = packed_entry(header.root, release.session_chunk)
-        start, end = target.offset, target.offset + target.size
-        source.seek(header.body_offset + start)
-        original = read_exact(source, target.size)
-        if target.integrity != integrity_of(original, target.integrity.block_size):
-            raise ValueError("source ASAR chunk integrity did not match its header")
-        replacement = patch_chunk(original, release)
-        new_root = replace_file(header.root, release.session_chunk, target, replacement, body_size, MODULE_NAME, module)
-        encoded_header = encode_header(new_root)
-        tail_size = body_size - end
+        session = source_chunk(source, header, release.session_chunk)
+        edited = [PackedReplacement(session.path, session.before, patch_chunk(session.content, release))]
+        modules = {(*session.path[:-1], MODULE_NAME): Path(__file__).with_name("restore.cjs").read_bytes()}
+        if release.window_chunk is not None:
+            window = source_chunk(source, header, release.window_chunk)
+            edited.append(PackedReplacement(
+                window.path, window.before, apply_anchors(window.content, release, (WINDOW_API,)),
+            ))
+            modules[(*window.path[:-1], BRIDGE_MODULE)] = Path(__file__).with_name("desktop_bridge.cjs").read_bytes()
+            modules[(*window.path[:-1], SOCKET_MODULE)] = Path(__file__).with_name("desktop_socket.cjs").read_bytes()
+        edited.sort(key=lambda change: change.before.offset)
+        new_header = encode_header(replace_files(header.root, edited, body_size, modules))
+        added = tuple(modules.values())
 
-        # Publish only a complete new archive. Hard linking refuses to
+        # Publish only a complete verified archive. Linking refuses to
         # overwrite either the installed archive or a previous build.
         with tempfile.TemporaryDirectory(dir=output_path.parent) as directory:
             temporary = Path(directory) / "app.asar"
             with temporary.open("w+b") as candidate:
-                candidate.write(encoded_header)
-                candidate.writelines(blocks_from(source, header.body_offset, start))
-                candidate.write(replacement)
-                candidate.writelines(blocks_from(source, header.body_offset + end, tail_size))
-                candidate.write(module)
-                digest = verify_candidate(
-                    source, candidate, header.body_offset, start, end, tail_size, encoded_header, replacement, module,
-                )
+                candidate.writelines(patched_blocks(source, header.body_offset, body_size, edited, new_header, added))
+                candidate.flush()
+                candidate.seek(0)
+                for expected in patched_blocks(source, header.body_offset, body_size, edited, new_header, added):
+                    if read_exact(candidate, len(expected)) != expected:
+                        raise ValueError("patched ASAR bytes did not round-trip")
+                if candidate.read(1):
+                    raise ValueError("unexpected bytes at the end of the patched ASAR")
+                digest = hash_archive(candidate)
             os.link(temporary, output_path)
             return digest
 

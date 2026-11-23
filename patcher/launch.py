@@ -123,7 +123,7 @@ def patch_digest() -> str:
     # These package files define the bytes that will be mounted in the app.
     digest = hashlib.sha256()
     directory = Path(__file__).parent
-    for name in ("build.py", "archive.py", "restore.cjs"):
+    for name in ("build.py", "archive.py", "restore.cjs", "desktop_bridge.cjs", "desktop_socket.cjs"):
         digest.update(name.encode() + b"\0")
         digest.update(hashlib.sha256((directory / name).read_bytes()).digest())
     return digest.hexdigest()

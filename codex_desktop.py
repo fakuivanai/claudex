@@ -313,6 +313,25 @@ def desktop_client(socket_path: Path | None) -> Iterator[DesktopClient]:
         yield client
 
 
+@dataclass(frozen=True)
+class ChatStatus:
+    chat_id: CodexChatId
+    loaded: bool
+
+    def to_wire(self) -> dict[str, object]:
+        return {"chat_id": self.chat_id, "loaded": self.loaded}
+
+
+def chat_status(chat_id: CodexChatId, *, socket_path: Path | None = None) -> ChatStatus:
+    """Check whether Codex Desktop has a loaded owner eligible for peer delivery."""
+    try:
+        with desktop_client(socket_path) as client:
+            client.owner(chat_id)
+    except OwnerNotLoaded:
+        return ChatStatus(chat_id, False)
+    return ChatStatus(chat_id, True)
+
+
 def deliver(chat_id: CodexChatId, message: PeerMessage, *, socket_path: Path | None = None) -> Delivery:
     """Submit an already-authorized peer message through the existing owner."""
     try:

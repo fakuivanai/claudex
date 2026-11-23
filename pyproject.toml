@@ -20,15 +20,15 @@ dev = ["mypy==1.20.1", "setuptools==80.10.1"]
 [tool.setuptools]
 packages = ["patcher"]
 py-modules = [
-    "claude_desktop", "claude_lifecycle", "claudex", "codex_desktop", "codex_history",
-    "codex_peer", "desktop_environment", "models", "peer_mailbox", "skill_reader",
+    "claude_desktop", "claude_lifecycle", "claudex", "claudex_cli", "codex_desktop", "codex_history",
+    "codex_peer", "desktop_control", "desktop_environment", "models", "peer_mailbox", "skill_reader",
 ]
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.in"]}
 
 [tool.setuptools.package-data]
-patcher = ["restore.cjs"]
+patcher = ["restore.cjs", "desktop_bridge.cjs", "desktop_socket.cjs"]
 
 [tool.mypy]
 python_version = "3.12"

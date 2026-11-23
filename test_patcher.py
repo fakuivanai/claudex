@@ -7,7 +7,10 @@ import unittest
 from unittest.mock import patch
 
 from patcher.archive import Directory, Packed, Unpacked, encode_header, integrity_of, packed_entry, read_header
-from patcher.build import Anchor, DEFERRED_ROSTER_HOOK, DesktopRelease, MODULE_NAME, STARTUP_HOOK, build, patch_chunk
+from patcher.build import (
+    Anchor, BRIDGE_MODULE, DEFERRED_ROSTER_HOOK, DesktopRelease, MODULE_NAME, SOCKET_MODULE,
+    STARTUP_HOOK, WINDOW_API, build, patch_chunk,
+)
 
 
 class PatcherTests(unittest.TestCase):
@@ -101,6 +104,40 @@ class PatcherTests(unittest.TestCase):
                 self.assertEqual((alias, file.read(resource.size)), (resource, tail))
                 self.assertIn(("resource-unpacked", Unpacked(len(tail), integrity)), header.root.children)
                 self.assertGreater(packed_entry(header.root, (MODULE_NAME,)).size, 0)
+
+    def test_build_patches_both_chunks_preserving_the_bytes_between_them(self) -> None:
+        chunks = (
+            ("window.js", WINDOW_API.stock),
+            ("untouched", b"resource between the patched chunks"),
+            ("session.js", b"session hook"),
+        )
+        body = b""
+        files: list[tuple[str, Packed]] = []
+        for name, content in chunks:
+            files.append((name, Packed(len(body), len(content), integrity_of(content, 16), None)))
+            body += content
+        stock = encode_header(Directory(tuple(files))) + body
+        fixture = DesktopRelease(
+            "fixture", hashlib.sha256(stock).hexdigest(), ("session.js",),
+            (Anchor("manager", b"session hook", b"manager replacement"),), ("window.js",),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "stock.asar"
+            output = Path(temporary) / "patched.asar"
+            source.write_bytes(stock)
+            with patch("patcher.build.SUPPORTED_RELEASES", (fixture,)):
+                build(source, output)
+            with output.open("rb") as file:
+                header = read_header(file)
+                for name, content in (
+                    ("window.js", WINDOW_API.patched), ("session.js", b"manager replacement"), chunks[1],
+                ):
+                    entry = packed_entry(header.root, (name,))
+                    file.seek(header.body_offset + entry.offset)
+                    self.assertEqual(file.read(entry.size), content)
+                    self.assertEqual(entry.integrity, integrity_of(content, 16))
+                for module in (MODULE_NAME, BRIDGE_MODULE, SOCKET_MODULE):
+                    self.assertGreater(packed_entry(header.root, (module,)).size, 0)
 
     def test_build_leaves_an_existing_output_intact(self) -> None:
         old = b"stock"

@@ -1,6 +1,6 @@
 """Read and rewrite the Electron ASAR format used by the pinned package."""
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 import hashlib
 import json
@@ -173,15 +173,44 @@ def packed_entry(root: Directory, path: tuple[str, ...]) -> Packed:
     return entry
 
 
-def replace_file(
-    root: Directory, target_path: tuple[str, ...], target: Packed, new_content: bytes,
-    old_body_size: int, added_name: str, added_content: bytes,
+@dataclass(frozen=True)
+class PackedReplacement:
+    path: tuple[str, ...]
+    before: Packed
+    content: bytes
+
+    @property
+    def end(self) -> int:
+        return self.before.offset + self.before.size
+
+    @property
+    def delta(self) -> int:
+        return len(self.content) - self.before.size
+
+
+def replace_files(
+    root: Directory, replacements: Sequence[PackedReplacement], old_body_size: int,
+    added_files: Mapping[tuple[str, ...], bytes],
 ) -> Directory:
-    new_size = len(new_content)
-    delta = new_size - target.size
-    old_end = target.offset + target.size
-    block_size = target.integrity.block_size
-    added = Packed(old_body_size + delta, len(added_content), integrity_of(added_content, block_size), None)
+    """Update the index for offset-sorted replacements and appended packed files."""
+    targets = {replacement.path: replacement for replacement in replacements}
+    if len(targets) != len(replacements):
+        raise ValueError("duplicate ASAR patch targets")
+    end = 0
+    for replacement in replacements:
+        if replacement.before.size == 0 or replacement.before.offset < end:
+            raise ValueError("patch targets overlap")
+        end = replacement.end
+    if end > old_body_size:
+        raise ValueError("invalid ASAR patch target location")
+
+    next_offset = old_body_size + sum(replacement.delta for replacement in replacements)
+    block_size = replacements[0].before.integrity.block_size
+    added: dict[tuple[str, ...], list[tuple[str, Entry]]] = {}
+    for pathname, content in added_files.items():
+        entry = Packed(next_offset, len(content), integrity_of(content, block_size), None)
+        added.setdefault(pathname[:-1], []).append((pathname[-1], entry))
+        next_offset += len(content)
 
     def visit(directory: Directory, path: tuple[str, ...]) -> Directory:
         children: list[tuple[str, Entry]] = []
@@ -193,20 +222,32 @@ def replace_file(
                 end = entry.offset + entry.size
                 if end > old_body_size:
                     raise ValueError("invalid packed ASAR entry location")
-                if child_path == target_path:
-                    entry = replace(entry, size=new_size, integrity=integrity_of(new_content, block_size))
-                elif entry.size and entry.offset < old_end and end > target.offset:
-                    raise ValueError("patch target overlaps or aliases a second ASAR entry")
-                elif entry.offset >= old_end:
-                    entry = replace(entry, offset=entry.offset + delta)
+                shift = sum(replacement.delta for replacement in replacements if replacement.end <= entry.offset)
+                replacement = targets.get(child_path)
+                if replacement is not None:
+                    content = replacement.content
+                    entry = replace(
+                        entry, offset=entry.offset + shift, size=len(content),
+                        integrity=integrity_of(content, entry.integrity.block_size),
+                    )
+                else:
+                    if entry.size and any(
+                        entry.offset < replacement.end and end > replacement.before.offset
+                        for replacement in replacements
+                    ):
+                        raise ValueError("patch target overlaps or aliases a second ASAR entry")
+                    entry = replace(entry, offset=entry.offset + shift)
             children.append((name, entry))
-        if path == target_path[:-1]:
-            if any(name == added_name for name, _ in children):
-                raise ValueError("reconnect module already exists in source archive")
-            children.append((added_name, added))
+        for name, entry in added.pop(path, []):
+            if any(existing == name for existing, _ in children):
+                raise ValueError("patch module already exists in source archive")
+            children.append((name, entry))
         return Directory(tuple(children))
 
-    return visit(root, ())
+    result = visit(root, ())
+    if added:
+        raise ValueError("a patch module directory is missing from the archive")
+    return result
 
 
 def blocks_from(file: BinaryIO, offset: int, length: int) -> Iterator[bytes]:

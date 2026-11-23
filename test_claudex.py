@@ -92,4 +92,18 @@ class StdioTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({tool.name for tool in tools.tools}, {
             "launch_claude", "list_chats", "read_chat", "send_message", "read_messages",
             "wake_chat", "open_chat_draft", "who_am_i", "list_skills", "read_skill",
+            "desktop_list_sessions", "desktop_get_session", "desktop_set_remote_control",
+            "desktop_warm_session", "desktop_set_model", "desktop_set_effort", "desktop_set_fast_mode",
+            "desktop_set_permission_mode", "desktop_archive", "desktop_unarchive", "desktop_stop",
+            "desktop_interrupt", "codex_thread_status",
         })
+        reads = {"desktop_list_sessions", "desktop_get_session"}
+        for tool in tools.tools:
+            if tool.name.startswith("desktop_"):
+                self.assertIsNotNone(tool.annotations)
+                assert tool.annotations is not None
+                if tool.name in reads:
+                    self.assertIs(tool.annotations.readOnlyHint, True)
+                else:
+                    self.assertIs(tool.annotations.readOnlyHint, False)
+                    self.assertIs(tool.annotations.idempotentHint, False)

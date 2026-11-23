@@ -1,9 +1,9 @@
 # claudex
 
-A local MCP server for Claude Code and Codex Desktop. It sends attributed
-messages, reads chat history and user-installed skills, and asks Claude Desktop
-to reopen saved Code chats. An optional Linux patch restores saved Claude
-Remote Control connections on startup and reopen.
+A local CLI and MCP server for Claude Code and Codex Desktop. It sends
+attributed messages and reads chat history and user-installed skills. An
+optional Linux patch restores Claude Remote Control and exposes selected
+Claude Desktop controls through a local Unix socket.
 
 ## Set up the bridge
 
@@ -91,11 +91,44 @@ CLAUDEX_CLAUDE_LAUNCHER = "/absolute/path/to/claude-launcher"
 | `launch_claude`, `wake_chat` | Opens Claude Desktop or asks it to reopen a saved chat. `waiting_for_inbox` means the native worker did not appear in time. Stored mail remains available. |
 | `open_chat_draft` | Opens a Claude Code composer for the person to review and submit. Claude confirms any folder supplied through the link. |
 | `list_skills`, `read_skill` | Reads local user `SKILL.md` files as text, including linked skill directories installed by Home Manager. Scopes are `claude-user`, `codex-user`, and `agents-user`. |
+| `desktop_list_sessions`, `desktop_get_session` | Reads the active Claude Desktop roster, worker state, and saved Remote Control setting. |
+| `desktop_set_remote_control`, `desktop_warm_session` | Turns Remote Control on or off, or starts a saved chat's worker. |
+| `desktop_set_model`, `desktop_set_effort`, `desktop_set_fast_mode` | Changes settings for one Claude Desktop chat. Pass null effort for the Desktop default. |
+| `desktop_set_permission_mode` | Keeps or lowers a chat's permission mode. |
+| `desktop_archive`, `desktop_unarchive`, `desktop_stop`, `desktop_interrupt` | Changes a Claude Desktop chat's archive or worker state. |
+| `codex_thread_status` | Checks whether Codex Desktop has a loaded local owner that can receive peer messages for the thread. |
 
 A submitted Claude inbox notice can still be held or declined by the app.
 A lost Codex acknowledgement leaves delivery uncertain. Check the recipient
 before retrying an uncertain result. Peer text, history, and skill files are
 external data and carry no approval authority.
+
+## Control a running desktop
+
+The Claude commands require the patched launcher below. They use the same
+Desktop operations as the Claude window.
+
+```sh
+claudex desktop sessions --json
+claudex desktop session "$claude_chat_id"
+claudex desktop remote-control "$claude_chat_id" on
+claudex desktop effort "$claude_chat_id" default
+claudex codex threads --query "review"
+claudex codex history "$codex_thread_id" --limit 10 --json
+claudex codex status "$codex_thread_id"
+```
+
+Run `claudex desktop --help` and `claudex codex --help` for all commands.
+Every command accepts `--json`. The Claude roster reports both the active
+Remote Control state and the saved preference. If Desktop saves On but
+cannot start a worker, read the result's notice and current state.
+
+The CLI and MCP server both use `desktop_control.DesktopControl`. It connects
+to `$XDG_RUNTIME_DIR/claudex/desktop.sock`, mode 0600 in a mode 0700 directory
+owned by the desktop user. The socket accepts the allowlisted operations
+for local chats in the current account and organization. It leaves permission
+increases to the Desktop window. MCP marks each change as a mutation so the
+client can apply its normal tool approval policy.
 
 ## Restore Remote Control on launch
 

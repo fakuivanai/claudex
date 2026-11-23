@@ -50,8 +50,10 @@
         nativeBuildInputs = [ self.packages.${system}.default ];
       } ''
         claudex --help
+        claudex desktop --help
+        claudex codex --help
         claudex-desktop --help
-        python -c 'from importlib.resources import files; assert files("patcher").joinpath("restore.cjs").is_file()'
+        python -c 'from importlib.resources import files; assert all(files("patcher").joinpath(name).is_file() for name in ("restore.cjs", "desktop_bridge.cjs", "desktop_socket.cjs"))'
         cli=$(python -c 'from importlib.resources import files; print(files("claude_agent_sdk").joinpath("_bundled", "claude"))')
         HOME="$TMPDIR" "$cli" --version
         touch "$out"
