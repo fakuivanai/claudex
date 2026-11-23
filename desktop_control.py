@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Annotated, Generic, Literal, TypeVar, get_args
 
 from pydantic import (
-    AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, RootModel, StringConstraints, ValidationError,
+    BaseModel, BeforeValidator, ConfigDict, Field, RootModel, StringConstraints, ValidationError,
 )
 
 from models import parse_claude_chat_id
@@ -35,7 +35,7 @@ class _WireModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
-class DesktopSession(_WireModel):
+class DesktopChat(_WireModel):
     chat_id: _ChatId
     title: str | None
     running: bool
@@ -50,14 +50,13 @@ class DesktopSession(_WireModel):
     permission_mode: str | None
 
 
-class DesktopSessionRoster(_WireModel):
-    # Advertise the public name to MCP while accepting Desktop's wire name.
-    sessions: list[DesktopSession] = Field(validation_alias=AliasChoices("chats", "sessions"), serialization_alias="chats")
+class DesktopChatList(_WireModel):
+    chats: list[DesktopChat]
     archived_pending: bool
 
 
 class DesktopMutation(_WireModel):
-    session: DesktopSession | None = Field(validation_alias=AliasChoices("chat", "session"), serialization_alias="chat")
+    chat: DesktopChat | None
     notice: str | None = None
 
 
@@ -202,8 +201,8 @@ class InvalidRequest:
 
 type DesktopResult[T: _WireModel] = Success[T] | Refused | DesktopFailure | Unavailable | TimedOut | InvalidResponse | InvalidRequest
 type _Response[T: _WireModel] = Annotated[Success[T] | Refused | DesktopFailure, Field(discriminator="status")]
-_ROSTER_RESPONSE = RootModel[_Response[DesktopSessionRoster]]
-_SESSION_RESPONSE = RootModel[_Response[DesktopSession]]
+_CHAT_LIST_RESPONSE = RootModel[_Response[DesktopChatList]]
+_CHAT_RESPONSE = RootModel[_Response[DesktopChat]]
 _MUTATION_RESPONSE = RootModel[_Response[DesktopMutation]]
 
 
@@ -214,15 +213,15 @@ class DesktopControl:
         self._runtime_directory = runtime_directory
         self._timeout = timeout
 
-    def list_sessions(self) -> DesktopResult[DesktopSessionRoster]:
-        return self._request(_ListSessions(tool="getSessionList", input=_WireModel()), _ROSTER_RESPONSE)
+    def list_chats(self) -> DesktopResult[DesktopChatList]:
+        return self._request(_ListSessions(tool="getSessionList", input=_WireModel()), _CHAT_LIST_RESPONSE)
 
-    def get_session(self, chat_id: str) -> DesktopResult[DesktopSession]:
+    def get_chat(self, chat_id: str) -> DesktopResult[DesktopChat]:
         try:
             request = _GetSession(tool="getSession", input=_ChatInput(chat_id=chat_id))
         except ValidationError as error:
             return _invalid_request(error)
-        result = self._request(request, _SESSION_RESPONSE)
+        result = self._request(request, _CHAT_RESPONSE)
         if isinstance(result, Success) and result.result.chat_id != chat_id:
             return InvalidResponse("Desktop returned a different chat than requested.")
         return result
@@ -232,7 +231,7 @@ class DesktopControl:
             tool="toggleRemoteControl", input=_EnabledInput(chat_id=chat_id, enabled=enabled),
         ))
 
-    def warm_session(self, chat_id: str) -> DesktopResult[DesktopMutation]:
+    def warm_chat(self, chat_id: str) -> DesktopResult[DesktopMutation]:
         return self._mutate(lambda: _WarmSession(tool="warmSession", input=_ChatInput(chat_id=chat_id)))
 
     def set_model(self, chat_id: str, model: str) -> DesktopResult[DesktopMutation]:
@@ -270,8 +269,8 @@ class DesktopControl:
             return _invalid_request(error)
         result = self._request(request, _MUTATION_RESPONSE)
         if isinstance(result, Success):
-            session = result.result.session
-            if session is not None and session.chat_id != request.input.chat_id:
+            chat = result.result.chat
+            if chat is not None and chat.chat_id != request.input.chat_id:
                 return InvalidResponse("Desktop returned a different chat than requested.")
         return result
 
@@ -298,7 +297,7 @@ class DesktopControl:
         except (FileNotFoundError, ConnectionRefusedError, PermissionError):
             return Unavailable("Claude Desktop's private socket is unavailable.")
         except TimeoutError:
-            return TimedOut("Desktop socket timed out. Check the current session state before retrying.")
+            return TimedOut("Desktop socket timed out. Check the current chat state before retrying.")
         except OSError:
             return DesktopFailure(reason="The Desktop socket exchange failed.")
         if isinstance(frame, InvalidResponse):

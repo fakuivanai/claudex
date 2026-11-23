@@ -17,8 +17,8 @@ from desktop_control import (
     PermissionMode,
     Success,
     DesktopMutation,
-    DesktopSession,
-    DesktopSessionRoster,
+    DesktopChat,
+    DesktopChatList,
 )
 from models import CodexChatId, Provider, parse_codex_chat_id
 
@@ -43,7 +43,7 @@ class Arguments(argparse.Namespace):
 
 
 type Result = (
-    DesktopSessionRoster | DesktopSession | DesktopMutation |
+    DesktopChatList | DesktopChat | DesktopMutation |
     codex_history.ChatPage | codex_history.ChatHistory | codex_desktop.ChatStatus
 )
 
@@ -119,16 +119,16 @@ def parser() -> argparse.ArgumentParser:
 
 def desktop_result(
     args: Arguments, control: DesktopControl,
-) -> DesktopResult[DesktopSessionRoster] | DesktopResult[DesktopSession] | DesktopResult[DesktopMutation]:
+) -> DesktopResult[DesktopChatList] | DesktopResult[DesktopChat] | DesktopResult[DesktopMutation]:
     match args.command:
         case "chats":
-            return control.list_sessions()
+            return control.list_chats()
         case "chat":
-            return control.get_session(args.chat_id)
+            return control.get_chat(args.chat_id)
         case "remote-control":
             return control.set_remote_control(args.chat_id, args.state == "on")
         case "wake":
-            return control.warm_session(args.chat_id)
+            return control.warm_chat(args.chat_id)
         case "model":
             return control.set_model(args.chat_id, args.model)
         case "effort":
@@ -171,21 +171,21 @@ def printable(text: str, *, multiline: bool = False) -> str:
     return "".join(char if char.isprintable() or (multiline and char == "\n") else " " for char in text)
 
 
-def print_session(session: DesktopSession, *, include_settings: bool = False) -> None:
-    saved = {True: "on", False: "off", None: "unset"}[session.remote_control_saved]
-    running = "yes" if session.running else "no"
-    archived = "yes" if session.archived else "no"
-    worker = "warm" if session.warm else "cold"
-    title = printable(session.title or "Untitled")
+def print_desktop_chat(chat: DesktopChat, *, include_settings: bool = False) -> None:
+    saved = {True: "on", False: "off", None: "unset"}[chat.remote_control_saved]
+    running = "yes" if chat.running else "no"
+    archived = "yes" if chat.archived else "no"
+    worker = "warm" if chat.warm else "cold"
+    title = printable(chat.title or "Untitled")
     print(
-        f"{session.chat_id}  {title}  worker {worker}, running {running}, archived {archived}, "
-        f"Remote Control {session.remote_control}, saved {saved}"
+        f"{chat.chat_id}  {title}  worker {worker}, running {running}, archived {archived}, "
+        f"Remote Control {chat.remote_control}, saved {saved}"
     )
     if include_settings:
-        fast = {True: "on", False: "off", None: "unset"}[session.fast_mode]
+        fast = {True: "on", False: "off", None: "unset"}[chat.fast_mode]
         print(
-            f"Model {printable(session.model or 'unset')}, effort {printable(session.effort or 'default')}, "
-            f"fast mode {fast}, permissions {printable(session.permission_mode or 'unset')}"
+            f"Model {printable(chat.model or 'unset')}, effort {printable(chat.effort or 'default')}, "
+            f"fast mode {fast}, permissions {printable(chat.permission_mode or 'unset')}"
         )
 
 
@@ -203,23 +203,23 @@ def print_result(result: Result, as_json: bool) -> None:
     match result:
         case codex_history.ChatPage() | codex_history.ChatHistory() | codex_desktop.ChatStatus() if as_json:
             print(json.dumps(result.to_wire()))
-        case DesktopSessionRoster() | DesktopSession() | DesktopMutation() if as_json:
-            print(result.model_dump_json(by_alias=True))
-        case DesktopSessionRoster():
-            if not result.sessions:
+        case DesktopChatList() | DesktopChat() | DesktopMutation() if as_json:
+            print(result.model_dump_json())
+        case DesktopChatList():
+            if not result.chats:
                 print("No Claude Desktop chats in the loaded roster.")
-            for session in result.sessions:
-                print_session(session)
+            for desktop_chat in result.chats:
+                print_desktop_chat(desktop_chat)
             if result.archived_pending:
                 print("Claude Desktop has more archived chats to load.")
-        case DesktopSession():
-            print_session(result, include_settings=True)
+        case DesktopChat():
+            print_desktop_chat(result, include_settings=True)
         case DesktopMutation():
-            if result.session is not None:
-                print_session(result.session, include_settings=True)
+            if result.chat is not None:
+                print_desktop_chat(result.chat, include_settings=True)
             if result.notice:
                 print(printable(result.notice))
-            elif result.session is None:
+            elif result.chat is None:
                 print("Claude Desktop accepted the request.")
         case codex_history.ChatPage():
             if not result.chats:

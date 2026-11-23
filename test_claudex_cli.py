@@ -9,7 +9,7 @@ from unittest.mock import patch
 import claudex
 import codex_desktop
 import codex_history
-from desktop_control import DesktopMutation, DesktopSession, DesktopSessionRoster, Refused, Success
+from desktop_control import DesktopMutation, DesktopChat, DesktopChatList, Refused, Success
 from models import parse_codex_chat_id
 
 
@@ -29,14 +29,14 @@ class ClaudeCommands(unittest.TestCase):
         client = patch("claudex_cli.DesktopControl", autospec=True)
         self.control = client.start().return_value
         self.addCleanup(client.stop)
-        self.session = DesktopSession(
+        self.chat = DesktopChat(
             chat_id=CLAUDE_ID, title="Local\x1b chat", running=False, archived=False, warm=False,
             remote_control="off", remote_control_saved=True, model="default", effort=None,
             permission_mode="default", fast_mode=False,
         )
 
     def test_lists_saved_state_and_deferred_archives(self) -> None:
-        self.control.list_sessions.return_value = Success(result=DesktopSessionRoster(sessions=[self.session], archived_pending=True))
+        self.control.list_chats.return_value = Success(result=DesktopChatList(chats=[self.chat], archived_pending=True))
 
         status, output, errors = invoke("claude", "chats")
         self.assertEqual((status, errors), (0, ""))
@@ -50,17 +50,17 @@ class ClaudeCommands(unittest.TestCase):
         self.assertIs(json.loads(output)["chats"][0]["remote_control_saved"], True)
 
     def test_reads_a_single_chat_by_exact_id(self) -> None:
-        self.control.get_session.return_value = Success(result=self.session)
+        self.control.get_chat.return_value = Success(result=self.chat)
         status, output, errors = invoke("claude", "chat", CLAUDE_ID, "--json")
         self.assertEqual((status, errors), (0, ""))
         self.assertEqual(json.loads(output)["chat_id"], CLAUDE_ID)
-        self.control.get_session.assert_called_once_with(CLAUDE_ID)
+        self.control.get_chat.assert_called_once_with(CLAUDE_ID)
 
     def test_every_mutation_accepts_json_and_delegates_once(self) -> None:
         cases = (
             ("remote-control", ("on",), "set_remote_control", (True,)),
             ("remote-control", ("off",), "set_remote_control", (False,)),
-            ("wake", (), "warm_session", ()),
+            ("wake", (), "warm_chat", ()),
             ("model", ("sonnet",), "set_model", ("sonnet",)),
             ("effort", ("high",), "set_effort", ("high",)),
             ("effort", ("default",), "set_effort", (None,)),
@@ -75,7 +75,7 @@ class ClaudeCommands(unittest.TestCase):
             with self.subTest(command=command, arguments=arguments):
                 self.control.reset_mock()
                 method = getattr(self.control, method_name)
-                method.return_value = Success(result=DesktopMutation(session=self.session, notice=None))
+                method.return_value = Success(result=DesktopMutation(chat=self.chat, notice=None))
                 status, output, errors = invoke("claude", command, CLAUDE_ID, *arguments, "--json")
                 self.assertEqual((status, errors), (0, ""))
                 self.assertEqual(json.loads(output)["chat"]["chat_id"], CLAUDE_ID)

@@ -89,10 +89,10 @@ def notify(target: ClaudeChatId, message_id: str, *, sender: Sender, control: De
     if live is not None:
         return AttemptedNotice(claude_desktop.submit_notice(live, message_id, sender), opened_saved_chat=False)
 
-    warmed = control.warm_session(target)
+    warmed = control.warm_chat(target)
     if not isinstance(warmed, Success):
         return StoredNotice(warmed.reason)
-    if warmed.result.session is None or not warmed.result.session.warm:
+    if warmed.result.chat is None or not warmed.result.chat.warm:
         return StoredNotice(warmed.result.notice or "Desktop did not start a worker for this chat.")
     live = wait_for_inbox(target)
     if live is None:

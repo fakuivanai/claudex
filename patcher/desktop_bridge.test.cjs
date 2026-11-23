@@ -69,17 +69,17 @@ function fixture() {
   return { api, manager, native, calls, dispatch, run };
 }
 
-test("projects only this scope's local sessions and keeps URLs private", async () => {
+test("projects only this scope's local chats and keeps URLs private", async () => {
   const { native, manager, dispatch } = fixture();
   manager.sessions.set(other, { ...native.row, sessionId: other, homeTenancy: { ...scope, orgId: "other" } });
   native.row.bridgeSessionUrl = "private URL";
   const response = await dispatch({ tool: "getSessionList", input: {} });
   assert.equal(response.status, "ok");
   assert.equal(response.result.archived_pending, true);
-  assert.equal(response.result.sessions.length, 1);
-  assert.equal(response.result.sessions[0].chat_id, id);
-  assert.equal(response.result.sessions[0].remote_control, "on");
-  assert.equal(response.result.sessions[0].remote_control_saved, false);
+  assert.equal(response.result.chats.length, 1);
+  assert.equal(response.result.chats[0].chat_id, id);
+  assert.equal(response.result.chats[0].remote_control, "on");
+  assert.equal(response.result.chats[0].remote_control_saved, false);
   assert.doesNotMatch(JSON.stringify(response), /private URL/);
 });
 
@@ -87,13 +87,13 @@ test("forwards warm and cold toggles to the exact native methods", async () => {
   const { run, calls } = fixture();
   const on = await run("toggleRemoteControl", { enabled: true });
   assert.deepEqual(calls, [["toggle", id, true], ["warm", id], ["toggle", id, true]]);
-  assert.equal(on.result.session.remote_control, "on");
-  assert.equal(on.result.session.remote_control_saved, true);
-  assert.equal(on.result.session.warm, true);
+  assert.equal(on.result.chat.remote_control, "on");
+  assert.equal(on.result.chat.remote_control_saved, true);
+  assert.equal(on.result.chat.warm, true);
   const off = await run("toggleRemoteControl", { enabled: false });
   assert.deepEqual(calls.at(-1), ["toggle", id, false]);
-  assert.equal(off.result.session.remote_control, "off");
-  assert.equal(off.result.session.remote_control_saved, false);
+  assert.equal(off.result.chat.remote_control, "off");
+  assert.equal(off.result.chat.remote_control_saved, false);
 });
 
 test("recognizes an auto-attached worker and reports a missing worker separately", async () => {
@@ -105,8 +105,8 @@ test("recognizes an auto-attached worker and reports a missing worker separately
 
   native.row.remoteControlUserEnabled = true;
   const pending = await run("toggleRemoteControl", { enabled: true });
-  assert.equal(pending.result.session.remote_control_saved, true);
-  assert.equal(pending.result.session.remote_control, "off");
+  assert.equal(pending.result.chat.remote_control_saved, true);
+  assert.equal(pending.result.chat.remote_control, "off");
   assert.match(pending.result.notice, /did not start a worker/);
   assert.deepEqual(calls, [["toggle", id, true], ["toggle", id, true]]);
 
@@ -115,7 +115,7 @@ test("recognizes an auto-attached worker and reports a missing worker separately
     native.row.bridgeSessionUrl = "private URL";
   };
   const on = await run("toggleRemoteControl", { enabled: true });
-  assert.equal(on.result.session.remote_control, "on");
+  assert.equal(on.result.chat.remote_control, "on");
   assert.deepEqual(calls, [["toggle", id, true], ["toggle", id, true], ["toggle", id, true]]);
 });
 
@@ -173,9 +173,9 @@ test("keeps permission changes at or below Desktop's effective mode", async () =
 test("calls native archive and unarchive without requesting worktree cleanup", async () => {
   const { run, calls } = fixture();
   const archived = await run("archive");
-  assert.equal(archived.result.session.archived, true);
+  assert.equal(archived.result.chat.archived, true);
   assert.equal((await run("toggleRemoteControl", { enabled: true })).status, "refused");
   const unarchived = await run("unarchive");
-  assert.equal(unarchived.result.session.archived, false);
+  assert.equal(unarchived.result.chat.archived, false);
   assert.deepEqual(calls, [["archive", id, { cleanupWorktree: false }], ["unarchive", id]]);
 });

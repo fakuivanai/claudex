@@ -7,7 +7,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import claude_desktop
 from claude_desktop import ClaudeChat, LiveChat, Liveness, NoticeStatus, WorkerStatus
-from desktop_control import DesktopControl, DesktopMutation, DesktopSession, Success, Unavailable
+from desktop_control import DesktopControl, DesktopMutation, DesktopChat, Success, Unavailable
 from models import Provider, Sender, parse_claude_chat_id
 import claude_lifecycle
 
@@ -28,8 +28,8 @@ class LifecycleTest(unittest.TestCase):
         self.launcher = self.enterContext(patch.object(claude_lifecycle, "launch"))
         self.lookup = self.enterContext(patch.object(claude_lifecycle, "wait_for_inbox"))
         self.control = create_autospec(DesktopControl, instance=True)
-        self.control.warm_session.return_value = Success(result=DesktopMutation(
-            session=DesktopSession(
+        self.control.warm_chat.return_value = Success(result=DesktopMutation(
+            chat=DesktopChat(
                 chat_id=TARGET, title="Fixture chat", running=False, archived=False, warm=True,
                 remote_control="off", remote_control_saved=None, model=None, effort=None,
                 fast_mode=None, permission_mode=None,
@@ -44,20 +44,20 @@ class LifecycleTest(unittest.TestCase):
         self.lookup.return_value = MARKER
         self.notice.return_value = NoticeStatus.SUBMITTED
         self.assertEqual(self.notify(), claude_lifecycle.AttemptedNotice(NoticeStatus.SUBMITTED, False))
-        self.control.warm_session.assert_not_called()
+        self.control.warm_chat.assert_not_called()
         self.launcher.assert_not_called()
 
     def test_notify_warms_exact_chat_through_socket_then_uses_inbox(self) -> None:
         self.lookup.side_effect = [None, MARKER]
         self.notice.return_value = NoticeStatus.SUBMITTED
         self.assertEqual(self.notify(), claude_lifecycle.AttemptedNotice(NoticeStatus.SUBMITTED, True))
-        self.control.warm_session.assert_called_once_with(TARGET)
+        self.control.warm_chat.assert_called_once_with(TARGET)
         self.notice.assert_called_once_with(MARKER, "message", SENDER)
         self.launcher.assert_not_called()
 
     def test_socket_unavailable_is_reported_without_deep_link(self) -> None:
         self.lookup.return_value = None
-        self.control.warm_session.return_value = Unavailable(reason="Desktop socket unavailable.")
+        self.control.warm_chat.return_value = Unavailable(reason="Desktop socket unavailable.")
         self.assertEqual(self.notify(), claude_lifecycle.StoredNotice("Desktop socket unavailable."))
         self.launcher.assert_not_called()
 

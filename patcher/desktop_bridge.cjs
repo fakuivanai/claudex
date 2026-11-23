@@ -3,7 +3,7 @@
 const refusal = (reason) => ({ status: "refused", reason });
 const failure = (reason) => ({ status: "error", reason });
 const success = (result) => ({ status: "ok", result });
-const SCOPE_CHANGED = failure("The active Desktop account or session roster changed during the request.");
+const SCOPE_CHANGED = failure("The active Desktop account or chat roster changed during the request.");
 const ROSTER_UNAVAILABLE = failure("The active Desktop roster is unavailable.");
 const SESSION_UNAVAILABLE = refusal("The chat is unavailable in the active account and organization.");
 
@@ -36,7 +36,7 @@ function ownsLocalChat(chat, scope) {
     !chat.prewarmHidden && !chat.movedToCloud;
 }
 
-function projectSession(row, chat) {
+function projectChat(row, chat) {
   let remoteControl = "off";
   if (row.bridgeSessionUrl) remoteControl = "on";
   else if (row.remoteControlConnecting) remoteControl = "connecting";
@@ -97,13 +97,13 @@ function createDesktopBridge(api, manager, { account, windowActive = () => true 
       if (!Array.isArray(roster.sessions) || typeof roster.archivedPending !== "boolean") {
         return ROSTER_UNAVAILABLE;
       }
-      const sessions = [];
+      const chats = [];
       for (const row of roster.sessions) {
         if (typeof row?.sessionId !== "string" || !LOCAL_CHAT_ID.test(row.sessionId) || row.isCloudRun) continue;
         const chat = manager.sessions.get(row.sessionId);
-        if (ownsLocalChat(chat, scope)) sessions.push(projectSession(row, chat));
+        if (ownsLocalChat(chat, scope)) chats.push(projectChat(row, chat));
       }
-      return success({ sessions, archived_pending: roster.archivedPending });
+      return success({ chats, archived_pending: roster.archivedPending });
     }
 
     // Native getSession loads a deferred archived row when needed. Validate
@@ -115,7 +115,7 @@ function createDesktopBridge(api, manager, { account, windowActive = () => true 
     if (row?.sessionId !== id || row.isCloudRun || !ownsLocalChat(chat, scope)) return SESSION_UNAVAILABLE;
     const ownsTarget = () => current() && manager.sessions.get(id) === chat && ownsLocalChat(chat, scope);
 
-    if (request.tool === "getSession") return success(projectSession(row, chat));
+    if (request.tool === "getSession") return success(projectChat(row, chat));
     if (chat.isArchived && request.tool !== "unarchive" && request.tool !== "archive") {
       return refusal("Unarchive this chat before changing it.");
     }
@@ -175,7 +175,7 @@ function createDesktopBridge(api, manager, { account, windowActive = () => true 
         if (!canSetMode(currentMode, mode)) {
           return refusal("Changing to that permission mode requires Desktop's window.");
         }
-        if (chat.permissionMode === mode) return success({ session: projectSession(row, chat) });
+        if (chat.permissionMode === mode) return success({ chat: projectChat(row, chat) });
         if (!await api.setPermissionMode(id, mode)) {
           return refusal("Desktop declined the permission mode change.");
         }
@@ -200,15 +200,15 @@ function createDesktopBridge(api, manager, { account, windowActive = () => true 
     if (!ownsTarget()) return SCOPE_CHANGED;
     const updated = await api.getSession(id);
     if (!ownsTarget()) return SCOPE_CHANGED;
-    const session = updated?.sessionId === id ? projectSession(updated, chat) : null;
+    const resultChat = updated?.sessionId === id ? projectChat(updated, chat) : null;
     if (request.tool === "toggleRemoteControl" && request.input.enabled &&
-        session?.remote_control !== "on" && !notice) {
+        resultChat?.remote_control !== "on" && !notice) {
       notice = "Desktop accepted the toggle. The chat does not have a confirmed Remote Control connection.";
     }
-    if (request.tool === "setFastMode" && session?.fast_mode !== request.input.enabled) {
+    if (request.tool === "setFastMode" && resultChat?.fast_mode !== request.input.enabled) {
       notice = "Desktop has not applied the requested fast mode to the current worker.";
     }
-    return success(notice ? { session, notice } : { session });
+    return success(notice ? { chat: resultChat, notice } : { chat: resultChat });
   };
 }
 

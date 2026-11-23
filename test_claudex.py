@@ -12,7 +12,7 @@ from mcp.types import RequestParams
 
 from claudex import Bridge, codex_sender, server
 from claude_lifecycle import StoredNotice
-from desktop_control import DesktopControl, DesktopMutation, DesktopSession, DesktopSessionRoster, Success
+from desktop_control import DesktopControl, DesktopMutation, DesktopChat, DesktopChatList, Success
 from models import Provider, Sender
 from peer_mailbox import Mailbox
 
@@ -28,7 +28,7 @@ class BridgeTest(unittest.TestCase):
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.control = create_autospec(DesktopControl, instance=True)
-        self.control.get_session.return_value = Success(result=DesktopSession(
+        self.control.get_chat.return_value = Success(result=DesktopChat(
             chat_id=CLAUDE_CHAT, title="Claude review", running=False, archived=False, warm=False,
             remote_control="off", remote_control_saved=None, model=None, effort=None,
             fast_mode=None, permission_mode=None,
@@ -86,8 +86,8 @@ class BridgeTest(unittest.TestCase):
 class StdioTest(unittest.IsolatedAsyncioTestCase):
     async def test_chat_results_match_the_mcp_output_schemas(self) -> None:
         control = create_autospec(DesktopControl, instance=True)
-        control.list_sessions.return_value = Success(result=DesktopSessionRoster(sessions=[], archived_pending=False))
-        control.warm_session.return_value = Success(result=DesktopMutation(session=None, notice="Fixture worker"))
+        control.list_chats.return_value = Success(result=DesktopChatList(chats=[], archived_pending=False))
+        control.warm_chat.return_value = Success(result=DesktopMutation(chat=None, notice="Fixture worker"))
         with TemporaryDirectory() as directory:
             application = server(Bridge(Provider.CLAUDE, Mailbox(Path(directory) / "mail.sqlite"), control))
             async with create_connected_server_and_client_session(application) as session:

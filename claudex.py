@@ -19,7 +19,7 @@ import claudex_cli
 import codex_desktop
 import codex_history
 from desktop_control import (
-    DesktopControl, DesktopMutation, DesktopResult, DesktopSession, DesktopSessionRoster,
+    DesktopControl, DesktopMutation, DesktopResult, DesktopChat, DesktopChatList,
     Effort, PermissionMode, Success,
 )
 from models import MessageText, PeerMessage, Provider, Sender, message_text, parse_claude_chat_id, parse_codex_chat_id
@@ -69,7 +69,7 @@ class SendReceipt:
     delivery: Delivery
 
 
-def desktop_value[T: (DesktopSessionRoster, DesktopSession, DesktopMutation)](result: DesktopResult[T]) -> T:
+def desktop_value[T: (DesktopChatList, DesktopChat, DesktopMutation)](result: DesktopResult[T]) -> T:
     if isinstance(result, Success):
         return result.result
     raise ToolError(f"{result.status}: {result.reason}")
@@ -93,7 +93,7 @@ class Bridge:
             return SendReceipt(message, codex_desktop.deliver(parse_codex_chat_id(target), message))
 
         saved = parse_claude_chat_id(target)
-        if desktop_value(self.desktop.get_session(saved)).archived:
+        if desktop_value(self.desktop.get_chat(saved)).archived:
             raise ValueError("No saved, unarchived Claude Desktop chat matches that ID.")
         self.mailbox.store(saved, message)
         try:
@@ -159,14 +159,14 @@ def server(bridge: Bridge) -> FastMCP[None]:
     control = bridge.desktop
 
     @application.tool(annotations=READ_ONLY)
-    def claude_list_chats() -> DesktopSessionRoster:
+    def claude_list_chats() -> DesktopChatList:
         """List Claude Desktop chats in the active account with Remote Control status and saved settings."""
-        return desktop_value(control.list_sessions())
+        return desktop_value(control.list_chats())
 
     @application.tool(annotations=READ_ONLY)
-    def claude_get_chat(chat_id: str) -> DesktopSession:
+    def claude_get_chat(chat_id: str) -> DesktopChat:
         """Read Claude Desktop status and settings for a chat by exact ID."""
-        return desktop_value(control.get_session(chat_id))
+        return desktop_value(control.get_chat(chat_id))
 
     @application.tool(annotations=LOCAL_CHANGE)
     def claude_set_remote_control(chat_id: str, enabled: bool) -> DesktopMutation:
@@ -176,7 +176,7 @@ def server(bridge: Bridge) -> FastMCP[None]:
     @application.tool(annotations=LOCAL_CHANGE)
     def claude_wake_chat(chat_id: str) -> DesktopMutation:
         """Start the Claude Desktop worker for a saved chat without sending a message."""
-        return desktop_value(control.warm_session(chat_id))
+        return desktop_value(control.warm_chat(chat_id))
 
     @application.tool(annotations=LOCAL_CHANGE)
     def claude_set_model(chat_id: str, model: str) -> DesktopMutation:

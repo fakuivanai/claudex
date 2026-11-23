@@ -66,25 +66,25 @@ class DesktopControlTests(unittest.TestCase):
                 self.endpoint.unlink()
 
     def test_typed_roster_and_session_use_the_window_method_names(self) -> None:
-        with self.reply(frame({"status": "ok", "result": {"sessions": [_ROW], "archived_pending": True}})) as request:
-            result = self.desktop.list_sessions()
+        with self.reply(frame({"status": "ok", "result": {"chats": [_ROW], "archived_pending": True}})) as request:
+            result = self.desktop.list_chats()
             assert isinstance(result, Success)
             roster = result.result
             self.assertTrue(roster.archived_pending)
-            self.assertEqual(len(roster.sessions), 1)
-            self.assertEqual(roster.sessions[0].model_dump(), _ROW)
+            self.assertEqual(len(roster.chats), 1)
+            self.assertEqual(roster.chats[0].model_dump(), _ROW)
             self.assertEqual(json.loads(request.result(3)), {"tool": "getSessionList", "input": {}})
         with self.reply(frame({"status": "ok", "result": _ROW})) as request:
-            session = self.desktop.get_session(_CHAT_ID)
-            assert isinstance(session, Success)
-            self.assertEqual(session.result.model_dump(), _ROW)
+            chat = self.desktop.get_chat(_CHAT_ID)
+            assert isinstance(chat, Success)
+            self.assertEqual(chat.result.model_dump(), _ROW)
             self.assertEqual(json.loads(request.result(3)), {"tool": "getSession", "input": {"chat_id": _CHAT_ID}})
 
     def test_each_mutation_sends_its_native_method_and_payload(self) -> None:
         cases: list[tuple[str, dict[str, object], Callable[[], DesktopResult[DesktopMutation]]]] = [
             ("toggleRemoteControl", {"enabled": True}, lambda: self.desktop.set_remote_control(_CHAT_ID, True)),
             ("toggleRemoteControl", {"enabled": False}, lambda: self.desktop.set_remote_control(_CHAT_ID, False)),
-            ("warmSession", {}, lambda: self.desktop.warm_session(_CHAT_ID)),
+            ("warmSession", {}, lambda: self.desktop.warm_chat(_CHAT_ID)),
             ("setModel", {"model": "sonnet"}, lambda: self.desktop.set_model(_CHAT_ID, "sonnet")),
             ("setEffort", {"effort": "low"}, lambda: self.desktop.set_effort(_CHAT_ID, "low")),
             ("setEffort", {"effort": None}, lambda: self.desktop.set_effort(_CHAT_ID, None)),
@@ -97,11 +97,11 @@ class DesktopControlTests(unittest.TestCase):
         ]
         for tool, fields, call in cases:
             with self.subTest(tool=tool, **fields), self.reply(
-                frame({"status": "ok", "result": {"session": _ROW, "notice": "Example notice"}}),
+                frame({"status": "ok", "result": {"chat": _ROW, "notice": "Example notice"}}),
             ) as request:
                 result = call()
                 assert isinstance(result, Success)
-                self.assertIsNotNone(result.result.session)
+                self.assertIsNotNone(result.result.chat)
                 self.assertEqual(result.result.notice, "Example notice")
                 self.assertEqual(json.loads(request.result(3)), {
                     "tool": tool,
@@ -112,25 +112,25 @@ class DesktopControlTests(unittest.TestCase):
         with self.reply(frame({"status": "refused", "reason": "Raising permission mode requires Desktop."})):
             result = self.desktop.set_permission_mode(_CHAT_ID, "bypassPermissions")
             self.assertEqual(result, Refused(reason="Raising permission mode requires Desktop."))
-        with self.reply(frame({"status": "error", "reason": "Claude's session roster changed."})):
-            failure = self.desktop.get_session(_CHAT_ID)
-            self.assertEqual(failure, DesktopFailure(reason="Claude's session roster changed."))
+        with self.reply(frame({"status": "error", "reason": "Claude's chat roster changed."})):
+            failure = self.desktop.get_chat(_CHAT_ID)
+            self.assertEqual(failure, DesktopFailure(reason="Claude's chat roster changed."))
 
     def test_disallows_unexpected_response_fields_and_chat_id_mismatches(self) -> None:
         with self.reply(frame({"status": "ok", "result": {**_ROW, "bridge_url": "private"}})):
-            self.assertEqual(self.desktop.get_session(_CHAT_ID), InvalidResponse("Desktop returned an invalid response."))
-        with self.reply(frame({"status": "ok", "result": {"session": {**_ROW, "chat_id": _OTHER_CHAT_ID}}})):
+            self.assertEqual(self.desktop.get_chat(_CHAT_ID), InvalidResponse("Desktop returned an invalid response."))
+        with self.reply(frame({"status": "ok", "result": {"chat": {**_ROW, "chat_id": _OTHER_CHAT_ID}}})):
             self.assertEqual(
-                self.desktop.warm_session(_CHAT_ID), InvalidResponse("Desktop returned a different chat than requested."),
+                self.desktop.warm_chat(_CHAT_ID), InvalidResponse("Desktop returned a different chat than requested."),
             )
         with self.reply(frame({"status": "ok", "result": _ROW}) * 2):
             self.assertEqual(
-                self.desktop.get_session(_CHAT_ID), InvalidResponse("Desktop returned an invalid response frame."),
+                self.desktop.get_chat(_CHAT_ID), InvalidResponse("Desktop returned an invalid response frame."),
             )
 
     def test_rejects_malformed_arguments_before_connecting(self) -> None:
         for invalid in (_CHAT_ID.upper(), _CHAT_ID + "\n", "local_missing"):
-            self.assertIsInstance(self.desktop.get_session(invalid), InvalidRequest)
+            self.assertIsInstance(self.desktop.get_chat(invalid), InvalidRequest)
         self.assertIsInstance(self.desktop.set_remote_control(_CHAT_ID, cast(bool, "true")), InvalidRequest)
 
     def test_model_id_rejects_surrogates_and_preserves_astral_characters(self) -> None:
@@ -140,16 +140,16 @@ class DesktopControlTests(unittest.TestCase):
             self.assertIn("Unicode surrogate characters", result.reason)
 
         model = "model-\U00010000"
-        with self.reply(frame({"status": "ok", "result": {"session": _ROW}})) as request:
+        with self.reply(frame({"status": "ok", "result": {"chat": _ROW}})) as request:
             self.assertIsInstance(self.desktop.set_model(_CHAT_ID, model), Success)
             self.assertEqual(json.loads(request.result(3))["input"]["model"], model)
 
     def test_reports_an_unavailable_socket_and_a_timeout_separately(self) -> None:
-        self.assertIsInstance(self.desktop.list_sessions(), Unavailable)
+        self.assertIsInstance(self.desktop.list_chats(), Unavailable)
         release = Event()
         with self.reply(b"", release):
             try:
-                self.assertIsInstance(DesktopControl(self.runtime, timeout=0.05).list_sessions(), TimedOut)
+                self.assertIsInstance(DesktopControl(self.runtime, timeout=0.05).list_chats(), TimedOut)
             finally:
                 release.set()
 
