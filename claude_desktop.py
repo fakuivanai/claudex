@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from enum import StrEnum
 import json
+import logging
 import os
 from pathlib import Path
 import socket
@@ -23,10 +24,16 @@ MAX_HISTORY_TEXT = 4000
 NOTICE_ESCAPES = str.maketrans({"<": "\\u003c", ">": "\\u003e", "&": "\\u0026", "[": "\\u005b", "]": "\\u005d"})
 
 DesktopId = Annotated[ClaudeChatId, BeforeValidator(parse_claude_chat_id)]
+MACHINE_ID_PATH = Path("/etc/machine-id")
+LOGGER = logging.getLogger(__name__)
 
 
 class ClaudeDesktopError(RuntimeError):
     pass
+
+
+class ClaudeRecordError(ClaudeDesktopError):
+    """A native session record could not be read or did not match the pinned format."""
 
 
 class Liveness(StrEnum):
@@ -100,8 +107,9 @@ class ClaudeHistory:
     messages: tuple[HistoryMessage, ...]
 
 
-@dataclass(frozen=True)
-class SavedChat:
+class SavedChat(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True)
+
     id: Annotated[DesktopId, Field(alias="sessionId")]
     archived: Annotated[bool, Field(alias="isArchived")]
     backend_id: Annotated[UUIDText | None, Field(alias="cliSessionId")] = None
@@ -109,8 +117,9 @@ class SavedChat:
     title: str | None = None
 
 
-@dataclass(frozen=True)
-class RuntimeMarker:
+class RuntimeMarker(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True)
+
     entrypoint: Literal["claude-desktop"]
     kind: Literal["interactive"]
     id: Annotated[DesktopId, Field(alias="hostSessionId")]
@@ -122,16 +131,27 @@ class RuntimeMarker:
     name: str | None = None
 
 
-SAVED_CHAT = TypeAdapter(SavedChat)
-RUNTIME_MARKER = TypeAdapter(RuntimeMarker)
+RECORD = TypeAdapter(dict[str, object])
 Record = TypeVar("Record", SavedChat, RuntimeMarker)
 
 
-def read_record(path: Path, schema: TypeAdapter[Record]) -> Record | None:
+def read_record(path: Path) -> dict[str, object] | None:
     try:
-        return schema.validate_json(path.read_bytes(), strict=True)
-    except (OSError, ValidationError):
+        return RECORD.validate_json(path.read_bytes(), strict=True)
+    except FileNotFoundError:
+        # Claude can remove a worker marker between the directory scan and read.
         return None
+    except OSError as error:
+        raise ClaudeRecordError(f"Could not read Claude record {path.name}") from error
+    except ValidationError:
+        raise ClaudeRecordError(f"Claude record {path.name} is not a valid JSON object") from None
+
+
+def parse_record(path: Path, raw: dict[str, object], schema: type[Record]) -> Record:
+    try:
+        return schema.model_validate(raw)
+    except ValidationError:
+        raise ClaudeRecordError(f"Claude record {path.name} does not match the supported {schema.__name__} format") from None
 
 
 def saved_records(target: ClaudeChatId, *, include_archived: bool = False) -> list[SavedChat]:
@@ -139,8 +159,13 @@ def saved_records(target: ClaudeChatId, *, include_archived: bool = False) -> li
     registry = config / "Claude" / "claude-code-sessions"
     records: list[SavedChat] = []
     for path in registry.glob(f"*/*/{target}.json"):
-        record = read_record(path, SAVED_CHAT)
-        if record is not None and record.id == target and (include_archived or not record.archived):
+        raw = read_record(path)
+        if raw is None:
+            continue
+        record = parse_record(path, raw, SavedChat)
+        if record.id != target:
+            raise ClaudeRecordError(f"Claude record {path.name} contains a different chat ID")
+        if include_archived or not record.archived:
             records.append(record)
     return records
 
@@ -157,9 +182,12 @@ def _live_title(marker: RuntimeMarker) -> str | None:
 
 
 def _matching_chat(path: Path, machine: str, namespace: str) -> LiveChat | None:
-    marker = read_record(path, RUNTIME_MARKER)
-    if marker is None or path.stem != str(marker.process_id):
+    raw = read_record(path)
+    if raw is None or raw.get("entrypoint") != "claude-desktop" or raw.get("kind") != "interactive":
         return None
+    marker = parse_record(path, raw, RuntimeMarker)
+    if path.stem != str(marker.process_id):
+        raise ClaudeRecordError(f"Claude worker record {path.name} contains a different process ID")
     host_domain = f"linux:{machine}:"
     if not marker.process_domain.startswith(host_domain):
         return None
@@ -181,21 +209,21 @@ def _matching_chat(path: Path, machine: str, namespace: str) -> LiveChat | None:
 def live_sessions() -> list[LiveChat]:
     code = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
     try:
-        machine = Path("/etc/machine-id").read_text(encoding="ascii").strip()
+        machine = MACHINE_ID_PATH.read_text(encoding="ascii").strip()
         namespace = os.readlink("/proc/self/ns/pid")
     except OSError as error:
         raise ClaudeDesktopError("Claude Desktop discovery needs the local Linux machine ID and PID namespace") from error
 
     matches: dict[ClaudeChatId, list[LiveChat]] = {}
     for path in (code / "sessions").glob("*.json"):
-        live = _matching_chat(path, machine, namespace)
+        try:
+            live = _matching_chat(path, machine, namespace)
+        except ClaudeRecordError as error:
+            LOGGER.warning("%s", error)
+            continue
         if live is not None:
             matches.setdefault(live.chat.id, []).append(live)
     return [sessions[0] for sessions in matches.values() if len(sessions) == 1]
-
-
-def list_chats() -> list[ClaudeChat]:
-    return sorted((live.chat for live in live_sessions()), key=lambda chat: (chat.title.casefold(), chat.id))
 
 
 def sender() -> ClaudeChat:

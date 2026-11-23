@@ -30,7 +30,10 @@ class ClaudeDesktopTest(unittest.TestCase):
         }))
         process_id = os.getpid()
         namespace = os.readlink("/proc/self/ns/pid")
-        machine = Path("/etc/machine-id").read_text(encoding="ascii").strip()
+        machine = "00000000000000000000000000000000"
+        machine_id = root / "machine-id"
+        machine_id.write_text(machine + "\n", encoding="ascii")
+        self.enterContext(patch.object(claude_desktop, "MACHINE_ID_PATH", machine_id))
         self.marker_data: dict[str, object] = json.loads((FIXTURES / "runtime-marker.json").read_text(encoding="utf-8"))
         self.marker_data.update(pid=process_id, pidDomain=f"linux:{machine}:{namespace}", messagingSocketPath=str(self.inbox))
         self.marker = root / "code" / "sessions" / f"{process_id}.json"
@@ -41,17 +44,31 @@ class ClaudeDesktopTest(unittest.TestCase):
         self.record.write_bytes((FIXTURES / "registry-record.json").read_bytes())
 
     def test_recorded_marker_and_registry_resolve_live_chat(self) -> None:
-        self.assertEqual(claude_desktop.list_chats(), [self.live.chat])
+        self.assertEqual([live.chat for live in claude_desktop.live_sessions()], [self.live.chat])
 
     def test_stale_backend_is_not_listed(self) -> None:
         self.marker_data["sessionId"] = "00000000-0000-4000-8000-000000000103"
         self.marker.write_text(json.dumps(self.marker_data), encoding="utf-8")
-        self.assertEqual(claude_desktop.list_chats(), [])
+        self.assertEqual(claude_desktop.live_sessions(), [])
 
     def test_runtime_marker_requires_integer_process_number(self) -> None:
         self.marker_data["pid"] = str(os.getpid())
         self.marker.write_text(json.dumps(self.marker_data), encoding="utf-8")
-        self.assertEqual(claude_desktop.list_chats(), [])
+        with self.assertLogs("claude_desktop", level="WARNING") as log:
+            self.assertEqual(claude_desktop.live_sessions(), [])
+        self.assertIn("RuntimeMarker format", log.output[0])
+
+    def test_ignores_other_claude_workers_without_requiring_desktop_fields(self) -> None:
+        cli = self.marker.with_name(f"{os.getpid() + 1}.json")
+        cli.write_text('{"entrypoint":"cli","kind":"interactive"}', encoding="utf-8")
+        with self.assertNoLogs("claude_desktop", level="WARNING"):
+            self.assertEqual([live.chat for live in claude_desktop.live_sessions()], [self.live.chat])
+
+    def test_invalid_saved_record_reports_the_format_change(self) -> None:
+        self.marker.unlink()
+        self.record.write_text('{"changed":"schema"}', encoding="utf-8")
+        with self.assertRaisesRegex(claude_desktop.ClaudeRecordError, "SavedChat format"):
+            claude_desktop.read_chat(CHAT_ID, 1)
 
     def test_sender_is_bound_to_sdk_environment(self) -> None:
         self.assertEqual(claude_desktop.sender(), self.live.chat)

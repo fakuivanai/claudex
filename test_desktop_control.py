@@ -4,15 +4,18 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 import json
+import re
 from pathlib import Path
 import socket
 from tempfile import TemporaryDirectory
+from threading import Event
 from typing import cast
 import unittest
 
-from pydantic import ValidationError
-
-from desktop_control import DesktopControl, DesktopControlError, DesktopControlRefused, DesktopMutation
+from desktop_control import (
+    EFFORTS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PERMISSION_MODES, DesktopControl, DesktopFailure, DesktopMutation,
+    DesktopResult, InvalidRequest, InvalidResponse, Refused, Success, TimedOut, Unavailable,
+)
 
 _CHAT_ID = "local_01234567-89ab-cdef-0123-456789abcdef"
 _OTHER_CHAT_ID = "local_11111111-2222-4444-8555-666666666666"
@@ -28,12 +31,14 @@ def frame(value: object) -> bytes:
     return json.dumps(value).encode() + b"\n"
 
 
-def exchange(server: socket.socket, response: bytes) -> bytes:
+def exchange(server: socket.socket, response: bytes, release: Event | None) -> bytes:
     connection, _ = server.accept()
     with connection:
         connection.settimeout(3)
         with connection.makefile("rb") as stream:
-            request = stream.read(4097)
+            request = stream.read(MAX_REQUEST_BYTES + 1)
+        if release is not None:
+            release.wait(3)
         connection.sendall(response)
         return request
 
@@ -49,30 +54,34 @@ class DesktopControlTests(unittest.TestCase):
         self.desktop = DesktopControl(self.runtime, timeout=3)
 
     @contextmanager
-    def reply(self, response: bytes) -> Iterator[Future[bytes]]:
+    def reply(self, response: bytes, release: Event | None = None) -> Iterator[Future[bytes]]:
         with socket.socket(socket.AF_UNIX) as listener, ThreadPoolExecutor(max_workers=1) as pool:
             listener.settimeout(3)
             listener.bind(str(self.endpoint))
             self.endpoint.chmod(0o600)
             listener.listen()
             try:
-                yield pool.submit(exchange, listener, response)
+                yield pool.submit(exchange, listener, response, release)
             finally:
                 self.endpoint.unlink()
 
     def test_typed_roster_and_session_use_the_window_method_names(self) -> None:
         with self.reply(frame({"status": "ok", "result": {"sessions": [_ROW], "archived_pending": True}})) as request:
-            roster = self.desktop.list_sessions()
+            result = self.desktop.list_sessions()
+            assert isinstance(result, Success)
+            roster = result.result
             self.assertTrue(roster.archived_pending)
             self.assertEqual(len(roster.sessions), 1)
             self.assertEqual(roster.sessions[0].model_dump(), _ROW)
             self.assertEqual(json.loads(request.result(3)), {"tool": "getSessionList", "input": {}})
         with self.reply(frame({"status": "ok", "result": _ROW})) as request:
-            self.assertEqual(self.desktop.get_session(_CHAT_ID).model_dump(), _ROW)
+            session = self.desktop.get_session(_CHAT_ID)
+            assert isinstance(session, Success)
+            self.assertEqual(session.result.model_dump(), _ROW)
             self.assertEqual(json.loads(request.result(3)), {"tool": "getSession", "input": {"chat_id": _CHAT_ID}})
 
     def test_each_mutation_sends_its_native_method_and_payload(self) -> None:
-        cases: list[tuple[str, dict[str, object], Callable[[], DesktopMutation]]] = [
+        cases: list[tuple[str, dict[str, object], Callable[[], DesktopResult[DesktopMutation]]]] = [
             ("toggleRemoteControl", {"enabled": True}, lambda: self.desktop.set_remote_control(_CHAT_ID, True)),
             ("toggleRemoteControl", {"enabled": False}, lambda: self.desktop.set_remote_control(_CHAT_ID, False)),
             ("warmSession", {}, lambda: self.desktop.warm_session(_CHAT_ID)),
@@ -91,8 +100,9 @@ class DesktopControlTests(unittest.TestCase):
                 frame({"status": "ok", "result": {"session": _ROW, "notice": "Example notice"}}),
             ) as request:
                 result = call()
-                self.assertIsNotNone(result.session)
-                self.assertEqual(result.notice, "Example notice")
+                assert isinstance(result, Success)
+                self.assertIsNotNone(result.result.session)
+                self.assertEqual(result.result.notice, "Example notice")
                 self.assertEqual(json.loads(request.result(3)), {
                     "tool": tool,
                     "input": {"chat_id": _CHAT_ID, **fields},
@@ -100,39 +110,50 @@ class DesktopControlTests(unittest.TestCase):
 
     def test_distinguishes_native_refusal_and_failure(self) -> None:
         with self.reply(frame({"status": "refused", "reason": "Raising permission mode requires Desktop."})):
-            with self.assertRaisesRegex(DesktopControlRefused, "Raising permission mode"):
-                self.desktop.set_permission_mode(_CHAT_ID, "bypassPermissions")
+            result = self.desktop.set_permission_mode(_CHAT_ID, "bypassPermissions")
+            self.assertEqual(result, Refused(reason="Raising permission mode requires Desktop."))
         with self.reply(frame({"status": "error", "reason": "Claude's session roster changed."})):
-            with self.assertRaisesRegex(DesktopControlError, "session roster changed"):
-                self.desktop.get_session(_CHAT_ID)
+            failure = self.desktop.get_session(_CHAT_ID)
+            self.assertEqual(failure, DesktopFailure(reason="Claude's session roster changed."))
 
     def test_disallows_unexpected_response_fields_and_chat_id_mismatches(self) -> None:
         with self.reply(frame({"status": "ok", "result": {**_ROW, "bridge_url": "private"}})):
-            with self.assertRaisesRegex(DesktopControlError, "invalid response"):
-                self.desktop.get_session(_CHAT_ID)
+            self.assertEqual(self.desktop.get_session(_CHAT_ID), InvalidResponse("Desktop returned an invalid response."))
         with self.reply(frame({"status": "ok", "result": {"session": {**_ROW, "chat_id": _OTHER_CHAT_ID}}})):
-            with self.assertRaisesRegex(DesktopControlError, "different chat"):
-                self.desktop.warm_session(_CHAT_ID)
+            self.assertEqual(
+                self.desktop.warm_session(_CHAT_ID), InvalidResponse("Desktop returned a different chat than requested."),
+            )
         with self.reply(frame({"status": "ok", "result": _ROW}) * 2):
-            with self.assertRaisesRegex(DesktopControlError, "invalid response frame"):
-                self.desktop.get_session(_CHAT_ID)
+            self.assertEqual(
+                self.desktop.get_session(_CHAT_ID), InvalidResponse("Desktop returned an invalid response frame."),
+            )
 
     def test_rejects_malformed_arguments_before_connecting(self) -> None:
         for invalid in (_CHAT_ID.upper(), _CHAT_ID + "\n", "local_missing"):
-            with self.assertRaises(ValidationError):
-                self.desktop.get_session(invalid)
-        with self.assertRaises(ValidationError):
-            self.desktop.set_remote_control(_CHAT_ID, cast(bool, "true"))
+            self.assertIsInstance(self.desktop.get_session(invalid), InvalidRequest)
+        self.assertIsInstance(self.desktop.set_remote_control(_CHAT_ID, cast(bool, "true")), InvalidRequest)
 
-    def test_reports_a_missing_or_nonprivate_socket(self) -> None:
-        with self.assertRaisesRegex(DesktopControlError, "socket is unavailable"):
-            self.desktop.list_sessions()
-        with socket.socket(socket.AF_UNIX) as listener:
-            listener.bind(str(self.endpoint))
-            self.endpoint.chmod(0o660)
-            with self.assertRaisesRegex(DesktopControlError, "mode 0600"):
-                self.desktop.list_sessions()
-            self.endpoint.chmod(0o600)
-            self.endpoint.parent.chmod(0o755)
-            with self.assertRaisesRegex(DesktopControlError, "mode 0700"):
-                self.desktop.list_sessions()
+    def test_reports_an_unavailable_socket_and_a_timeout_separately(self) -> None:
+        self.assertIsInstance(self.desktop.list_sessions(), Unavailable)
+        release = Event()
+        with self.reply(b"", release):
+            try:
+                self.assertIsInstance(DesktopControl(self.runtime, timeout=0.05).list_sessions(), TimedOut)
+            finally:
+                release.set()
+
+    def test_protocol_bounds_and_setting_choices_match_the_server(self) -> None:
+        directory = Path(__file__).with_name("patcher")
+        server = (directory / "desktop_socket.cjs").read_text()
+        for name, value in (("MAX_REQUEST_BYTES", MAX_REQUEST_BYTES), ("MAX_RESPONSE_BYTES", MAX_RESPONSE_BYTES)):
+            definition = re.search(rf"^const {name} = (\d+);$", server, re.MULTILINE)
+            assert definition is not None
+            self.assertEqual(int(definition.group(1)), value)
+
+        efforts = re.search(r"^const EFFORTS = new Set\((\[.*\])\);$", server, re.MULTILINE)
+        modes = re.search(
+            r"^const PERMISSION_MODES = (\[.*\]);$", (directory / "desktop_bridge.cjs").read_text(), re.MULTILINE,
+        )
+        assert efforts is not None and modes is not None
+        self.assertEqual(tuple(json.loads(efforts.group(1))), EFFORTS)
+        self.assertEqual(tuple(json.loads(modes.group(1))), PERMISSION_MODES)

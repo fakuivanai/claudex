@@ -2,11 +2,12 @@ import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 from urllib.parse import parse_qs, urlsplit
 
 import claude_desktop
 from claude_desktop import ClaudeChat, LiveChat, Liveness, NoticeStatus, WorkerStatus
+from desktop_control import DesktopControl, DesktopMutation, DesktopSession, Success, Unavailable
 from models import Provider, Sender, parse_claude_chat_id
 import claude_lifecycle
 
@@ -26,39 +27,43 @@ class LifecycleTest(unittest.TestCase):
     def setUp(self) -> None:
         self.launcher = self.enterContext(patch.object(claude_lifecycle, "launch"))
         self.lookup = self.enterContext(patch.object(claude_lifecycle, "wait_for_inbox"))
-        self.validate = self.enterContext(patch.object(claude_lifecycle, "validate_saved"))
+        self.control = create_autospec(DesktopControl, instance=True)
+        self.control.warm_session.return_value = Success(result=DesktopMutation(
+            session=DesktopSession(
+                chat_id=TARGET, title="Fixture chat", running=False, archived=False, warm=True,
+                remote_control="off", remote_control_saved=None, model=None, effort=None,
+                fast_mode=None, permission_mode=None,
+            ),
+        ))
         self.notice = self.enterContext(patch.object(claude_desktop, "submit_notice"))
 
-    def test_live_inbox_skips_launch(self) -> None:
+    def notify(self) -> claude_lifecycle.NoticeResult:
+        return claude_lifecycle.notify(TARGET, "message", sender=SENDER, control=self.control)
+
+    def test_live_inbox_skips_launch_and_warm(self) -> None:
         self.lookup.return_value = MARKER
-        claude_lifecycle.wake(TARGET)
+        self.notice.return_value = NoticeStatus.SUBMITTED
+        self.assertEqual(self.notify(), claude_lifecycle.AttemptedNotice(NoticeStatus.SUBMITTED, False))
+        self.control.warm_session.assert_not_called()
         self.launcher.assert_not_called()
 
-    def test_cold_chat_passes_exact_saved_identifier(self) -> None:
-        self.lookup.side_effect = [None, MARKER]
-        claude_lifecycle.wake(TARGET)
-        self.launcher.assert_called_once_with(f"claude://code/continue?session={TARGET}")
-
-    def test_cold_chat_is_validated_before_launch(self) -> None:
-        self.lookup.return_value = None
-        self.validate.side_effect = ValueError("Unknown saved chat")
-        with self.assertRaises(ValueError):
-            claude_lifecycle.wake(TARGET)
-        self.launcher.assert_not_called()
-
-    def test_reopen_without_worker_reports_waiting(self) -> None:
-        self.lookup.return_value = None
-        self.assertEqual(claude_lifecycle.wake(TARGET).status, claude_lifecycle.WakeStatus.WAITING_FOR_INBOX)
-
-    def test_notify_uses_the_worker_returned_after_reopen(self) -> None:
+    def test_notify_warms_exact_chat_through_socket_then_uses_inbox(self) -> None:
         self.lookup.side_effect = [None, MARKER]
         self.notice.return_value = NoticeStatus.SUBMITTED
-        claude_lifecycle.notify(TARGET, "message", sender=SENDER)
+        self.assertEqual(self.notify(), claude_lifecycle.AttemptedNotice(NoticeStatus.SUBMITTED, True))
+        self.control.warm_session.assert_called_once_with(TARGET)
         self.notice.assert_called_once_with(MARKER, "message", SENDER)
+        self.launcher.assert_not_called()
+
+    def test_socket_unavailable_is_reported_without_deep_link(self) -> None:
+        self.lookup.return_value = None
+        self.control.warm_session.return_value = Unavailable(reason="Desktop socket unavailable.")
+        self.assertEqual(self.notify(), claude_lifecycle.StoredNotice("Desktop socket unavailable."))
+        self.launcher.assert_not_called()
 
     def test_notify_without_worker_leaves_message_stored(self) -> None:
         self.lookup.return_value = None
-        self.assertIsInstance(claude_lifecycle.notify(TARGET, "message", sender=SENDER), claude_lifecycle.StoredNotice)
+        self.assertIsInstance(self.notify(), claude_lifecycle.StoredNotice)
 
     def test_draft_encodes_prompt_as_data(self) -> None:
         prompt = "Check A & B? folder=/elsewhere"

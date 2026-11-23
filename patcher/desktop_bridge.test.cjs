@@ -145,11 +145,23 @@ test("retains native compliance refusals without warming or exposing internals",
   assert.deepEqual(calls, []);
 });
 
+test("declines a request queued under an older account scope", async () => {
+  const { calls, dispatch, native } = fixture();
+  const queuedScope = { ...scope, generation: native.generation };
+  native.generation++;
+  const response = await dispatch({ tool: "toggleRemoteControl", input: { chat_id: id, enabled: true } }, queuedScope);
+  assert.equal(response.status, "error");
+  assert.match(response.reason, /changed/);
+  assert.deepEqual(calls, []);
+});
+
 test("keeps permission changes at or below Desktop's effective mode", async () => {
   const { native, calls, run } = fixture();
-  for (const mode of ["acceptEdits", "auto", "bypassPermissions", "dontAsk"]) {
+  for (const mode of ["acceptEdits", "auto", "bypassPermissions", "dontAsk", "unrecognized"]) {
     assert.equal((await run("setPermissionMode", { mode })).status, "refused");
   }
+  native.row.permissionMode = "unrecognized";
+  assert.equal((await run("setPermissionMode", { mode: "unrecognized" })).status, "refused");
   native.row.permissionMode = "auto";
   native.heldMode = "default";
   assert.equal((await run("setPermissionMode", { mode: "acceptEdits" })).status, "refused");

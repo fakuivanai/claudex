@@ -1,7 +1,6 @@
 """Launch the signed-in Claude Desktop and open native Code links."""
 
 from dataclasses import dataclass
-from enum import StrEnum
 import os
 from pathlib import Path
 import subprocess
@@ -10,26 +9,15 @@ from urllib.parse import urlencode
 
 import claude_desktop
 from claude_desktop import ClaudeDesktopError, LiveChat, NoticeStatus
+from desktop_control import DesktopControl, Success
 from desktop_environment import desktop_environment
 from models import ClaudeChatId, Sender
 
 
-# Desktop may take several seconds to initialize a cold Claude Code worker.
-OPEN_TIMEOUT = 18.0
+# A native worker can return before publishing its Claude Code inbox.
+INBOX_TIMEOUT = 18.0
 # Poll the local registry without contending with the worker's startup.
 INBOX_POLL_INTERVAL = 0.25
-
-
-class WakeStatus(StrEnum):
-    ALREADY_RUNNING = "already_running"
-    INBOX_READY = "inbox_ready"
-    WAITING_FOR_INBOX = "waiting_for_inbox"
-
-
-@dataclass(frozen=True)
-class WakeResult:
-    chat_id: ClaudeChatId
-    status: WakeStatus
 
 
 @dataclass(frozen=True)
@@ -44,12 +32,6 @@ class AttemptedNotice:
 
 
 NoticeResult = StoredNotice | AttemptedNotice
-
-
-@dataclass(frozen=True)
-class _ReadyInbox:
-    live: LiveChat
-    opened_saved_chat: bool
 
 
 def _launcher() -> Path:
@@ -74,12 +56,7 @@ def launch(url: str | None = None) -> None:
         raise ClaudeDesktopError("Could not launch Claude Desktop") from error
 
 
-def validate_saved(target: ClaudeChatId) -> None:
-    if not claude_desktop.saved_records(target):
-        raise ValueError("No saved, unarchived Claude Desktop chat matches that ID.")
-
-
-def wait_for_inbox(target: ClaudeChatId, timeout: float = OPEN_TIMEOUT) -> LiveChat | None:
+def wait_for_inbox(target: ClaudeChatId, timeout: float = INBOX_TIMEOUT) -> LiveChat | None:
     deadline = time.monotonic() + timeout
     while True:
         for live in claude_desktop.live_sessions():
@@ -106,28 +83,18 @@ def open_draft(prompt: str, folder: str | None = None) -> None:
     launch(draft_url(prompt, folder))
 
 
-def _ensure_inbox(target: ClaudeChatId) -> _ReadyInbox | None:
+def notify(target: ClaudeChatId, message_id: str, *, sender: Sender, control: DesktopControl) -> NoticeResult:
+    """Notify the exact live inbox, or leave the message stored until it appears."""
     live = wait_for_inbox(target, timeout=0)
     if live is not None:
-        return _ReadyInbox(live, opened_saved_chat=False)
-    # Desktop 5.11492.5 accepts its own local ID here and keeps its own runtime.
-    launch("claude://code/continue?" + urlencode({"session": target}))
+        return AttemptedNotice(claude_desktop.submit_notice(live, message_id, sender), opened_saved_chat=False)
+
+    warmed = control.warm_session(target)
+    if not isinstance(warmed, Success):
+        return StoredNotice(warmed.reason)
+    if warmed.result.session is None or not warmed.result.session.warm:
+        return StoredNotice(warmed.result.notice or "Desktop did not start a worker for this chat.")
     live = wait_for_inbox(target)
-    return _ReadyInbox(live, opened_saved_chat=True) if live is not None else None
-
-
-def wake(target: ClaudeChatId) -> WakeResult:
-    validate_saved(target)
-    ready = _ensure_inbox(target)
-    if ready is None:
-        return WakeResult(target, WakeStatus.WAITING_FOR_INBOX)
-    return WakeResult(target, WakeStatus.INBOX_READY if ready.opened_saved_chat else WakeStatus.ALREADY_RUNNING)
-
-
-def notify(target: ClaudeChatId, message_id: str, *, sender: Sender) -> NoticeResult:
-    """Notify the exact live inbox, or leave the message stored until it appears."""
-    ready = _ensure_inbox(target)
-    if ready is None:
-        return StoredNotice("No live inbox appeared after requesting the saved chat.")
-    status = claude_desktop.submit_notice(ready.live, message_id, sender)
-    return AttemptedNotice(status, ready.opened_saved_chat)
+    if live is None:
+        return StoredNotice("The worker did not publish a live inbox in time.")
+    return AttemptedNotice(claude_desktop.submit_notice(live, message_id, sender), opened_saved_chat=True)

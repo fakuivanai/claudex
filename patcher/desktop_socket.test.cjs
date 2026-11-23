@@ -8,15 +8,16 @@ const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { test } = require("node:test");
-const { startDesktopSocket } = require("./desktop_socket.cjs");
+const { setImmediate: nextTurn } = require("node:timers/promises");
+const { MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, startDesktopSocket } = require("./desktop_socket.cjs");
 
 const localId = "local_01234567-89ab-cdef-0123-456789abcdef";
 const list = { tool: "getSessionList", input: {} };
 const toggle = { tool: "toggleRemoteControl", input: { chat_id: localId, enabled: true } };
 
-function exchange(endpoint, wire) {
+function exchange(endpoint, wire, sent) {
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection(endpoint, () => socket.end(wire));
+    const socket = net.createConnection(endpoint, () => socket.end(wire, sent));
     const chunks = [];
     socket.on("data", (chunk) => chunks.push(chunk));
     socket.on("error", reject);
@@ -66,7 +67,8 @@ test("rejects unknown tools, malformed frames and ambiguous targets before dispa
     ),
     encode({ tool: "archive", input: { chat_id: localId, cleanupWorktree: true } }),
     encode({ tool: "setModel", input: { chat_id: localId, model: "a\u0000b" } }),
-    encode({ tool: "setPermissionMode", input: { chat_id: localId, mode: "unrecognized" } }),
+    encode({ tool: "setPermissionMode", input: { chat_id: localId, mode: "" } }),
+    encode({ tool: "setEffort", input: { chat_id: localId, effort: "unrecognized" } }),
     encode({ ...toggle, input: { ...toggle.input, chat_id: ` ${localId}` } }),
     encode({ ...toggle, input: { ...toggle.input, chat_id: localId + "\n" } }),
     encode({ ...toggle, input: { ...toggle.input, chat_id: localId.toUpperCase() } }),
@@ -74,7 +76,7 @@ test("rejects unknown tools, malformed frames and ambiguous targets before dispa
     encode(list) + encode(toggle),
     JSON.stringify(list),
     Buffer.from([0xff, 0x0a]),
-    " ".repeat(4096) + "\n",
+    " ".repeat(MAX_REQUEST_BYTES) + "\n",
   ];
   for (const wire of invalidWires) {
     assert.equal((await exchange(endpoint, wire)).status, "error");
@@ -82,25 +84,36 @@ test("rejects unknown tools, malformed frames and ambiguous targets before dispa
   assert.equal(called, false);
 });
 
-test("serializes dispatch and allows a later request after a handler settles", async (t) => {
+test("queues requests in arrival order and forwards them one at a time", async (t) => {
   const { promise: dispatchEntered, resolve: entered } = Promise.withResolvers();
   const { promise: dispatchReleased, resolve: release } = Promise.withResolvers();
+  const calls = [];
+  let active = 0;
   const { endpoint } = await fixture(t, async (request) => {
+    calls.push(request.tool);
+    assert.equal(++active, 1);
     entered();
     await dispatchReleased;
+    active--;
     return success(request.tool);
   });
-  const pending = exchange(endpoint, encode(toggle));
+  const first = exchange(endpoint, encode(toggle));
   await dispatchEntered;
   try {
-    assert.deepEqual(await exchange(endpoint, encode(list)), {
-      status: "error", reason: "The desktop handler is busy.",
-    });
+    const { promise: secondSent, resolve: sent } = Promise.withResolvers();
+    const second = exchange(endpoint, encode(list), sent);
+    await secondSent;
+    await nextTurn();
+    const third = exchange(endpoint, encode({ tool: "getSession", input: { chat_id: localId } }));
+    assert.deepEqual(calls, ["toggleRemoteControl"]);
+    release();
+    assert.deepEqual(await Promise.all([first, second, third]), [
+      success("toggleRemoteControl"), success("getSessionList"), success("getSession"),
+    ]);
+    assert.deepEqual(calls, ["toggleRemoteControl", "getSessionList", "getSession"]);
   } finally {
     release();
   }
-  assert.deepEqual(await pending, success("toggleRemoteControl"));
-  assert.deepEqual(await exchange(endpoint, encode(list)), success("getSessionList"));
 });
 
 test("does not displace another listener and cleans up on close", async (t) => {
@@ -112,21 +125,24 @@ test("does not displace another listener and cleans up on close", async (t) => {
   assert.deepEqual(await fs.readdir(path.dirname(endpoint)), []);
 });
 
-test("refuses a public directory and a symlink before binding", async (t) => {
-  const { directory } = await fixture(t, async () => success([]));
-  const shared = path.join(directory, "shared");
-  const symlink = path.join(directory, "symlink");
-  await fs.mkdir(shared, { mode: 0o755 });
-  await fs.symlink(shared, symlink);
-  for (const runtimeDirectory of [shared, symlink]) {
-    await assert.rejects(startDesktopSocket(async () => success([]), { runtimeDirectory }), /mode 0700/);
-  }
+test("will not replace a directory symlink or an unrelated endpoint file", async (t) => {
+  const runtimeDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "claudex-path-"));
+  t.after(() => fs.rm(runtimeDirectory, { recursive: true, force: true }));
+  const directory = path.join(runtimeDirectory, "claudex");
+  await fs.symlink(runtimeDirectory, directory);
+  await assert.rejects(startDesktopSocket(async () => success([]), { runtimeDirectory }), /not a directory/);
+  await fs.unlink(directory);
+  await fs.mkdir(directory);
+  const endpoint = path.join(directory, "desktop.sock");
+  await fs.writeFile(endpoint, "existing file");
+  await assert.rejects(startDesktopSocket(async () => success([]), { runtimeDirectory }), /non-socket/);
+  assert.equal(await fs.readFile(endpoint, "utf8"), "existing file");
 });
 
 test("reports handler failures and oversized replies without exposing internals", async (t) => {
   const { endpoint } = await fixture(t, async (request) => {
     if (request.tool === "toggleRemoteControl") throw new Error("Other account identifiers");
-    return success(" ".repeat(512 * 1024));
+    return success(" ".repeat(MAX_RESPONSE_BYTES));
   });
   assert.deepEqual(await exchange(endpoint, encode(toggle)), { status: "error", reason: "Desktop handler failed." });
   assert.deepEqual(await exchange(endpoint, encode(list)), {

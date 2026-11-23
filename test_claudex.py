@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -11,6 +11,7 @@ from mcp.types import RequestParams
 
 from claudex import Bridge, codex_sender
 from claude_lifecycle import StoredNotice
+from desktop_control import DesktopControl, DesktopSession, Success
 from models import Provider, Sender
 from peer_mailbox import Mailbox
 
@@ -25,7 +26,13 @@ class BridgeTest(unittest.TestCase):
     def setUp(self) -> None:
         temporary = TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.bridge = Bridge(Provider.CLAUDE, Mailbox(Path(temporary.name) / "mail.sqlite"))
+        self.control = create_autospec(DesktopControl, instance=True)
+        self.control.get_session.return_value = Success(result=DesktopSession(
+            chat_id=CLAUDE_CHAT, title="Claude review", running=False, archived=False, warm=False,
+            remote_control="off", remote_control_saved=None, model=None, effort=None,
+            fast_mode=None, permission_mode=None,
+        ))
+        self.bridge = Bridge(Provider.CLAUDE, Mailbox(Path(temporary.name) / "mail.sqlite"), self.control)
 
     def test_sender_identity_comes_from_request(self) -> None:
         metadata = RequestParams.Meta.model_validate({"x-codex-turn-metadata": {"thread_id": CODEX_CHAT}})
@@ -62,7 +69,6 @@ class BridgeTest(unittest.TestCase):
 
     def test_notification_failure_still_leaves_the_original_message(self) -> None:
         with (
-            patch("claudex.claude_lifecycle.validate_saved"),
             patch("claudex.claude_lifecycle.notify", side_effect=OSError("offline")),
         ):
             receipt = self.bridge.send(CODEX_SENDER, CLAUDE_CHAT, "peer body")
@@ -70,7 +76,6 @@ class BridgeTest(unittest.TestCase):
 
     def test_failed_native_notice_is_reported_as_stored(self) -> None:
         with (
-            patch("claudex.claude_lifecycle.validate_saved"),
             patch("claudex.claude_lifecycle.notify", side_effect=OSError("offline")),
         ):
             receipt = self.bridge.send(CODEX_SENDER, CLAUDE_CHAT, "peer body")
@@ -83,23 +88,23 @@ class StdioTest(unittest.IsolatedAsyncioTestCase):
             entrypoint = str(Path(__file__).with_name("claudex.py"))
             parameters = StdioServerParameters(
                 command=sys.executable,
-                args=["-B", entrypoint, "--client", "codex", "--state", str(Path(directory) / "mail.sqlite")],
+                args=["-B", entrypoint, "mcp", "--client", "codex", "--state", str(Path(directory) / "mail.sqlite")],
             )
             async with timeout(10), stdio_client(parameters) as (receive, send):
                 async with ClientSession(receive, send) as session:
                     await session.initialize()
                     tools = await session.list_tools()
         self.assertEqual({tool.name for tool in tools.tools}, {
-            "launch_claude", "list_chats", "read_chat", "send_message", "read_messages",
-            "wake_chat", "open_chat_draft", "who_am_i", "list_skills", "read_skill",
-            "desktop_list_sessions", "desktop_get_session", "desktop_set_remote_control",
-            "desktop_warm_session", "desktop_set_model", "desktop_set_effort", "desktop_set_fast_mode",
-            "desktop_set_permission_mode", "desktop_archive", "desktop_unarchive", "desktop_stop",
-            "desktop_interrupt", "codex_thread_status",
+            "claude_launch", "codex_list_chats", "read_chat", "send_message", "read_messages",
+            "claude_open_chat_draft", "who_am_i", "list_skills", "read_skill",
+            "claude_list_chats", "claude_get_chat", "claude_set_remote_control",
+            "claude_wake_chat", "claude_set_model", "claude_set_effort", "claude_set_fast_mode",
+            "claude_set_permission_mode", "claude_archive", "claude_unarchive", "claude_stop",
+            "claude_interrupt", "codex_chat_status",
         })
-        reads = {"desktop_list_sessions", "desktop_get_session"}
+        reads = {"claude_list_chats", "claude_get_chat"}
         for tool in tools.tools:
-            if tool.name.startswith("desktop_"):
+            if tool.name.startswith("claude_"):
                 self.assertIsNotNone(tool.annotations)
                 assert tool.annotations is not None
                 if tool.name in reads:

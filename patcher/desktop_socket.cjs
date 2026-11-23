@@ -1,16 +1,20 @@
 "use strict";
 
-const { randomBytes } = require("node:crypto");
 const { once } = require("node:events");
-const { lstatSync, unlinkSync } = require("node:fs");
-const fs = require("node:fs/promises");
+const { lstatSync, mkdirSync, unlinkSync } = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
 
+// The Python tests check these shared wire bounds. A request holds one chat
+// ID and small options. A reply can hold a full Desktop roster.
 const MAX_REQUEST_BYTES = 4096;
-const MAX_RESPONSE_BYTES = 512 * 1024;
+const MAX_RESPONSE_BYTES = 524288;
+// Bound the number of in-flight connections, including queued requests.
+// The local request frame is tiny, so two seconds also bounds stalled writers.
 const MAX_CONNECTIONS = 8;
 const REQUEST_TIMEOUT_MS = 2000;
+const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+const endpoints = new Set();
 const LOCAL_CHAT_ID = /^local_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
@@ -53,15 +57,15 @@ function parseRequest(bytes) {
       if (exactObject(input, "chat_id", "enabled") && typeof input.enabled === "boolean") return request;
       break;
     case "setModel":
-      if (exactObject(input, "chat_id", "model") && optionToken(input.model, 256)) return request;
+      if (exactObject(input, "chat_id", "model") && optionToken(input.model, 128)) return request;
       break;
     case "setEffort":
       if (exactObject(input, "chat_id", "effort") &&
-          (input.effort === null || optionToken(input.effort, 32))) return request;
+          (input.effort === null || EFFORTS.has(input.effort))) return request;
       break;
     case "setPermissionMode":
       if (exactObject(input, "chat_id", "mode") &&
-          ["plan", "default", "dontAsk", "acceptEdits", "auto", "bypassPermissions"].includes(input.mode)) {
+          optionToken(input.mode, 32)) {
         return request;
       }
       break;
@@ -91,85 +95,53 @@ function reply(socket, response) {
   socket.end(wire);
 }
 
-async function requirePrivateDirectory(directory) {
-  const info = await fs.lstat(directory);
-  if (!info.isDirectory() || info.uid !== process.geteuid() || (info.mode & 0o7777) !== 0o700) {
-    throw new Error("Desktop socket requires a directory owned by this user with mode 0700.");
-  }
-}
-
-async function unlinkPublishedSocket(endpoint, published) {
+function prepareEndpoint(directory, endpoint) {
+  // The graphical login provides a private XDG_RUNTIME_DIR. Electron holds
+  // its single-instance lock before starting this listener.
   try {
-    const current = await fs.lstat(endpoint);
-    if (current.dev === published.dev && current.ino === published.ino) {
-      await fs.unlink(endpoint);
-    }
-  } catch (cause) {
-    if (cause.code !== "ENOENT") throw cause;
+    mkdirSync(directory, { mode: 0o700 });
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+    if (!lstatSync(directory).isDirectory()) throw new Error("The Desktop socket path is not a directory.");
   }
-}
-
-function socketIsListening(endpoint) {
-  return new Promise((resolve, reject) => {
-    const probe = net.createConnection(endpoint);
-    probe.setTimeout(1000);
-    probe.once("connect", () => {
-      probe.destroy();
-      resolve(true);
-    });
-    probe.once("timeout", () => {
-      probe.destroy();
-      reject(new Error("Could not determine whether the Desktop socket is still in use."));
-    });
-    probe.once("error", (cause) => {
-      if (cause.code === "ECONNREFUSED") resolve(false);
-      else reject(cause);
-    });
-  });
-}
-
-async function removeStaleEndpoint(directory, endpoint) {
-  let existing;
   try {
-    existing = await fs.lstat(endpoint);
-  } catch (cause) {
-    if (cause.code === "ENOENT") return;
-    throw cause;
-  }
-  if (!existing.isSocket() || existing.uid !== process.geteuid() ||
-      (existing.mode & 0o7777) !== 0o600 || await socketIsListening(endpoint)) {
-    throw new Error("The desktop socket endpoint already exists.");
-  }
-  await unlinkPublishedSocket(endpoint, existing);
-  for (const name of await fs.readdir(directory)) {
-    if (/^\.sock-[a-f0-9]{12}$/u.test(name)) {
-      await unlinkPublishedSocket(path.join(directory, name), existing);
-    }
+    if (!lstatSync(endpoint).isSocket()) throw new Error("The Desktop socket path contains a non-socket.");
+    unlinkSync(endpoint);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
   }
 }
 
-async function startDesktopSocket(dispatch, { runtimeDirectory = process.env.XDG_RUNTIME_DIR } = {}) {
-  if (typeof dispatch !== "function") throw new TypeError("A native handler is required.");
+async function startDesktopSocket(dispatch, {
+  runtimeDirectory = process.env.XDG_RUNTIME_DIR, capture = () => undefined,
+} = {}) {
   if (typeof runtimeDirectory !== "string" || !path.isAbsolute(runtimeDirectory)) {
     throw new Error("Desktop socket requires an absolute XDG_RUNTIME_DIR.");
   }
-  await requirePrivateDirectory(runtimeDirectory);
   const directory = path.join(runtimeDirectory, "claudex");
-  try {
-    await fs.mkdir(directory, { mode: 0o700 });
-  } catch (cause) {
-    if (cause.code !== "EEXIST") throw cause;
-  }
-  await requirePrivateDirectory(directory);
   const endpoint = path.join(directory, "desktop.sock");
-  const listenerPath = path.join(directory, `.sock-${randomBytes(6).toString("hex")}`);
-  await removeStaleEndpoint(directory, endpoint);
-  if (Buffer.byteLength(listenerPath) > 107) {
-    throw new Error("Desktop socket path is too long.");
-  }
+  if (endpoints.has(endpoint)) throw new Error("The Desktop socket already exists in this process.");
+  prepareEndpoint(directory, endpoint);
 
   const sockets = new Set();
-  let busy = false;
+  const queue = [];
+  let active = null;
+  async function dispatchQueued() {
+    if (active) return;
+    while (queue.length) {
+      const { socket, request, scope } = queue.shift();
+      active = socket;
+      try {
+        reply(socket, await dispatch(request, scope));
+      } catch {
+        reply(socket, error("Desktop handler failed."));
+      } finally {
+        active = null;
+        if (socket.destroyed) sockets.delete(socket);
+      }
+    }
+  }
+
   const server = net.createServer({ allowHalfOpen: true }, (socket) => {
     socket.on("error", () => socket.destroy());
     if (sockets.size >= MAX_CONNECTIONS) {
@@ -191,7 +163,9 @@ async function startDesktopSocket(dispatch, { runtimeDirectory = process.env.XDG
     }
     socket.on("close", () => {
       clearTimeout(timeout);
-      sockets.delete(socket);
+      if (socket !== active) sockets.delete(socket);
+      const waiting = queue.findIndex((entry) => entry.socket === socket);
+      if (waiting !== -1) queue.splice(waiting, 1);
     });
     socket.on("data", (chunk) => {
       if (ended) return;
@@ -199,82 +173,52 @@ async function startDesktopSocket(dispatch, { runtimeDirectory = process.env.XDG
       if (length > MAX_REQUEST_BYTES) return reject("Desktop request exceeds the size limit.");
       chunks.push(chunk);
     });
-    socket.on("end", async () => {
+    socket.on("end", () => {
       if (ended) return;
       ended = true;
       clearTimeout(timeout);
-      let request;
       try {
-        request = parseRequest(Buffer.concat(chunks, length));
+        const request = parseRequest(Buffer.concat(chunks, length));
+        queue.push({ socket, request, scope: capture() });
+        void dispatchQueued();
       } catch {
         reply(socket, error("Invalid desktop request."));
-        return;
-      }
-      if (busy) {
-        reply(socket, error("The desktop handler is busy."));
-        return;
-      }
-      busy = true;
-      try {
-        reply(socket, await dispatch(request));
-      } catch {
-        reply(socket, error("Desktop handler failed."));
-      } finally {
-        busy = false;
       }
     });
   });
-  // The opening promise reports bind failures. A later accept error cannot exit the host app.
+  // Once startup completes, keep a socket error from terminating Electron.
   server.on("error", () => {});
-
-  function stopListening() {
-    for (const socket of sockets) socket.destroy();
-    return new Promise((resolve, reject) => server.close((cause) => {
-      if (cause) reject(cause);
-      else resolve();
-    }));
-  }
-
-  server.listen(listenerPath);
-  await once(server, "listening");
-  let published;
+  endpoints.add(endpoint);
   try {
-    await fs.chmod(listenerPath, 0o600);
-    published = await fs.lstat(listenerPath);
-    // Publish only after setting the permissions. Atomic linking never displaces another listener.
-    await fs.link(listenerPath, endpoint);
-  } catch (cause) {
-    await stopListening();
-    if (cause.code === "EEXIST") throw new Error("The desktop socket endpoint already exists.");
-    throw cause;
-  }
-  // Electron does not await before-quit listeners. The exit hook covers
-  // graceful exits where asynchronous shutdown cannot remove the endpoint.
-  const removeOnExit = () => {
-    for (const pathname of [endpoint, listenerPath]) {
-      try {
-        const current = lstatSync(pathname);
-        if (current.dev === published.dev && current.ino === published.ino) unlinkSync(pathname);
-      } catch {
-        // An abrupt exit is covered by the next startup's liveness check.
-      }
+    // Unix sockets bind with mode 0777 before umask. Also mask owner execute
+    // to keep the existing mode 0600 contract. The Unix bind is synchronous.
+    const previous = process.umask(0o177);
+    try {
+      server.listen(endpoint);
+    } finally {
+      process.umask(previous);
     }
-  };
-  process.once("exit", removeOnExit);
+    await once(server, "listening");
+  } catch (error) {
+    endpoints.delete(endpoint);
+    throw error;
+  }
+
   let closing;
   return {
     close() {
-      closing ??= (async () => {
-        try {
-          await unlinkPublishedSocket(endpoint, published);
-        } finally {
-          await stopListening();
-          process.off("exit", removeOnExit);
-        }
-      })();
+      closing ??= new Promise((resolve, reject) => {
+        queue.length = 0;
+        for (const socket of sockets) socket.destroy();
+        server.close((cause) => {
+          endpoints.delete(endpoint);
+          if (cause) reject(cause);
+          else resolve();
+        });
+      });
       return closing;
     },
   };
 }
 
-module.exports = { startDesktopSocket };
+module.exports = { startDesktopSocket, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES };

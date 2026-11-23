@@ -1,21 +1,26 @@
 """Command-line tools for the local Claude and Codex desktop apps."""
 
 import argparse
-from collections.abc import Sequence
 import json
+from pathlib import Path
 import sys
-from typing import assert_never
+from typing import Literal, assert_never
 
 import codex_desktop
 import codex_history
 from desktop_control import (
     DesktopControl,
-    DesktopControlRefused,
+    DesktopResult,
+    EFFORTS,
+    PERMISSION_MODES,
+    Effort,
+    PermissionMode,
+    Success,
     DesktopMutation,
     DesktopSession,
     DesktopSessionRoster,
 )
-from models import CodexChatId, parse_codex_chat_id
+from models import CodexChatId, Provider, parse_codex_chat_id
 
 
 class Arguments(argparse.Namespace):
@@ -23,11 +28,13 @@ class Arguments(argparse.Namespace):
     command: str
     json: bool
     chat_id: str
-    thread_id: CodexChatId
+    codex_chat_id: CodexChatId
+    client: Provider
+    state_file: Path
     state: str
     model: str
-    effort: str
-    mode: str
+    effort: Effort | Literal["default"]
+    mode: PermissionMode
     query: str | None
     limit: int
     cursor: str | None
@@ -54,16 +61,19 @@ def page_size(value: str, maximum: int) -> int:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(prog="claudex", description=__doc__, allow_abbrev=False)
     apps = root.add_subparsers(dest="app", required=True)
-    desktop = apps.add_parser("desktop", help="Control Claude Desktop", allow_abbrev=False)
-    codex = apps.add_parser("codex", help="Read local Codex Desktop threads", allow_abbrev=False)
+    desktop = apps.add_parser("claude", help="Control Claude Desktop", allow_abbrev=False)
+    codex = apps.add_parser("codex", help="Read local Codex Desktop chats", allow_abbrev=False)
+    mcp = apps.add_parser("mcp", help="Run the local MCP server over stdio", allow_abbrev=False)
+    mcp.add_argument("--client", choices=list(Provider), type=Provider, required=True)
+    mcp.add_argument("--state", dest="state_file", type=Path, required=True, help="Shared message database path")
     desktop_commands = desktop.add_subparsers(dest="command", required=True)
     codex_commands = codex.add_subparsers(dest="command", required=True)
 
     descriptions = {
-        "sessions": "List Claude Desktop chats and their Remote Control state",
-        "session": "Show one Claude Desktop chat",
+        "chats": "List Claude Desktop chats and their Remote Control state",
+        "chat": "Show one Claude Desktop chat",
         "remote-control": "Set Remote Control for a chat",
-        "warm": "Start the worker for a saved chat",
+        "wake": "Start the worker for a saved chat",
         "model": "Set a chat's model",
         "effort": "Set a chat's reasoning effort",
         "fast-mode": "Set fast mode for a chat",
@@ -76,7 +86,7 @@ def parser() -> argparse.ArgumentParser:
     for name, help_text in descriptions.items():
         command = desktop_commands.add_parser(name, help=help_text, description=help_text, allow_abbrev=False)
         command.add_argument("--json", action="store_true", help="Write JSON")
-        if name != "sessions":
+        if name != "chats":
             command.add_argument("chat_id", metavar="CHAT_ID", help="Exact Claude Desktop chat ID")
         match name:
             case "remote-control" | "fast-mode":
@@ -84,38 +94,40 @@ def parser() -> argparse.ArgumentParser:
             case "model":
                 command.add_argument("model")
             case "effort":
-                command.add_argument("effort", help="Effort value or 'default'")
+                command.add_argument("effort", choices=(*EFFORTS, "default"), help="Effort value or 'default'")
             case "permission-mode":
-                command.add_argument("mode")
+                command.add_argument("mode", choices=PERMISSION_MODES)
 
-    threads = codex_commands.add_parser("threads", help="List or search saved threads", allow_abbrev=False)
-    threads.add_argument("--query", help="Title text or exact thread ID")
-    threads.add_argument("--archived", action="store_true", help="List archived threads")
+    threads = codex_commands.add_parser("chats", help="List or search saved chats", allow_abbrev=False)
+    threads.add_argument("--query", help="Title text or exact chat ID")
+    threads.add_argument("--archived", action="store_true", help="List archived chats")
     threads.add_argument("--limit", type=lambda value: page_size(value, codex_history.MAX_LIST),
                          default=codex_history.DEFAULT_CHAT_PAGE)
-    history = codex_commands.add_parser("history", help="Read the visible turns in a thread", allow_abbrev=False)
-    history.add_argument("thread_id", type=parse_codex_chat_id, metavar="THREAD_ID")
-    history.add_argument("--include-archived", action="store_true", help="Allow an archived thread")
+    history = codex_commands.add_parser("history", help="Read the visible turns in a chat", allow_abbrev=False)
+    history.add_argument("codex_chat_id", type=parse_codex_chat_id, metavar="CHAT_ID")
+    history.add_argument("--include-archived", action="store_true", help="Allow an archived chat")
     history.add_argument("--limit", type=lambda value: page_size(value, codex_history.MAX_TURNS),
                          default=codex_history.DEFAULT_TURN_PAGE)
     for command in (threads, history):
         command.add_argument("--cursor", help="Continue from a previous page")
         command.add_argument("--json", action="store_true", help="Write JSON")
-    status = codex_commands.add_parser("status", help="Check the loaded owner for a thread", allow_abbrev=False)
-    status.add_argument("thread_id", type=parse_codex_chat_id, metavar="THREAD_ID")
+    status = codex_commands.add_parser("status", help="Check the loaded owner for a chat", allow_abbrev=False)
+    status.add_argument("codex_chat_id", type=parse_codex_chat_id, metavar="CHAT_ID")
     status.add_argument("--json", action="store_true", help="Write JSON")
     return root
 
 
-def desktop_result(args: Arguments, control: DesktopControl) -> DesktopSessionRoster | DesktopSession | DesktopMutation:
+def desktop_result(
+    args: Arguments, control: DesktopControl,
+) -> DesktopResult[DesktopSessionRoster] | DesktopResult[DesktopSession] | DesktopResult[DesktopMutation]:
     match args.command:
-        case "sessions":
+        case "chats":
             return control.list_sessions()
-        case "session":
+        case "chat":
             return control.get_session(args.chat_id)
         case "remote-control":
             return control.set_remote_control(args.chat_id, args.state == "on")
-        case "warm":
+        case "wake":
             return control.warm_session(args.chat_id)
         case "model":
             return control.set_model(args.chat_id, args.model)
@@ -139,18 +151,18 @@ def desktop_result(args: Arguments, control: DesktopControl) -> DesktopSessionRo
 
 def codex_result(args: Arguments) -> codex_history.ChatPage | codex_history.ChatHistory | codex_desktop.ChatStatus:
     match args.command:
-        case "threads":
+        case "chats":
             if args.query is not None and len(args.query) > codex_history.MAX_QUERY_CHARS:
-                raise ValueError(f"Use a search query of at most {codex_history.MAX_QUERY_CHARS} characters.")
+                raise codex_history.HistoryError(f"Use a search query of at most {codex_history.MAX_QUERY_CHARS} characters.")
             return codex_history.list_chats(
                 query=args.query, limit=args.limit, cursor=args.cursor, archived=args.archived,
             )
         case "history":
             return codex_history.read_chat(
-                args.thread_id, limit=args.limit, cursor=args.cursor, include_archived=args.include_archived,
+                args.codex_chat_id, limit=args.limit, cursor=args.cursor, include_archived=args.include_archived,
             )
         case "status":
-            return codex_desktop.chat_status(args.thread_id)
+            return codex_desktop.chat_status(args.codex_chat_id)
         case _:
             raise ValueError("Unknown Codex Desktop command.")
 
@@ -192,7 +204,7 @@ def print_result(result: Result, as_json: bool) -> None:
         case codex_history.ChatPage() | codex_history.ChatHistory() | codex_desktop.ChatStatus() if as_json:
             print(json.dumps(result.to_wire()))
         case DesktopSessionRoster() | DesktopSession() | DesktopMutation() if as_json:
-            print(result.model_dump_json())
+            print(result.model_dump_json(by_alias=True))
         case DesktopSessionRoster():
             if not result.sessions:
                 print("No Claude Desktop chats in the loaded roster.")
@@ -211,7 +223,7 @@ def print_result(result: Result, as_json: bool) -> None:
                 print("Claude Desktop accepted the request.")
         case codex_history.ChatPage():
             if not result.chats:
-                print("No matching Codex Desktop threads.")
+                print("No matching Codex Desktop chats.")
             for chat in result.chats:
                 print_chat(chat)
             print_cursor(result.next_cursor)
@@ -230,17 +242,25 @@ def print_result(result: Result, as_json: bool) -> None:
             assert_never(result)
 
 
-def main(argv: Sequence[str]) -> int:
-    args = parser().parse_args(argv, namespace=Arguments())
-    try:
-        result: Result = desktop_result(args, DesktopControl()) if args.app == "desktop" else codex_result(args)
-    except ValueError as error:
-        reason = str(error)
-        if args.json:
-            status = "refused" if isinstance(error, DesktopControlRefused) else "error"
-            print(json.dumps({"status": status, "reason": reason}))
-        else:
-            print(f"claudex: {printable(reason)}", file=sys.stderr)
-        return 1
+def print_error(status: str, reason: str, as_json: bool) -> int:
+    if as_json:
+        print(json.dumps({"status": status, "reason": reason}))
+    else:
+        print(f"claudex: {printable(reason)}", file=sys.stderr)
+    return 1
+
+
+def run(args: Arguments) -> int:
+    result: Result
+    if args.app == "claude":
+        response = desktop_result(args, DesktopControl())
+        if not isinstance(response, Success):
+            return print_error(response.status, response.reason, args.json)
+        result = response.result
+    else:
+        try:
+            result = codex_result(args)
+        except (codex_history.HistoryError, codex_desktop.CodexDesktopError) as error:
+            return print_error("error", str(error), args.json)
     print_result(result, args.json)
     return 0

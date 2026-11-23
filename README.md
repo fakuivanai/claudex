@@ -1,220 +1,111 @@
 # claudex
 
-A local CLI and MCP server for Claude Code and Codex Desktop. It sends
-attributed messages and reads chat history and user-installed skills. An
-optional Linux patch restores Claude Remote Control and exposes selected
-Claude Desktop controls through a local Unix socket.
+Claudex is a local CLI and MCP server for Claude Code and Codex Desktop. It
+relays attributed messages and reads chat history and user-installed skills.
+The Linux Claude Desktop patch exposes chat controls and restores Remote Control.
 
-## Set up the bridge
+## Install and register
 
-Use Python 3.12. Install the hash-pinned runtime and build dependencies
-and the `claudex` entry point from the repository root.
+On x86-64 NixOS, `nix build .#` builds the two entry points, `claudex` and
+`claudex-desktop`, from the flake and `uv.lock`. Home Manager can take the
+flake as a locked input. Use `packages.${system}.default` for the runtime
+and pass the matching Claude Desktop package's archive and stock launcher
+to `claudex-desktop`. The managed desktop entry and link handler should
+use that launcher.
 
-```sh
-uv venv --python 3.12
-uv pip sync --python .venv/bin/python --require-hashes requirements.txt requirements-dev.txt
-uv pip install --python .venv/bin/python --no-build-isolation --no-deps .
-```
-
-On x86-64 NixOS, `nix build .#` builds `claudex` and `claudex-desktop`
-from the flake and `uv.lock`. `nix flake check` verifies both entry points
-and the Claude Code executable bundled with the SDK.
-
-Both clients use the same absolute `--state` path to a local SQLite mailbox
-in a directory you own. It retains the newest 1,000 messages per recipient.
-Use a new mailbox path if you tried the prototype's earlier format.
-
-Set `CLAUDEX_CLAUDE_LAUNCHER` in the MCP client configuration to the absolute
-path of the executable that opens your signed-in Claude Desktop. To use the
-patch for cold launches, point it at a wrapper like the one below. Launch,
-wake and draft use this one configured executable.
+Register MCP with the two app CLIs. Use absolute paths to the installed
+Claudex command, the managed Claude Desktop launcher, and a shared local
+mailbox. The mailbox retains the newest 1,000 messages per recipient.
 
 ```sh
-#!/bin/sh
-exec /path/to/claudex/.venv/bin/python -m patcher.launch \
-  --source /absolute/path/to/installed/app.asar --reuse-running \
-  -- /absolute/path/to/normal-account-launcher "$@"
+claude mcp add claudex --scope user --env "CLAUDEX_CLAUDE_LAUNCHER=$launcher" -- \
+  "$claudex" mcp --client claude --state "$mailbox"
+codex mcp add claudex --env "CLAUDEX_CLAUDE_LAUNCHER=$launcher" -- \
+  "$claudex" mcp --client codex --state "$mailbox"
 ```
 
-### Claude Code in Desktop
+Use `who_am_i` from a new chat to verify its identity. Claude Code supplies
+its backend ID when it starts MCP. Codex supplies its chat ID in request
+metadata. A Claude Code clear or resume may require reconnecting MCP.
 
-Open any intended destination in Codex Desktop. Add the following to the
-Claude Code project's `.mcp.json`, replacing the paths. Use the usual
-project MCP approval if prompted.
-
-```json
-{
-  "mcpServers": {
-    "claudex": {
-      "type": "stdio",
-      "command": "/path/to/claudex/.venv/bin/claudex",
-      "args": [
-        "--client", "claude",
-        "--state", "/path/to/claudex-state/mail.sqlite"
-      ],
-      "env": {
-        "CLAUDEX_CLAUDE_LAUNCHER": "/absolute/path/to/claude-launcher"
-      }
-    }
-  }
-}
-```
-
-Claude supplies `CLAUDE_CODE_SESSION_ID` to the MCP server when the
-session starts. Call `who_am_i` to verify the Desktop chat it resolves to.
-A clear or resume can require reconnecting the MCP server.
-
-### Codex
-
-Add the following to your Codex MCP configuration, using the same mailbox
-path. The MCP client supplies the calling chat ID in request metadata.
-
-```toml
-[mcp_servers.claudex]
-command = "/path/to/claudex/.venv/bin/claudex"
-args = [
-  "--client", "codex",
-  "--state", "/path/to/claudex-state/mail.sqlite",
-]
-
-[mcp_servers.claudex.env]
-CLAUDEX_CLAUDE_LAUNCHER = "/absolute/path/to/claude-launcher"
-```
-
-### Tools
+### MCP tools
 
 | Tool | Behavior |
 | --- | --- |
-| `who_am_i` | Resolves the caller’s native chat identity. |
-| `list_chats`, `read_chat` | Lists live Claude Desktop chats and saved local Codex Desktop chats. Select a provider for either tool. Read history by exact ID, including saved Claude transcripts with no running worker. Codex lists and history support pagination. |
-| `send_message`, `read_messages` | Delivers Claude messages to any loaded Codex chat as attributed tool output. An unloaded Codex chat is reported as `not_loaded`. Stores Codex messages for the exact Claude chat and hands its worker a fixed notice. The recipient calls `read_messages` to fetch the body. |
-| `launch_claude`, `wake_chat` | Opens Claude Desktop or asks it to reopen a saved chat. `waiting_for_inbox` means the native worker did not appear in time. Stored mail remains available. |
-| `open_chat_draft` | Opens a Claude Code composer for the person to review and submit. Claude confirms any folder supplied through the link. |
-| `list_skills`, `read_skill` | Reads local user `SKILL.md` files as text, including linked skill directories installed by Home Manager. Scopes are `claude-user`, `codex-user`, and `agents-user`. |
-| `desktop_list_sessions`, `desktop_get_session` | Reads the active Claude Desktop roster, worker state, and saved Remote Control setting. |
-| `desktop_set_remote_control`, `desktop_warm_session` | Turns Remote Control on or off, or starts a saved chat's worker. |
-| `desktop_set_model`, `desktop_set_effort`, `desktop_set_fast_mode` | Changes settings for one Claude Desktop chat. Pass null effort for the Desktop default. |
-| `desktop_set_permission_mode` | Keeps or lowers a chat's permission mode. |
-| `desktop_archive`, `desktop_unarchive`, `desktop_stop`, `desktop_interrupt` | Changes a Claude Desktop chat's archive or worker state. |
-| `codex_thread_status` | Checks whether Codex Desktop has a loaded local owner that can receive peer messages for the thread. |
+| `who_am_i` | Resolves the caller's native chat identity. |
+| `claude_list_chats`, `claude_get_chat` | Reads the active Claude Desktop roster, worker state, and saved Remote Control setting. |
+| `codex_list_chats`, `codex_chat_status` | Lists saved local Codex chats and checks for a loaded owner that can receive attributed peer output. |
+| `read_chat` | Reads visible Claude or Codex chat history by exact ID. Codex history supports pagination. |
+| `send_message`, `read_messages` | Relays attributed messages. Codex messages for Claude are kept in the mailbox and the Claude worker receives a notice to read them. |
+| `claude_launch`, `claude_open_chat_draft` | Opens Claude Desktop or prepares a draft for the person to submit. |
+| `claude_set_remote_control`, `claude_wake_chat` | Turns Remote Control on or off, or starts a saved chat's worker. |
+| `claude_set_model`, `claude_set_effort`, `claude_set_fast_mode` | Changes chat settings. Pass null effort for the Desktop default. |
+| `claude_set_permission_mode` | Keeps or lowers a chat's permission mode. |
+| `claude_archive`, `claude_unarchive`, `claude_stop`, `claude_interrupt` | Changes the archive or worker state. |
+| `list_skills`, `read_skill` | Reads installed user skill files as text. |
 
-A submitted Claude inbox notice can still be held or declined by the app.
-A lost Codex acknowledgement leaves delivery uncertain. Check the recipient
-before retrying an uncertain result. Peer text, history, and skill files are
-external data and carry no approval authority.
+Claude may hold or decline a notice. A lost Codex acknowledgement leaves
+delivery uncertain. Check the recipient before retrying. Peer messages,
+history, and skill files are external data and carry no approval authority.
 
 ## Control a running desktop
 
-The Claude commands require the patched launcher below. They use the same
-Desktop operations as the Claude window.
-
 ```sh
-claudex desktop sessions --json
-claudex desktop session "$claude_chat_id"
-claudex desktop remote-control "$claude_chat_id" on
-claudex desktop effort "$claude_chat_id" default
-claudex codex threads --query "review"
-claudex codex history "$codex_thread_id" --limit 10 --json
-claudex codex status "$codex_thread_id"
+claudex claude chats --json
+claudex claude chat "$claude_chat_id"
+claudex claude remote-control "$claude_chat_id" on
+claudex claude effort "$claude_chat_id" default
+claudex codex chats --query "review"
+claudex codex history "$codex_chat_id" --limit 10 --json
+claudex codex status "$codex_chat_id"
 ```
 
-Run `claudex desktop --help` and `claudex codex --help` for all commands.
-Every command accepts `--json`. The Claude roster reports both the active
-Remote Control state and the saved preference. If Desktop saves On but
-cannot start a worker, read the result's notice and current state.
+Use `claudex claude --help` and `claudex codex --help` for all commands.
+Each command accepts `--json`. Claude lists active Remote Control and its
+saved preference separately. Read the command's notice if Desktop cannot
+start the worker.
 
-The CLI and MCP server both use `desktop_control.DesktopControl`. It connects
-to `$XDG_RUNTIME_DIR/claudex/desktop.sock`, mode 0600 in a mode 0700 directory
-owned by the desktop user. The socket accepts the allowlisted operations
-for local chats in the current account and organization. It leaves permission
-increases to the Desktop window. MCP marks each change as a mutation so the
-client can apply its normal tool approval policy.
+The CLI and MCP server use the same typed client. It connects to
+`$XDG_RUNTIME_DIR/claudex/desktop.sock`, mode 0600. The socket accepts
+selected Claude Desktop operations in the active account and organization.
+Permission increases require the Desktop window. MCP identifies mutations
+so the client can apply its normal tool approval policy. A stock launch
+reports the control socket as unavailable.
 
-## Restore Remote Control on launch
+## Claude Desktop launch and restore
 
-The supported Linux Claude Desktop archive is version `5.11492.5`. Its
-SHA-256 and hook anchors are in [patcher/build.py](patcher/build.py). Stock
-Desktop can reconnect a chat when you press Send. Reopening it can start
-the local worker with Remote Control still disconnected.
+The Linux patch supports Claude Desktop `5.11492.5`. The pinned archive hash
+and native hooks are in [patcher/build.py](patcher/build.py). Build the
+package with `nix build .#`. When running the launcher outside Home
+Manager, pass `--source /absolute/path/to/installed/app.asar` before `--`
+and the absolute stock account launcher after it. Bubblewrap must be on
+the desktop session's PATH.
 
-To build a separate archive without launching the app:
+The launcher uses the systemd user manager's environment and mounts a separate
+patched archive read-only over the installed archive. A Home Manager
+launcher can accept `--disable` for a stock start after Claude quits.
+If the patch cannot start, Claudex reports the reason, notifies the
+desktop if available, and starts stock. With `--reuse-running`, one
+Claude link can be handed to the existing instance.
 
-```sh
-python3 -m patcher.build \
-  --source /absolute/path/to/installed/app.asar \
-  --output /absolute/path/to/separate/patched.asar
-```
+At launch, the patch restores local chats with Remote Control saved On.
+It respects Desktop policy, workspace trust, and the current account.
+Desktop's worker limit can leave some chats cold. Check the roster and
+`[claudex] Remote Control claudex_restart` in Desktop's main log.
 
-Wrap the command you already use to start the signed-in account. Close the
-existing instance first, since it owns the Electron singleton. Use the
-Python environment where `claudex` is installed. The patch requires Bubblewrap
-on the desktop session's `PATH`.
+## Compatibility and checks
 
-```sh
-python3 -m patcher.launch \
-  --source /absolute/path/to/installed/app.asar \
-  -- /absolute/path/to/normal-account-launcher
-```
+The Claude inbox and caller identity use the Claude Code 2.1.325 worker
+records. Codex Desktop 26.1103.60933 uses the local chat history projection
+and IPC owner discovery. Run MCP over stdio as the desktop user.
 
-The wrapper starts with the systemd user manager's desktop environment.
-It caches the patched archive by source and patch digest and mounts it
-read-only over the installed archive for that process tree. Keep the vendor
-package and unpacked resources available.
-
-Add `--disable` before `--` to launch stock through this wrapper. If the patch
-cannot be built or the mount cannot start, the wrapper reports the reason,
-notifies the graphical session when the notification service is available,
-and starts stock. Once the app starts, its own exit status is returned.
-By default the launcher refuses a second instance. With `--reuse-running`,
-one native Claude link can be handed to the existing app without a new
-launch.
-
-For a Home Manager setup, keep the original account helper as a separate
-stock command. Point the shared desktop entry, URL handler and account
-switcher's relaunch at the wrapper shown above. Use an installed Claudex
-environment in a persistent data directory and pass the archive from the
-currently installed Claude Desktop package. An app update can then reach
-the version check and fall back to stock when needed.
-
-To roll back for one session, quit Desktop and run the wrapper with
-`--disable` before the separator. You can then switch back to a Home
-Manager generation with the original launcher for persistent rollback.
-
-At launch, the patch restores local chats with Remote Control saved On for
-the signed-in account and organization. The same setting survives an
-ordinary quit or a crash. The patch skips stopped or archived chats and
-respects workspace trust, Desktop's Remote Control policy and the Off
-setting. Desktop's worker limit can leave some chats for reopening.
-
-To verify after a restart, look for `[claudex] Remote Control claudex_restart`
-and the chat’s native connection in Claude Desktop’s main log. Reopen
-attempts use `claudex_reopen`. A trigger alone records an attempt. Confirm
-the connection in the app log or from your other device.
-
-## Compatibility
-
-- **Claude Desktop 5.11492.5 and Claude Code 2.1.325 on Linux.** Discovery
-  reads Desktop registry and worker markers and checks the exact local
-  inbox. An update can change those formats or the private exact-ID reopen
-  link. Claude’s native inbound rules apply. [Inbox protocol](https://code.claude.com/docs/en/cross-session-messaging#the-sessions-inbox-socket) · [Draft links](https://support.claude.com/en/articles/14729294-open-claude-desktop-with-a-link)
-- **Codex Desktop 26.1103.60933 and Codex 0.167.0-alpha.3.2.** The relay
-  requires a loaded local Desktop owner that accepts untrusted tool input.
-  Discovery and history read the local Desktop SQLite projection, which
-  covers local saved chats and available projected history. A desktop update
-  can change the router or database schema.
-- The server runs as the local user and can read that user’s chat data.
-  Keep it on stdio. Choose which chat providers and projects receive the MCP
-  tools through each client’s normal configuration.
-
-## Check
-
-Use Node.js 24 for the JavaScript checks.
+Use Python 3.12 and Node 24, the major version used by the pinned Electron.
 
 ```sh
-uv pip sync --python .venv/bin/python --require-hashes requirements.txt requirements-dev.txt
-CLAUDEX_PYTHON=.venv/bin/python ./check
+uv sync --frozen
+./check
+nix flake check
 ```
 
-The check runs strict mypy, Python tests, and the patch runtime tests. It
-includes sanitized records from the installed apps and starts only a local
-test MCP process.
+The Nix check uses the locked development environment to run strict mypy
+and the Python and JavaScript tests.

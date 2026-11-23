@@ -156,7 +156,7 @@ class DesktopRelayTest(unittest.TestCase):
             "type": "response", "requestId": "request", "method": "initialize", "resultType": "success",
             "handledByClientId": OWNER, "result": {"clientId": "invalid"},
         }
-        with self.assertRaises(desktop.DesktopError):
+        with self.assertRaises(desktop.CodexDesktopError):
             desktop.parse_router_frame(json.dumps(frame).encode())
 
 

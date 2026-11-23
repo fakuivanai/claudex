@@ -1,12 +1,4 @@
-"""Relay an authorized peer message to the loaded Codex Desktop owner.
-
-The little-endian framing and initialization were adapted from the local
-weekly-quota-guard/quota_guard_ipc.py prototype, SHA-256
-b272fe9e6006301a8e7d987c5c9ad6d0af5025d57891dfdb63601aa7204fd057.
-That implementation was derived from the Codex Desktop 26.1002.52244 bundle.
-The request methods, capability and versions here were verified against
-Codex Desktop 26.1103.60933.
-"""
+"""Local IPC used by Codex Desktop 26.1103.60933."""
 
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -46,15 +38,15 @@ def parse_client_id(value: object) -> ClientId:
 CheckedClientId = Annotated[ClientId, BeforeValidator(parse_client_id)]
 
 
-class DesktopError(ValueError):
+class CodexDesktopError(ValueError):
     pass
 
 
-class OwnerNotLoaded(DesktopError):
+class OwnerNotLoaded(CodexDesktopError):
     pass
 
 
-class UnconfirmedDelivery(DesktopError):
+class UnconfirmedDelivery(CodexDesktopError):
     pass
 
 
@@ -183,7 +175,7 @@ def parse_router_frame(payload: bytes) -> IncomingFrame | None:
                 return None
         return RouterResponse(response.request_id, parse_client_id(response.handled_by), reply)
     except ValueError as error:
-        raise DesktopError("Malformed Codex Desktop IPC response") from error
+        raise CodexDesktopError("Malformed Codex Desktop IPC response") from error
 
 
 class DesktopClient:
@@ -195,13 +187,13 @@ class DesktopClient:
     def initialize(self) -> None:
         response = self.request(Method.INITIALIZE, {"clientType": "claudex"})
         if not isinstance(response.reply, Initialization) or response.handled_by != response.reply.client_id:
-            raise DesktopError("Codex Desktop router did not establish a client identity")
+            raise CodexDesktopError("Codex Desktop router did not establish a client identity")
         self.client_id = response.reply.client_id
 
     def set_timeout(self) -> float:
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
-            raise DesktopError("Codex Desktop IPC timed out")
+            raise CodexDesktopError("Codex Desktop IPC timed out")
         self.connection.settimeout(remaining)
         return remaining
 
@@ -211,20 +203,20 @@ class DesktopClient:
             self.set_timeout()
             chunk = self.connection.recv(min(count - len(chunks), READ_CHUNK_BYTES))
             if not chunk:
-                raise DesktopError("Codex Desktop IPC disconnected")
+                raise CodexDesktopError("Codex Desktop IPC disconnected")
             chunks.extend(chunk)
         return bytes(chunks)
 
     def read_frame(self) -> IncomingFrame | None:
         size = int.from_bytes(self.receive_exactly(4), "little")
         if not 0 < size <= MAX_FRAME_BYTES:
-            raise DesktopError("Unexpected Codex Desktop IPC frame length")
+            raise CodexDesktopError("Unexpected Codex Desktop IPC frame length")
         return parse_router_frame(self.receive_exactly(size))
 
     def write_frame(self, frame: dict[str, object]) -> None:
         payload = json.dumps(frame, ensure_ascii=True, separators=(",", ":")).encode()
         if not 0 < len(payload) <= MAX_FRAME_BYTES:
-            raise DesktopError("Codex Desktop IPC request exceeds the frame limit")
+            raise CodexDesktopError("Codex Desktop IPC request exceeds the frame limit")
         self.set_timeout()
         self.connection.sendall(struct.pack("<I", len(payload)) + payload)
 
@@ -233,7 +225,7 @@ class DesktopClient:
         try:
             remaining = self.set_timeout()
         except OSError as error:
-            raise DesktopError("Codex Desktop IPC closed before the request") from error
+            raise CodexDesktopError("Codex Desktop IPC closed before the request") from error
         frame: dict[str, object] = {
             "type": "request",
             "requestId": request_id,
@@ -257,13 +249,13 @@ class DesktopClient:
                     })
                 elif incoming is not None and incoming.request_id == request_id:
                     break
-        except (DesktopError, OSError) as error:
-            failure = UnconfirmedDelivery if method is Method.START_TURN else DesktopError
+        except (CodexDesktopError, OSError) as error:
+            failure = UnconfirmedDelivery if method is Method.START_TURN else CodexDesktopError
             raise failure("Codex Desktop IPC closed, timed out, or returned invalid data") from error
         if isinstance(incoming, RouterRejection):
             if incoming.no_owner:
                 raise OwnerNotLoaded("Codex Desktop has no loaded owner for that local chat")
-            failure = UnconfirmedDelivery if method is Method.START_TURN else DesktopError
+            failure = UnconfirmedDelivery if method is Method.START_TURN else CodexDesktopError
             raise failure("Codex Desktop did not confirm the request")
         if target is not None and incoming.handled_by != target:
             raise UnconfirmedDelivery("Codex Desktop acknowledgement did not match the request")
@@ -273,11 +265,11 @@ class DesktopClient:
         response = self.request(Method.DISCOVER_OWNER, {"hostId": "local", "conversationId": chat_id})
         reply = response.reply
         if not isinstance(reply, OwnerCapability):
-            raise DesktopError("Codex Desktop acknowledgement did not match owner discovery")
+            raise CodexDesktopError("Codex Desktop acknowledgement did not match owner discovery")
         if response.handled_by == self.client_id:
-            raise DesktopError("Codex Desktop returned the relay as chat owner")
+            raise CodexDesktopError("Codex Desktop returned the relay as chat owner")
         if not reply.supports_tool_output:
-            raise DesktopError("Codex Desktop owner does not advertise untrusted tool input support")
+            raise CodexDesktopError("Codex Desktop owner does not advertise untrusted tool input support")
         return response.handled_by
 
     def deliver(self, chat_id: CodexChatId, output: ToolOutput) -> Submitted:
@@ -301,14 +293,14 @@ def desktop_client(socket_path: Path | None) -> Iterator[DesktopClient]:
     try:
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     except OSError as error:
-        raise DesktopError("Could not create Codex Desktop IPC socket") from error
+        raise CodexDesktopError("Could not create Codex Desktop IPC socket") from error
     with connection:
         client = DesktopClient(connection)
         try:
             client.set_timeout()
             connection.connect(str(path))
         except OSError as error:
-            raise DesktopError("Could not connect to Codex Desktop IPC") from error
+            raise CodexDesktopError("Could not connect to Codex Desktop IPC") from error
         client.initialize()
         yield client
 
@@ -341,5 +333,5 @@ def deliver(chat_id: CodexChatId, message: PeerMessage, *, socket_path: Path | N
         return NotLoaded(chat_id)
     except UnconfirmedDelivery as error:
         return Unknown(str(error))
-    except DesktopError as error:
+    except CodexDesktopError as error:
         return Refused(str(error))

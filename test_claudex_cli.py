@@ -6,10 +6,10 @@ import json
 import unittest
 from unittest.mock import patch
 
-import claudex_cli
+import claudex
 import codex_desktop
 import codex_history
-from desktop_control import DesktopControlRefused, DesktopMutation, DesktopSession, DesktopSessionRoster
+from desktop_control import DesktopMutation, DesktopSession, DesktopSessionRoster, Refused, Success
 from models import parse_codex_chat_id
 
 
@@ -20,7 +20,7 @@ CODEX_ID = parse_codex_chat_id("33d0f881-b4e7-4d66-badd-8192aa1dbd8f")
 def invoke(*args: str) -> tuple[int, str, str]:
     output, errors = io.StringIO(), io.StringIO()
     with redirect_stdout(output), redirect_stderr(errors):
-        status = claudex_cli.main(args)
+        status = claudex.main(list(args))
     return status, output.getvalue(), errors.getvalue()
 
 
@@ -36,22 +36,22 @@ class ClaudeCommands(unittest.TestCase):
         )
 
     def test_lists_saved_state_and_deferred_archives(self) -> None:
-        self.control.list_sessions.return_value = DesktopSessionRoster(sessions=[self.session], archived_pending=True)
+        self.control.list_sessions.return_value = Success(result=DesktopSessionRoster(sessions=[self.session], archived_pending=True))
 
-        status, output, errors = invoke("desktop", "sessions")
+        status, output, errors = invoke("claude", "chats")
         self.assertEqual((status, errors), (0, ""))
         self.assertIn("worker cold", output)
         self.assertIn("Remote Control off, saved on", output)
         self.assertIn("more archived chats to load", output)
         self.assertNotIn("\x1b", output)
 
-        status, output, errors = invoke("desktop", "sessions", "--json")
+        status, output, errors = invoke("claude", "chats", "--json")
         self.assertEqual((status, errors), (0, ""))
-        self.assertIs(json.loads(output)["sessions"][0]["remote_control_saved"], True)
+        self.assertIs(json.loads(output)["chats"][0]["remote_control_saved"], True)
 
     def test_reads_a_single_chat_by_exact_id(self) -> None:
-        self.control.get_session.return_value = self.session
-        status, output, errors = invoke("desktop", "session", CLAUDE_ID, "--json")
+        self.control.get_session.return_value = Success(result=self.session)
+        status, output, errors = invoke("claude", "chat", CLAUDE_ID, "--json")
         self.assertEqual((status, errors), (0, ""))
         self.assertEqual(json.loads(output)["chat_id"], CLAUDE_ID)
         self.control.get_session.assert_called_once_with(CLAUDE_ID)
@@ -60,7 +60,7 @@ class ClaudeCommands(unittest.TestCase):
         cases = (
             ("remote-control", ("on",), "set_remote_control", (True,)),
             ("remote-control", ("off",), "set_remote_control", (False,)),
-            ("warm", (), "warm_session", ()),
+            ("wake", (), "warm_session", ()),
             ("model", ("sonnet",), "set_model", ("sonnet",)),
             ("effort", ("high",), "set_effort", ("high",)),
             ("effort", ("default",), "set_effort", (None,)),
@@ -75,21 +75,21 @@ class ClaudeCommands(unittest.TestCase):
             with self.subTest(command=command, arguments=arguments):
                 self.control.reset_mock()
                 method = getattr(self.control, method_name)
-                method.return_value = DesktopMutation(session=self.session, notice=None)
-                status, output, errors = invoke("desktop", command, CLAUDE_ID, *arguments, "--json")
+                method.return_value = Success(result=DesktopMutation(session=self.session, notice=None))
+                status, output, errors = invoke("claude", command, CLAUDE_ID, *arguments, "--json")
                 self.assertEqual((status, errors), (0, ""))
-                self.assertEqual(json.loads(output)["session"]["chat_id"], CLAUDE_ID)
+                self.assertEqual(json.loads(output)["chat"]["chat_id"], CLAUDE_ID)
                 method.assert_called_once_with(CLAUDE_ID, *values)
 
     def test_native_refusal_is_nonzero_and_machine_readable(self) -> None:
-        self.control.set_permission_mode.side_effect = DesktopControlRefused("Permission mode would increase access.")
-        status, output, errors = invoke("desktop", "permission-mode", CLAUDE_ID, "bypassPermissions", "--json")
+        self.control.set_permission_mode.return_value = Refused(reason="Permission mode would increase access.")
+        status, output, errors = invoke("claude", "permission-mode", CLAUDE_ID, "bypassPermissions", "--json")
         self.assertEqual((status, errors), (1, ""))
         self.assertEqual(json.loads(output), {"status": "refused", "reason": "Permission mode would increase access."})
 
     def test_rejects_invalid_toggle_before_opening_client(self) -> None:
         with self.assertRaises(SystemExit) as failure, redirect_stderr(io.StringIO()):
-            claudex_cli.main(("desktop", "remote-control", CLAUDE_ID, "toggle"))
+            claudex.main(["claude", "remote-control", CLAUDE_ID, "toggle"])
         self.assertEqual(failure.exception.code, 2)
         self.control.set_remote_control.assert_not_called()
 
@@ -105,7 +105,7 @@ class CodexCommands(unittest.TestCase):
         page = codex_history.ChatPage((chat,), "next")
         with patch("codex_history.list_chats", return_value=page) as list_chats:
             status, output, errors = invoke(
-                "codex", "threads", "--query", "local", "--archived", "--limit", "1", "--cursor", "prior", "--json",
+                "codex", "chats", "--query", "local", "--archived", "--limit", "1", "--cursor", "prior", "--json",
             )
         self.assertEqual((status, errors), (0, ""))
         self.assertEqual(json.loads(output), page.to_wire())

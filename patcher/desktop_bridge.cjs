@@ -9,7 +9,8 @@ const SESSION_UNAVAILABLE = refusal("The chat is unavailable in the active accou
 
 // Desktop's set_session_permission_mode documents this order. dontAsk is a CLI
 // mode outside that Desktop order. An unknown or incomparable mode cannot move.
-const MODE_RANK = { plan: 0, default: 1, acceptEdits: 2, auto: 3, bypassPermissions: 4 };
+const PERMISSION_MODES = ["plan", "default", "acceptEdits", "auto", "bypassPermissions", "dontAsk"];
+const MODE_RANK = new Map(PERMISSION_MODES.filter((mode) => mode !== "dontAsk").map((mode, rank) => [mode, rank]));
 const LOCAL_CHAT_ID = /^local_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u;
 
 function captureScope(manager, account) {
@@ -56,9 +57,10 @@ function projectSession(row, chat) {
 }
 
 function canSetMode(current, desired) {
-  return current === desired ||
-    (Object.hasOwn(MODE_RANK, current) && Object.hasOwn(MODE_RANK, desired) &&
-      MODE_RANK[desired] < MODE_RANK[current]);
+  if (current === desired) return PERMISSION_MODES.includes(desired);
+  const rank = MODE_RANK.get(desired);
+  const currentRank = MODE_RANK.get(current);
+  return rank !== undefined && currentRank !== undefined && rank < currentRank;
 }
 
 // Do not forward raw errors or results. They can contain a workspace path
@@ -81,11 +83,10 @@ function remoteControlNotice(result) {
 }
 
 function createDesktopBridge(api, manager, { account, windowActive = () => true }) {
-  return async function dispatch(request) {
-    if (!windowActive()) return ROSTER_UNAVAILABLE;
-    const scope = captureScope(manager, account);
-    if (scope === null) return ROSTER_UNAVAILABLE;
+  return async function dispatch(request, scope = captureScope(manager, account)) {
+    if (scope === null || !windowActive()) return ROSTER_UNAVAILABLE;
     const current = () => windowActive() && sameScope(captureScope(manager, account), scope);
+    if (!current()) return SCOPE_CHANGED;
     await manager.waitForSessionsLoaded();
     if (!current()) return SCOPE_CHANGED;
     if (manager.isInitializing() || !manager.areSessionsLoaded()) return ROSTER_UNAVAILABLE;
@@ -241,10 +242,10 @@ function attachDesktopWindow(window, api, manager, account, log) {
   void app.whenReady().then(async () => {
     if (quitting || !app.hasSingleInstanceLock()) return;
     const { startDesktopSocket } = require("./claudex-desktop-socket.cjs");
-    listener = await startDesktopSocket((request) => {
+    listener = await startDesktopSocket((request, scope) => {
       const active = Array.from(windows.values()).at(-1);
-      return active ? active(request) : ROSTER_UNAVAILABLE;
-    });
+      return active ? active(request, scope) : ROSTER_UNAVAILABLE;
+    }, { capture: () => captureScope(manager, account) });
     if (quitting) await listener.close();
     else log("[claudex] Desktop control socket ready");
   }).catch((error) => {
