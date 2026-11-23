@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Annotated, Generic, Literal, TypeVar, get_args
 
 from pydantic import (
-    AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, RootModel, StringConstraints,
+    AfterValidator, AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, RootModel, StringConstraints,
     ValidationError,
 )
 
@@ -51,12 +51,13 @@ class DesktopSession(_WireModel):
 
 
 class DesktopSessionRoster(_WireModel):
-    sessions: list[DesktopSession] = Field(serialization_alias="chats")
+    # Advertise the public name to MCP while accepting Desktop's wire name.
+    sessions: list[DesktopSession] = Field(validation_alias=AliasChoices("chats", "sessions"), serialization_alias="chats")
     archived_pending: bool
 
 
 class DesktopMutation(_WireModel):
-    session: DesktopSession | None = Field(serialization_alias="chat")
+    session: DesktopSession | None = Field(validation_alias=AliasChoices("chat", "session"), serialization_alias="chat")
     notice: str | None = None
 
 

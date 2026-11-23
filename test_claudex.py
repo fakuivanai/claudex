@@ -7,11 +7,12 @@ from unittest.mock import create_autospec, patch
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import RequestParams
 
-from claudex import Bridge, codex_sender
+from claudex import Bridge, codex_sender, server
 from claude_lifecycle import StoredNotice
-from desktop_control import DesktopControl, DesktopSession, Success
+from desktop_control import DesktopControl, DesktopMutation, DesktopSession, DesktopSessionRoster, Success
 from models import Provider, Sender
 from peer_mailbox import Mailbox
 
@@ -83,6 +84,20 @@ class BridgeTest(unittest.TestCase):
 
 
 class StdioTest(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_results_match_the_mcp_output_schemas(self) -> None:
+        control = create_autospec(DesktopControl, instance=True)
+        control.list_sessions.return_value = Success(result=DesktopSessionRoster(sessions=[], archived_pending=False))
+        control.warm_session.return_value = Success(result=DesktopMutation(session=None, notice="Fixture worker"))
+        with TemporaryDirectory() as directory:
+            application = server(Bridge(Provider.CLAUDE, Mailbox(Path(directory) / "mail.sqlite"), control))
+            async with create_connected_server_and_client_session(application) as session:
+                roster = await session.call_tool("claude_list_chats")
+                changed = await session.call_tool("claude_wake_chat", {"chat_id": CLAUDE_CHAT})
+        self.assertFalse(roster.isError)
+        self.assertEqual(roster.structuredContent, {"chats": [], "archived_pending": False})
+        self.assertFalse(changed.isError)
+        self.assertEqual(changed.structuredContent, {"chat": None, "notice": "Fixture worker"})
+
     async def test_mcp_advertises_the_public_tool_names(self) -> None:
         with TemporaryDirectory() as directory:
             entrypoint = str(Path(__file__).with_name("claudex.py"))
