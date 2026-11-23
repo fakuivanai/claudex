@@ -83,6 +83,35 @@ class DesktopControlTests(unittest.TestCase):
             self.assertEqual(chat.result.model_dump(), _ROW)
             self.assertEqual(json.loads(request.result(3)), {"tool": "getSession", "input": {"chat_id": _CHAT_ID}})
 
+    def test_start_sends_only_the_native_start_parameters(self) -> None:
+        sender = "01234567-89ab-cdef-0123-456789abcdef"
+        folder = str(self.runtime)
+        with self.reply(frame({"status": "ok", "result": _ROW})) as request:
+            result = self.desktop.start_chat(
+                _CHAT_ID, folder=folder, model="haiku", effort="low", sender_chat_id=sender,
+            )
+            assert isinstance(result, Success)
+            self.assertEqual(result.result.chat_id, _CHAT_ID)
+            self.assertEqual(json.loads(request.result(3)), {
+                "tool": "startSession",
+                "input": {"chat_id": _CHAT_ID, "folder": folder, "model": "haiku", "effort": "low",
+                          "sender_chat_id": sender},
+            })
+
+    def test_start_refuses_invalid_folder_and_does_not_accept_another_chat(self) -> None:
+        sender = "01234567-89ab-cdef-0123-456789abcdef"
+        for folder in ("workspace", "/tmp/workspace\0", "/tmp/\ud800"):
+            with self.subTest(folder=folder):
+                self.assertIsInstance(self.desktop.start_chat(
+                    _CHAT_ID, folder=folder, model="sonnet", effort=None, sender_chat_id=sender,
+                ), InvalidRequest)
+        with self.reply(frame({"status": "ok", "result": {**_ROW, "chat_id": _OTHER_CHAT_ID}})):
+            result = self.desktop.start_chat(
+                _CHAT_ID, folder=str(self.runtime), model="sonnet", effort=None, sender_chat_id=sender,
+            )
+            assert isinstance(result, InvalidResponse)
+            self.assertIn("The chat may already have started", result.reason)
+
     def test_each_mutation_sends_its_native_method_and_payload(self) -> None:
         cases: list[tuple[str, dict[str, object], Callable[[], DesktopResult[DesktopMutation]]]] = [
             ("toggleRemoteControl", {"enabled": True}, lambda: self.desktop.set_remote_control(_CHAT_ID, True)),

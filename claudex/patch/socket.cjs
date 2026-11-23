@@ -16,6 +16,7 @@ const REQUEST_TIMEOUT_MS = 2000;
 const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 const endpoints = new Set();
 const LOCAL_CHAT_ID = /^local_[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const CODEX_CHAT_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u;
 const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 function exactObject(value, ...keys) {
@@ -25,7 +26,7 @@ function exactObject(value, ...keys) {
 
 function optionToken(value, max) {
   return typeof value === "string" && value.length > 0 && value.length <= max &&
-    value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
+    value.trim() === value && !/[\u0000-\u001f\u007f\ud800-\udfff]/u.test(value);
 }
 
 function parseRequest(bytes) {
@@ -44,6 +45,13 @@ function parseRequest(bytes) {
     throw new Error("Invalid Desktop chat ID.");
   }
   switch (tool) {
+    case "startSession":
+      if (exactObject(input, "chat_id", "folder", "model", "effort", "sender_chat_id") &&
+          optionToken(input.folder, MAX_REQUEST_BYTES) && path.isAbsolute(input.folder) &&
+          optionToken(input.model, 128) && (input.effort === null || EFFORTS.has(input.effort)) &&
+          typeof input.sender_chat_id === "string" && input.sender_chat_id.length === 36 &&
+          CODEX_CHAT_ID.test(input.sender_chat_id)) return request;
+      break;
     case "getSession":
     case "warmSession":
     case "archive":

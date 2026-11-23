@@ -15,6 +15,12 @@ const localId = "local_01234567-89ab-cdef-0123-456789abcdef";
 const list = { tool: "getSessionList", input: {} };
 const toggle = { tool: "toggleRemoteControl", input: { chat_id: localId, enabled: true } };
 
+const start = {
+  tool: "startSession",
+  input: { chat_id: localId, folder: "/tmp/example", model: "sonnet", effort: "high",
+    sender_chat_id: "12345678-89ab-cdef-0123-456789abcdef" },
+};
+
 function exchange(endpoint, wire, sent) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(endpoint, () => socket.end(wire, sent));
@@ -56,6 +62,11 @@ test("forwards allowlisted calls and preserves an explicit refusal", async (t) =
   assert.deepEqual(await exchange(endpoint, encode(toggle)), refusal);
 });
 
+test("forwards the native start fields", async (t) => {
+  const { endpoint } = await fixture(t, async (request) => success(request));
+  assert.deepEqual(await exchange(endpoint, encode(start)), success(start));
+});
+
 test("rejects unknown tools, malformed frames and ambiguous targets before dispatch", async (t) => {
   let called = false;
   const { endpoint } = await fixture(t, async () => { called = true; });
@@ -65,6 +76,11 @@ test("rejects unknown tools, malformed frames and ambiguous targets before dispa
     ...["createSession", "sendMessage", "respondToToolPermission", "runBashCommand", "delete"].map(
       (tool) => encode({ tool, input: { chat_id: localId } }),
     ),
+    ...[
+      { folder: "relative/path" }, { folder: "/tmp/folder\n" }, { folder: "/tmp/\ud800" },
+      { sender_chat_id: "forged sender" }, { effort: "unrecognized" }, { message: "peer text" },
+      { permission_mode: "bypassPermissions" }, { permissionMode: "bypassPermissions" },
+    ].map((fields) => encode({ ...start, input: { ...start.input, ...fields } })),
     encode({ tool: "archive", input: { chat_id: localId, cleanupWorktree: true } }),
     encode({ tool: "setModel", input: { chat_id: localId, model: "a\u0000b" } }),
     encode({ tool: "setPermissionMode", input: { chat_id: localId, mode: "" } }),

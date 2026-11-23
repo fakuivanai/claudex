@@ -16,7 +16,7 @@ from pydantic import (
 )
 
 from claudex.environment import systemd_runtime_directory
-from claudex.models import parse_claude_chat_id
+from claudex.models import UUIDText, parse_claude_chat_id
 
 # One small JSON request and one roster per connection. The JS tests check
 # these bounds against the server's. The timeout includes queuing and a cold
@@ -72,6 +72,18 @@ def _model_id(value: object) -> object:
     return value
 
 
+def _absolute_folder(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    if not Path(value).is_absolute():
+        raise ValueError("Enter an absolute folder path.")
+    if value != value.strip() or any(
+        ord(char) < 32 or ord(char) == 127 or 0xD800 <= ord(char) <= 0xDFFF for char in value
+    ):
+        raise ValueError("Enter a folder path without surrounding whitespace or control characters.")
+    return value
+
+
 class _ChatInput(_WireModel):
     chat_id: _ChatId
 
@@ -82,6 +94,12 @@ class _EnabledInput(_ChatInput):
 
 class _ModelInput(_ChatInput):
     model: Annotated[str, StringConstraints(min_length=1, max_length=128), BeforeValidator(_model_id)]
+
+
+class _StartInput(_ModelInput):
+    folder: Annotated[str, BeforeValidator(_absolute_folder)]
+    effort: Effort | None
+    sender_chat_id: UUIDText
 
 
 class _EffortInput(_ChatInput):
@@ -100,6 +118,11 @@ class _ListSessions(_WireModel):
 class _GetSession(_WireModel):
     tool: Literal["getSession"] = "getSession"
     input: _ChatInput
+
+
+class _StartSession(_WireModel):
+    tool: Literal["startSession"] = "startSession"
+    input: _StartInput
 
 
 class _ToggleRemoteControl(_WireModel):
@@ -156,7 +179,7 @@ type _MutationRequest = (
     _ToggleRemoteControl | _WarmSession | _SetModel | _SetEffort | _SetFastMode |
     _SetPermissionMode | _Archive | _Unarchive | _Stop | _Interrupt
 )
-type _Request = _ListSessions | _GetSession | _MutationRequest
+type _Request = _ListSessions | _GetSession | _StartSession | _MutationRequest
 
 _Result = TypeVar("_Result", bound=_WireModel)
 
@@ -225,6 +248,24 @@ class DesktopControl:
         result = self._request(request, _CHAT_RESPONSE)
         if isinstance(result, Success) and result.result.chat_id != chat_id:
             return InvalidResponse("Desktop returned a different chat than requested.")
+        return result
+
+    def start_chat(
+        self, chat_id: str, *, folder: str, model: str, effort: Effort | None, sender_chat_id: str,
+    ) -> DesktopResult[DesktopChat]:
+        try:
+            request = _StartSession(input=_StartInput(
+                chat_id=chat_id, folder=folder, model=model, effort=effort, sender_chat_id=sender_chat_id,
+            ))
+        except ValidationError as error:
+            return _invalid_request(error)
+        result = self._request(request, _CHAT_RESPONSE)
+        if isinstance(result, Success) and result.result.chat_id != chat_id:
+            result = InvalidResponse("Desktop returned a different chat than requested.")
+        if isinstance(result, InvalidResponse):
+            return InvalidResponse(
+                f"{result.reason} The chat may already have started. Check the chat before retrying."
+            )
         return result
 
     def set_remote_control(self, chat_id: str, enabled: bool) -> DesktopResult[DesktopMutation]:
