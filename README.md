@@ -275,3 +275,7 @@ claudex/
     socket.cjs    the control socket server, run inside Desktop
 tests/            the same layout, with recorded app data in fixtures/
 ```
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
