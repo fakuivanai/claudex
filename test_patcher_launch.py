@@ -16,7 +16,9 @@ from desktop_environment import clean_environment, parse_desktop_environment
 from patcher import build as archive_builder
 from patcher.archive import Directory, Packed, encode_header, integrity_of
 from patcher.build import Anchor, DesktopRelease
-from patcher.launch import LaunchRefused, STOCK_LAUNCH_MARKER, cached_archive, launch, notify_stock_fallback, running_desktop
+from patcher.launch import (
+    CachedArchive, LaunchRefused, STOCK_LAUNCH_MARKER, cached_archive, launch, notify_stock_fallback, running_desktop,
+)
 
 
 class DesktopEnvironmentTests(unittest.TestCase):
@@ -58,7 +60,7 @@ class DesktopLaunchTests(unittest.TestCase):
         self.state = self.root / ".local" / "state" / "claudex" / "desktop"
         self.stock = self.root / "stock.asar"
         self.stock.touch()
-        self.patched = self.root / "patched.asar"
+        self.patched = CachedArchive(self.root / "patched.asar", self.root / "patched.json")
         self.record = self.root / "launch-record"
         self.notice_record = self.root / "notice-record"
         self.environment = {"HOME": str(self.root), "PATH": str(self.bin), "XDG_CACHE_HOME": str(self.root / "cache")}
@@ -354,12 +356,12 @@ os.execv(arguments[0], arguments)
         release = self.cache_fixture()
         with patch("patcher.build.SUPPORTED_RELEASES", (release,)):
             original = cached_archive(self.stock, self.cache)
-            original.chmod(0o600)
-            original.write_bytes(b"tampered archive")
+            original.archive.chmod(0o600)
+            original.archive.write_bytes(b"tampered archive")
             rebuilt = cached_archive(self.stock, self.cache)
-        self.assertNotEqual(rebuilt.read_bytes(), b"tampered archive")
+            self.assertNotEqual(rebuilt.archive.read_bytes(), b"tampered archive")
 
-    def test_launch_keeps_the_current_cache_and_preserves_unmanaged_entries(self) -> None:
+    def test_launch_keeps_only_the_current_cache_pair(self) -> None:
         release = self.cache_fixture()
         self.fake_bubblewrap()
         args = self.fake_launcher()
@@ -369,18 +371,16 @@ os.execv(arguments[0], arguments)
             patch("patcher.build.SUPPORTED_RELEASES", (release,)),
             patch("patcher.launch.patch_digest", return_value=stale_patch),
         ):
-            stale = cached_archive(self.stock, self.cache)
-        stale_reference, = self.cache.glob("*.json")
+            cached_archive(self.stock, self.cache)
 
         staging = self.cache / "launch-unfinished"
         staging.mkdir()
         (staging / "app.asar").write_bytes(b"partially written")
-        orphan = self.cache / f"{'c' * 64}-{stale_patch}.asar"
-        orphan.write_bytes(b"no provenance")
-        unrelated = self.cache / f"{'d' * 64}-{stale_patch}.json"
-        unrelated.write_text("user note")
-        linked = self.cache / f"{'e' * 64}-{stale_patch}.json"
-        linked.symlink_to(unrelated)
+        (self.cache / f"{'c' * 64}-{stale_patch}.asar").write_bytes(b"orphan")
+        external = self.root / "external"
+        external.mkdir()
+        (external / "kept").touch()
+        (self.cache / "link").symlink_to(external, target_is_directory=True)
 
         with (
             patch("patcher.build.SUPPORTED_RELEASES", (release,)),
@@ -390,14 +390,10 @@ os.execv(arguments[0], arguments)
         ):
             self.assertEqual(launch(self.stock, args, disabled=False), 0)
 
-        self.assertFalse(stale.exists())
-        self.assertFalse(stale_reference.exists())
-        self.assertEqual(len(list(self.cache.glob(f"*-{current_patch}.asar"))), 1)
-        self.assertEqual(len(list(self.cache.glob(f"*-{current_patch}.json"))), 1)
-        self.assertTrue((staging / "app.asar").is_file())
-        self.assertTrue(orphan.exists())
-        self.assertTrue(linked.is_symlink())
-        self.assertEqual(unrelated.read_text(), "user note")
+            current = cached_archive(self.stock, self.cache)
+
+        self.assertEqual(set(self.cache.iterdir()), {current.archive, current.reference})
+        self.assertTrue((external / "kept").is_file())
 
     def test_cache_hit_prunes_stale_references_to_the_current_archive(self) -> None:
         release = self.cache_fixture()
@@ -419,7 +415,7 @@ os.execv(arguments[0], arguments)
             with patch("patcher.build.build") as build:
                 self.assertEqual(launch(self.stock, args, disabled=False), 0)
             build.assert_not_called()
-        self.assertTrue(current.is_file())
+        self.assertTrue(current.archive.is_file())
         self.assertTrue(reference.is_file())
         self.assertFalse(obsolete.exists())
 

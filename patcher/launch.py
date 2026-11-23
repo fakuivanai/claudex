@@ -51,12 +51,16 @@ class CacheRecord:
     artifact: FileIdentity
 
 
+@dataclass(frozen=True)
+class CachedArchive:
+    archive: Path
+    reference: Path
+
+
 # The archive is reused only when the source stat identity and patch inputs match.
 FILE_IDENTITY = TypeAdapter(FileIdentity)
 CACHE_RECORD = TypeAdapter(CacheRecord)
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
-# Generated references are named by the source identity and patch digests.
-CACHE_REFERENCE = re.compile(r"[0-9a-f]{64}-([0-9a-f]{64})\.json")
 # A managed stock run invalidates an older Remote Control shutdown snapshot.
 STOCK_LAUNCH_MARKER = "last-stock-launch"
 STOCK_LAUNCH_CUTOFF = "CLAUDEX_REMOTE_CONTROL_SINCE"
@@ -128,7 +132,7 @@ def patch_digest() -> str:
     return digest.hexdigest()
 
 
-def cached_archive(source: Path, cache: Path) -> Path:
+def cached_archive(source: Path, cache: Path) -> CachedArchive:
     identity = FileIdentity.read(source)
     patch = patch_digest()
     source_key = hashlib.sha256(os.fsencode(source) + b"\0" + FILE_IDENTITY.dump_json(identity)).hexdigest()
@@ -141,7 +145,7 @@ def cached_archive(source: Path, cache: Path) -> Path:
         if supported:
             candidate = cache / f"{record.source_digest}-{patch}.asar"
             if FileIdentity.read(candidate) == record.artifact:
-                return candidate
+                return CachedArchive(candidate, reference)
     except (OSError, ValidationError):
         pass
 
@@ -156,46 +160,18 @@ def cached_archive(source: Path, cache: Path) -> Path:
         output.chmod(0o400)
         output.replace(candidate)
     publish_bytes(reference, CACHE_RECORD.dump_json(CacheRecord(release.digest, FileIdentity.read(candidate))))
-    return candidate
+    return CachedArchive(candidate, reference)
 
 
-def prune_cached_archives(cache: Path, current: Path) -> None:
-    """Remove proven stale cache entries after checking that Desktop is stopped under the launch lock."""
-    if current.parent != cache:
-        return
-    current_identity = FileIdentity.read(current)
-    for reference in cache.iterdir():
-        name = CACHE_REFERENCE.fullmatch(reference.name)
-        if name is None:
+def prune_cached_archives(cache: Path, current: CachedArchive) -> None:
+    """Trim the private cache with the launch lock held and Desktop stopped."""
+    for entry in cache.iterdir():
+        if entry == current.archive or entry == current.reference:
             continue
-        try:
-            info = reference.lstat()
-            if info.st_uid != os.getuid() or not stat.S_ISREG(info.st_mode):
-                continue
-            record = CACHE_RECORD.validate_json(reference.read_bytes(), strict=True)
-        except (OSError, ValidationError):
-            continue
-        if SHA256_HEX.fullmatch(record.source_digest) is None:
-            continue
-        candidate = cache / f"{record.source_digest}-{name[1]}.asar"
-        if candidate == current:
-            if current_identity != record.artifact:
-                reference.unlink(missing_ok=True)
-            continue
-        try:
-            identity = FileIdentity.read(candidate)
-        except FileNotFoundError:
-            reference.unlink(missing_ok=True)
-            continue
-        except OSError:
-            # An unreadable or nonregular artifact cannot be proven to be ours.
-            continue
-        if identity != record.artifact or (
-            identity.device == current_identity.device and identity.inode == current_identity.inode
-        ):
-            continue
-        candidate.unlink(missing_ok=True)
-        reference.unlink(missing_ok=True)
+        if stat.S_ISDIR(entry.lstat().st_mode):
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
 
 
 def mount_command(bubblewrap: str, patched: Path, stock: Path, command: list[str]) -> list[str]:
@@ -349,7 +325,7 @@ def launch(source: Path, command: list[str], *, disabled: bool, reuse_running: b
         except OSError as error:
             print(f"claudex: Could not remove an old cached patch ({error}).", file=sys.stderr)
         patched_environment = {**environment, STOCK_LAUNCH_CUTOFF: cutoff}
-        result = start_patched(bubblewrap, patched, source, command, patched_environment, cache)
+        result = start_patched(bubblewrap, patched.archive, source, command, patched_environment, cache)
         match result:
             case Fallback():
                 return stock_launch(command, environment, state, result)
