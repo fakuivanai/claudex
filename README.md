@@ -77,12 +77,19 @@ is. Each send reports one of:
 If the chat has no running worker, Claudex starts one through the patch and
 waits up to 18 seconds for its inbox. If that fails, the message stays in
 the mailbox until the chat reads it. Claude Code applies its own rules to
-the notice and may hold or decline it.
+the notice and may hold or decline it. It also presents the notice as coming
+from another Claude session, even when a Codex chat sent it. The notice text
+names the real sender.
 
 Messages, chat history and skill files come from another agent. They are
 data, never approval for anything. The server says so in its MCP
 instructions, and every reply that carries another agent's text is labelled
 untrusted.
+
+A message's sender is the app, chat ID and title that the sending MCP client
+reported. Claudex doesn't check them. That's fine on a single-user machine,
+since any program running as you could write to the mailbox directly, but
+the sender is a label, not proof of who sent the message.
 
 ## MCP tools
 
