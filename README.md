@@ -45,27 +45,31 @@ codex mcp add claudex --env "CLAUDEX_CLAUDE_LAUNCHER=$launcher" -- \
 - `$mailbox` is a SQLite file shared by both apps. It keeps the newest 1,000
   messages for each recipient.
 
-Only chats started after registration get the tools. To check one, call
-`who_am_i` from it: it should return that chat's app, ID and title. Claude
-Code gives the server its chat's identity once, when the server starts,
-while Codex sends it with each request. So after a Claude Code `/clear` or
-resume, you may need to reconnect MCP.
+Start a new chat to load the tools after registration. Restarting Codex
+Desktop also loads them for existing Codex chats. Call `who_am_i` to check
+the chat's app, ID and title. Claude Code supplies the chat's identity
+when the server starts. Codex supplies it with each request. After a
+Claude Code `/clear` or resume, you may need to reconnect MCP.
 
 ## How messages travel
 
 **From a Claude chat to a Codex chat:**
 
-1. Claudex asks Codex Desktop which of its windows has the chat open.
-2. It asks that window to start a new turn, with the message attached as
-   tool output from `claudex.peer_message`, not as your input.
+1. Claudex asks Codex Desktop which window owns the loaded chat.
+2. It sends the message as untrusted tool output from `claudex.peer_message`.
+   Codex starts a turn or adds the output to the turn already running.
 
-The chat must be open in Codex; `codex_chat_status` tells you whether it
-is. Each send reports one of:
+A Codex window has to load the chat before it can receive messages.
+After restarting Codex Desktop, open any chat that reports `not_loaded`.
+`codex_chat_status` reports whether the chat is loaded and whether its
+owner can receive peer messages.
 
-- `submitted`, with the new turn's ID;
-- `not_loaded`: no window has the chat open;
-- `refused`;
-- `unknown`: Codex didn't confirm. Check the chat before sending again.
+- `submitted` includes the ID of the receiving turn. `joined_existing`
+  is true when the confirmed turn ID matches one already running before
+  the send. It is null when Claudex can't tell.
+- `not_loaded` means no window owns the loaded chat.
+- `refused` reports a rejected request.
+- `unknown` means Codex didn't confirm. Check the chat before sending again.
 
 **From a Codex chat to a Claude chat:**
 
@@ -99,7 +103,7 @@ the sender is a label, not proof of who sent the message.
 | `send_message` | Sends a message to a chat in the other app, by exact ID. |
 | `read_messages` | Reads messages addressed to the calling chat, after a cursor. |
 | `codex_list_chats` | Lists or searches saved Codex chats. |
-| `codex_chat_status` | Checks whether a Codex window has the chat open and can take a message. |
+| `codex_chat_status` | Reports whether the chat is loaded and reachable for peer messages. |
 | `read_chat` | Reads a Claude or Codex chat's visible history by exact ID. Claude returns up to 100 messages; Codex pages up to 10 turns at a time. |
 | `list_skills`, `read_skill` | Lists your installed Claude Code or Codex skills, or reads one `SKILL.md` as plain text. |
 | `claude_list_chats`, `claude_get_chat` | Shows Claude Desktop chats with their worker, settings and Remote Control state. |
@@ -143,9 +147,10 @@ start a chat's worker, the command prints a notice that says so.
 ## The Desktop control socket
 
 The patch serves `$XDG_RUNTIME_DIR/claudex/desktop.sock`, mode 0600. The CLI
-and the MCP server use the same typed client for it. The socket serves only
-the operations listed above, and only for local chats in the account and
-organization Desktop has active. Desktop does the work through its own
+and the MCP server share a client. When `XDG_RUNTIME_DIR` is missing or
+relative, they use a user-owned `/run/user/<uid>` directory with mode 0700.
+The socket serves only the operations listed above, and only for local
+chats in the account and organization Desktop has active. Desktop does the work through its own
 window API, under its own checks:
 
 - An archived chat can be read, archived or unarchived. Anything else is
