@@ -12,6 +12,10 @@ dynamic = ["dependencies"]
 
 [project.scripts]
 claudex = "claudex:main"
+claudex-desktop = "patcher.launch:main"
+
+[dependency-groups]
+dev = ["mypy==1.20.1", "setuptools==80.10.1"]
 
 [tool.setuptools]
 packages = ["patcher"]

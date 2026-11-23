@@ -16,6 +16,10 @@ uv pip sync --python .venv/bin/python --require-hashes requirements.txt requirem
 uv pip install --python .venv/bin/python --no-build-isolation --no-deps .
 ```
 
+On x86-64 NixOS, `nix build .#` builds `claudex` and `claudex-desktop`
+from the flake and `uv.lock`. `nix flake check` verifies both entry points
+and the Claude Code executable bundled with the SDK.
+
 Both clients use the same absolute `--state` path to a local SQLite mailbox
 in a directory you own. It retains the newest 1,000 messages per recipient.
 Use a new mailbox path if you tried the prototype's earlier format.
