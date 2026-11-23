@@ -60,16 +60,6 @@ class DesktopMutation(_WireModel):
     notice: str | None = None
 
 
-# Recognize an older running Desktop after the client has been updated.
-# These models are used only for error reporting.
-class _LegacyChatList(DesktopChatList):
-    chats: list[DesktopChat] = Field(alias="sessions")
-
-
-class _LegacyMutation(DesktopMutation):
-    chat: DesktopChat | None = Field(alias="session")
-
-
 def _model_id(value: object) -> object:
     if not isinstance(value, str):
         return value
@@ -214,10 +204,6 @@ type _Response[T: _WireModel] = Annotated[Success[T] | Refused | DesktopFailure,
 _CHAT_LIST_RESPONSE = RootModel[_Response[DesktopChatList]]
 _CHAT_RESPONSE = RootModel[_Response[DesktopChat]]
 _MUTATION_RESPONSE = RootModel[_Response[DesktopMutation]]
-_LEGACY_CHAT_LIST_RESPONSE = RootModel[_Response[_LegacyChatList]]
-_LEGACY_MUTATION_RESPONSE = RootModel[_Response[_LegacyMutation]]
-
-_BUILD_MISMATCH = "The Claudex client and Claude Desktop may be on different builds. Restart Claude Desktop."
 
 
 class DesktopControl:
@@ -279,7 +265,11 @@ class DesktopControl:
         if isinstance(result, Success):
             chat = result.result.chat
             if chat is not None and chat.chat_id != request.input.chat_id:
-                return InvalidResponse("Desktop returned a different chat than requested.")
+                result = InvalidResponse("Desktop returned a different chat than requested.")
+        if isinstance(result, InvalidResponse):
+            return InvalidResponse(
+                f"{result.reason} The change may already have taken effect. Check the chat before retrying."
+            )
         return result
 
     def _request(
@@ -313,28 +303,10 @@ class DesktopControl:
         try:
             return response.model_validate_json(frame).root
         except ValidationError:
-            return _invalid_response(request, frame)
-
-
-def _invalid_response(request: _Request, frame: bytes) -> InvalidResponse:
-    try:
-        if isinstance(request, _ListSessions):
-            legacy_list = _LEGACY_CHAT_LIST_RESPONSE.model_validate_json(frame).root
-            if isinstance(legacy_list, Success):
-                return InvalidResponse(_BUILD_MISMATCH)
-        elif not isinstance(request, _GetSession):
-            legacy_mutation = _LEGACY_MUTATION_RESPONSE.model_validate_json(frame).root
-            if isinstance(legacy_mutation, Success):
-                chat = legacy_mutation.result.chat
-                if chat is not None and chat.chat_id != request.input.chat_id:
-                    return InvalidResponse("Desktop returned a different chat than requested.")
-                return InvalidResponse(
-                    f"{_BUILD_MISMATCH} The change may already have taken effect. "
-                    "Check the chat's state before retrying."
-                )
-    except ValidationError:
-        pass
-    return InvalidResponse("Desktop returned an invalid response.")
+            return InvalidResponse(
+                "Claude Desktop sent a reply this Claudex build can't read. "
+                "If Claudex was just updated, restart Claude Desktop."
+            )
 
 
 def _invalid_request(error: ValidationError) -> InvalidRequest:
