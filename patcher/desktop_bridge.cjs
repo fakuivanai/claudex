@@ -5,7 +5,7 @@ const failure = (reason) => ({ status: "error", reason });
 const success = (result) => ({ status: "ok", result });
 const SCOPE_CHANGED = failure("The active Desktop account or chat roster changed during the request.");
 const ROSTER_UNAVAILABLE = failure("The active Desktop roster is unavailable.");
-const SESSION_UNAVAILABLE = refusal("The chat is unavailable in the active account and organization.");
+const CHAT_UNAVAILABLE = refusal("The chat is unavailable in the active account and organization.");
 
 // Desktop's set_session_permission_mode documents this order. dontAsk is a CLI
 // mode outside that Desktop order. An unknown or incomparable mode cannot move.
@@ -112,7 +112,7 @@ function createDesktopBridge(api, manager, { account, windowActive = () => true 
     const row = await api.getSession(id);
     if (!current()) return SCOPE_CHANGED;
     const chat = manager.sessions.get(id);
-    if (row?.sessionId !== id || row.isCloudRun || !ownsLocalChat(chat, scope)) return SESSION_UNAVAILABLE;
+    if (row?.sessionId !== id || row.isCloudRun || !ownsLocalChat(chat, scope)) return CHAT_UNAVAILABLE;
     const ownsTarget = () => current() && manager.sessions.get(id) === chat && ownsLocalChat(chat, scope);
 
     if (request.tool === "getSession") return success(projectChat(row, chat));

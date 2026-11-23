@@ -102,62 +102,62 @@ class _ModeInput(_ChatInput):
 
 
 class _ListSessions(_WireModel):
-    tool: Literal["getSessionList"]
+    tool: Literal["getSessionList"] = "getSessionList"
     input: _WireModel
 
 
 class _GetSession(_WireModel):
-    tool: Literal["getSession"]
+    tool: Literal["getSession"] = "getSession"
     input: _ChatInput
 
 
 class _ToggleRemoteControl(_WireModel):
-    tool: Literal["toggleRemoteControl"]
+    tool: Literal["toggleRemoteControl"] = "toggleRemoteControl"
     input: _EnabledInput
 
 
 class _WarmSession(_WireModel):
-    tool: Literal["warmSession"]
+    tool: Literal["warmSession"] = "warmSession"
     input: _ChatInput
 
 
 class _SetModel(_WireModel):
-    tool: Literal["setModel"]
+    tool: Literal["setModel"] = "setModel"
     input: _ModelInput
 
 
 class _SetEffort(_WireModel):
-    tool: Literal["setEffort"]
+    tool: Literal["setEffort"] = "setEffort"
     input: _EffortInput
 
 
 class _SetFastMode(_WireModel):
-    tool: Literal["setFastMode"]
+    tool: Literal["setFastMode"] = "setFastMode"
     input: _EnabledInput
 
 
 class _SetPermissionMode(_WireModel):
-    tool: Literal["setPermissionMode"]
+    tool: Literal["setPermissionMode"] = "setPermissionMode"
     input: _ModeInput
 
 
 class _Archive(_WireModel):
-    tool: Literal["archive"]
+    tool: Literal["archive"] = "archive"
     input: _ChatInput
 
 
 class _Unarchive(_WireModel):
-    tool: Literal["unarchive"]
+    tool: Literal["unarchive"] = "unarchive"
     input: _ChatInput
 
 
 class _Stop(_WireModel):
-    tool: Literal["stop"]
+    tool: Literal["stop"] = "stop"
     input: _ChatInput
 
 
 class _Interrupt(_WireModel):
-    tool: Literal["interrupt"]
+    tool: Literal["interrupt"] = "interrupt"
     input: _ChatInput
 
 
@@ -228,11 +228,11 @@ class DesktopControl:
         self._timeout = timeout
 
     def list_chats(self) -> DesktopResult[DesktopChatList]:
-        return self._request(_ListSessions(tool="getSessionList", input=_WireModel()), _CHAT_LIST_RESPONSE)
+        return self._request(_ListSessions(input=_WireModel()), _CHAT_LIST_RESPONSE)
 
     def get_chat(self, chat_id: str) -> DesktopResult[DesktopChat]:
         try:
-            request = _GetSession(tool="getSession", input=_ChatInput(chat_id=chat_id))
+            request = _GetSession(input=_ChatInput(chat_id=chat_id))
         except ValidationError as error:
             return _invalid_request(error)
         result = self._request(request, _CHAT_RESPONSE)
@@ -241,40 +241,34 @@ class DesktopControl:
         return result
 
     def set_remote_control(self, chat_id: str, enabled: bool) -> DesktopResult[DesktopMutation]:
-        return self._mutate(lambda: _ToggleRemoteControl(
-            tool="toggleRemoteControl", input=_EnabledInput(chat_id=chat_id, enabled=enabled),
-        ))
+        return self._mutate(lambda: _ToggleRemoteControl(input=_EnabledInput(chat_id=chat_id, enabled=enabled)))
 
     def warm_chat(self, chat_id: str) -> DesktopResult[DesktopMutation]:
-        return self._mutate(lambda: _WarmSession(tool="warmSession", input=_ChatInput(chat_id=chat_id)))
+        return self._mutate(lambda: _WarmSession(input=_ChatInput(chat_id=chat_id)))
 
     def set_model(self, chat_id: str, model: str) -> DesktopResult[DesktopMutation]:
-        return self._mutate(lambda: _SetModel(tool="setModel", input=_ModelInput(chat_id=chat_id, model=model)))
+        return self._mutate(lambda: _SetModel(input=_ModelInput(chat_id=chat_id, model=model)))
 
     def set_effort(self, chat_id: str, effort: Effort | None) -> DesktopResult[DesktopMutation]:
-        return self._mutate(lambda: _SetEffort(tool="setEffort", input=_EffortInput(chat_id=chat_id, effort=effort)))
+        return self._mutate(lambda: _SetEffort(input=_EffortInput(chat_id=chat_id, effort=effort)))
 
     def set_fast_mode(self, chat_id: str, enabled: bool) -> DesktopResult[DesktopMutation]:
-        return self._mutate(lambda: _SetFastMode(
-            tool="setFastMode", input=_EnabledInput(chat_id=chat_id, enabled=enabled),
-        ))
+        return self._mutate(lambda: _SetFastMode(input=_EnabledInput(chat_id=chat_id, enabled=enabled)))
 
     def set_permission_mode(self, chat_id: str, mode: PermissionMode) -> DesktopResult[DesktopMutation]:
-        return self._mutate(lambda: _SetPermissionMode(
-            tool="setPermissionMode", input=_ModeInput(chat_id=chat_id, mode=mode),
-        ))
+        return self._mutate(lambda: _SetPermissionMode(input=_ModeInput(chat_id=chat_id, mode=mode)))
 
     def archive(self, chat_id: str) -> DesktopResult[DesktopMutation]:
-        return self._mutate(lambda: _Archive(tool="archive", input=_ChatInput(chat_id=chat_id)))
+        return self._mutate(lambda: _Archive(input=_ChatInput(chat_id=chat_id)))
 
     def unarchive(self, chat_id: str) -> DesktopResult[DesktopMutation]:
-        return self._mutate(lambda: _Unarchive(tool="unarchive", input=_ChatInput(chat_id=chat_id)))
+        return self._mutate(lambda: _Unarchive(input=_ChatInput(chat_id=chat_id)))
 
     def stop(self, chat_id: str) -> DesktopResult[DesktopMutation]:
-        return self._mutate(lambda: _Stop(tool="stop", input=_ChatInput(chat_id=chat_id)))
+        return self._mutate(lambda: _Stop(input=_ChatInput(chat_id=chat_id)))
 
     def interrupt(self, chat_id: str) -> DesktopResult[DesktopMutation]:
-        return self._mutate(lambda: _Interrupt(tool="interrupt", input=_ChatInput(chat_id=chat_id)))
+        return self._mutate(lambda: _Interrupt(input=_ChatInput(chat_id=chat_id)))
 
     def _mutate(self, make_request: Callable[[], _MutationRequest]) -> DesktopResult[DesktopMutation]:
         try:
