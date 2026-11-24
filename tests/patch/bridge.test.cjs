@@ -18,6 +18,8 @@ function fixture() {
     signedIn: scope.accountId,
     generation: 2,
     heldMode: undefined,
+    defaultMode: null,
+    readStartPreferences: async () => null,
     row: {
       sessionId: id,
       homeTenancy: scope,
@@ -45,6 +47,7 @@ function fixture() {
       sessions: [...manager.sessions.values()], loadGeneration: native.generation, archivedPending: true,
     }),
     getSession: async (chatId) => manager.sessions.get(chatId),
+    getDefaultPermissionMode: async () => native.defaultMode,
     start: async (options) => {
       calls.push(["start", options]);
       const sessionId = options.sessionId;
@@ -78,7 +81,10 @@ function fixture() {
       native.row.isArchived = false;
     },
   };
-  const dispatch = createDesktopBridge(api, manager, { account: () => native.signedIn });
+  const dispatch = createDesktopBridge(api, manager, {
+    account: () => native.signedIn,
+    readStartPreferences: () => native.readStartPreferences(),
+  });
   const run = (tool, input = {}) => dispatch({ tool, input: { chat_id: id, ...input } });
   return { api, manager, native, calls, dispatch, run };
 }
@@ -131,6 +137,88 @@ test("starts a desktop chat with a fixed peer notice and Desktop's permission de
   assert.equal(response.status, "ok");
   assert.equal(response.result.chat_id, other);
   assert.equal(response.result.running, true);
+});
+
+test("uses the current account's native folder choice before its global pick", async () => {
+  const { calls, native, run } = fixture();
+  const folder = await realpath(__dirname);
+  native.readStartPreferences = async () => ({
+    preferences: {
+      "epitaxy-folder-permission-mode-v2.account": { [folder]: "acceptEdits" },
+      "epitaxy-folder-permission-mode-v2.other": { [folder]: "bypassPermissions" },
+      "cc-landing-draft-permission-mode.account": "default",
+    },
+    autoDefaultEnabled: true,
+    autoAllowed: true,
+  });
+  const response = await run("startSession", { chat_id: other, folder, model: "sonnet", effort: null, sender_chat_id: sender });
+  assert.equal(response.status, "ok");
+  assert.equal(calls[0][1].permissionMode, "acceptEdits");
+  assert.equal(calls[0][1].permissionModeFromSettings, undefined);
+  assert.equal(calls[0][1].permissionModeSource, "folder_pick");
+  assert.equal(calls[0][1].permissionModeProvisional, false);
+});
+
+test("the native rollout and Auto policy jointly govern the app's new chat default", async () => {
+  for (const [autoDefaultEnabled, autoAllowed, expected, preferences] of [
+    [true, true, "auto", { "cc-landing-draft-permission-mode.other": "bypassPermissions" }],
+    [false, true, undefined], [true, false, undefined],
+    [undefined, true, undefined], [true, undefined, undefined],
+    [true, true, "auto", undefined], [true, true, undefined, null],
+  ]) {
+    const { calls, native, run } = fixture();
+    native.readStartPreferences = async () => ({
+      preferences,
+      autoDefaultEnabled,
+      autoAllowed,
+    });
+    const response = await run("startSession", {
+      chat_id: other, folder: __dirname, model: "sonnet", effort: null, sender_chat_id: sender,
+    });
+    assert.equal(response.status, "ok");
+    assert.equal(calls[0][1].permissionMode, expected);
+    if (expected) {
+      assert.equal(calls[0][1].permissionModeProvisional, true);
+      assert.equal(calls[0][1].permissionModeSource, "auto_default");
+      assert.equal(calls[0][1].permissionModeAutoState, "available");
+      assert.equal(calls[0][1].permissionModeFromSettings, undefined);
+    }
+  }
+});
+
+test("leaves native defaults in place for managed settings or an unreadable or unsupported pick", async () => {
+  for (const [nativeMode, preferences] of [
+    ["plan", { "cc-landing-draft-permission-mode.account": "auto" }],
+    [null, undefined],
+    [null, { "cc-landing-draft-permission-mode.account": "bypassPermissions" }],
+    [null, { "cc-landing-draft-permission-mode.account": "dontAsk" }],
+    [null, { "cc-landing-draft-permission-mode.account": "unrecognized" }],
+  ]) {
+    const { calls, native, run } = fixture();
+    native.defaultMode = nativeMode;
+    native.readStartPreferences = async () => {
+      if (!preferences) throw new Error("Preference is unavailable");
+      return { preferences, autoDefaultEnabled: true, autoAllowed: true };
+    };
+    const response = await run("startSession", {
+      chat_id: other, folder: __dirname, model: "sonnet", effort: null, sender_chat_id: sender,
+    });
+    assert.equal(response.status, "ok");
+    assert.equal(calls[0][1].permissionMode, undefined);
+  }
+});
+
+test("checks the account again after reading new chat permission choices", async () => {
+  const { calls, native, run } = fixture();
+  native.readStartPreferences = async () => {
+    native.signedIn = "other account";
+    return { preferences: {}, autoDefaultEnabled: true, autoAllowed: true };
+  };
+  const response = await run("startSession", {
+    chat_id: other, folder: __dirname, model: "sonnet", effort: null, sender_chat_id: sender,
+  });
+  assert.match(response.reason, /account or chat roster changed/u);
+  assert.deepEqual(calls, []);
 });
 
 test("refuses invalid folders, untrusted workspaces and existing chat IDs before native start", async () => {

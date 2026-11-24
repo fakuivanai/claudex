@@ -128,7 +128,11 @@ WINDOW_API = Anchor(
     b"exports.createLocalSessionsApi=function(window,manager,dispatcher){"
     b"const api=Ei(window,manager,dispatcher);"
     b'try{require("./claudex-desktop-bridge.cjs").attachDesktopWindow('
-    b'window,api,manager,()=>t.I0(),message=>t.EEt.info(message))}'
+    b'window,api,manager,()=>t.I0(),message=>t.EEt.info(message),async()=>({'
+    # The first-party renderer stores start picks in AppPreferences.epitaxyPrefs.
+    # The pinned main process owns its feature flag and managed Auto checks.
+    b'preferences:t.Udt("epitaxyPrefs"),autoDefaultEnabled:t.udt("ccd_auto_default_mode",false),'
+    b'autoAllowed:!t.tm("code")&&!t.jdt()&&!t.bZ(await t.hZ())}))}'
     b'catch{t.EEt.warn("[claudex] Could not attach the Desktop control socket")}return api};',
 )
 

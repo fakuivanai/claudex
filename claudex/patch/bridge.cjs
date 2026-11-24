@@ -84,7 +84,50 @@ function remoteControlNotice(result) {
   }
 }
 
-function createDesktopBridge(api, manager, { account, windowActive = () => true }) {
+// The renderer's new local chat reads account-scoped folder and global picks
+// from Desktop's epitaxyPrefs bucket. Match those keys without sampling other
+// chats. Copy the ordinary choices accepted by its Auto-default cohort.
+// Other picks leave Desktop to apply its native settings and policy.
+const START_PICK_MODES = new Set(["default", "acceptEdits", "auto"]);
+
+async function startModeOptions(api, readStartPreferences, cwd, accountId) {
+  if (!readStartPreferences) return {};
+  try {
+    // Retain an explicit default from Desktop's managed or Claude Code
+    // settings. A provisional renderer preference cannot replace it.
+    if (await api.getDefaultPermissionMode(cwd) != null) return {};
+    const { preferences = {}, autoDefaultEnabled, autoAllowed } = await readStartPreferences();
+    if (!preferences || typeof preferences !== "object" || Array.isArray(preferences)) return {};
+    const scoped = (name) => {
+      const key = `${name}.${accountId}`;
+      return Object.hasOwn(preferences, key) ? preferences[key] : undefined;
+    };
+    const folders = scoped("epitaxy-folder-permission-mode-v2") ??
+      scoped("epitaxy-folder-permission-mode");
+    const folderPick = folders && typeof folders === "object" && Object.hasOwn(folders, cwd) ?
+      folders[cwd] : undefined;
+    const globalPick = scoped("cc-landing-draft-permission-mode");
+    const pick = folderPick ?? globalPick;
+    if (pick != null && !START_PICK_MODES.has(pick)) return {};
+    const permissionMode = pick ?? (autoDefaultEnabled === true && autoAllowed === true ? "auto" : undefined);
+    if (!permissionMode || (permissionMode === "auto" &&
+        (autoAllowed !== true || (folderPick == null && autoDefaultEnabled !== true)))) return {};
+    return {
+      permissionMode,
+      ...(permissionMode === "auto" ? { permissionModeAutoState: "available" } : {}),
+      permissionModeSource: folderPick != null ? "folder_pick" : globalPick != null ? "global_pick" : "auto_default",
+      permissionModeProvisional: pick == null,
+    };
+  } catch {
+    // A missing preference/gate or unavailable settings leaves the normal
+    // Desktop start defaults in place.
+    return {};
+  }
+}
+
+function createDesktopBridge(api, manager, {
+  account, readStartPreferences, windowActive = () => true,
+}) {
   return async function dispatch(request, scope = captureScope(manager, account)) {
     if (scope === null || !windowActive()) return ROSTER_UNAVAILABLE;
     const current = () => windowActive() && sameScope(captureScope(manager, account), scope);
@@ -129,6 +172,8 @@ function createDesktopBridge(api, manager, { account, windowActive = () => true 
         return refusal("Approve this workspace in Claude Desktop before starting a chat there.");
       }
       if (!current()) return SCOPE_CHANGED;
+      const mode = await startModeOptions(api, readStartPreferences, cwd, scope.accountId);
+      if (!current()) return SCOPE_CHANGED;
       if (manager.sessions.has(id) || manager.isDeferredArchivedSession(id)) {
         return refusal("That chat ID already exists.");
       }
@@ -140,7 +185,7 @@ function createDesktopBridge(api, manager, { account, windowActive = () => true 
         "read_messages tool to read it.";
       const unconfirmed = failure("Desktop could not confirm the chat start. Check the chat before retrying.");
       try {
-        const started = await api.start({ cwd, sessionId: id, model, effort: effort ?? undefined, message });
+        const started = await api.start({ cwd, sessionId: id, model, effort: effort ?? undefined, message, ...mode });
         if (!current()) return SCOPE_CHANGED;
         if (started?.sessionId !== id) return unconfirmed;
 
@@ -266,12 +311,13 @@ let starting = false;
 let quitting = false;
 let quitHookInstalled = false;
 
-function attachDesktopWindow(window, api, manager, account, log) {
+function attachDesktopWindow(window, api, manager, account, log, readStartPreferences) {
   const { app } = require("electron");
   const contents = window.webContents;
   if (!contents || contents.isDestroyed() || quitting) return;
   const dispatch = createDesktopBridge(api, manager, {
     account,
+    readStartPreferences,
     windowActive: () => !contents.isDestroyed() && !quitting,
   });
   // The stock factory normally runs once per main window. Choose the most

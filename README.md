@@ -60,8 +60,11 @@ an optional effort and the task. A successful start returns the new chat ID.
 Use that ID for follow-up messages, history and controls.
 
 Claude gets a fixed notice pointing to the original task in its Claudex
-inbox. Codex gets the task as untrusted tool output on its first turn.
-The apps apply their usual permissions and workspace checks.
+inbox. Claudex reads Desktop's saved new-chat mode and Auto policy.
+Desktop applies the workspace and permission checks. Codex gets an
+opening prompt that names the sending Claude chat and says the task
+carries no user approval. Messages to existing Codex chats use peer tool
+output.
 
 ## How messages travel
 
@@ -167,8 +170,9 @@ start a chat's worker, the command prints a notice that says so.
 Run `claudex claude restart` or `claudex codex restart` from a terminal.
 If a chat is running, the command lists it and returns. Use `--wait`
 to wait for active turns, or `--force` to allow them to be interrupted.
-The command launches the app in a separate user service and checks
-which chats are reachable again. If you call it from the app being
+Claudex quits Claude through its private control socket. An older Claude
+patch uses the KDE tray's Quit action. The command launches the app in a
+separate user service and checks which chats are reachable again. If you call it from the app being
 restarted, it returns a receipt path so you can check the outcome
 after the old connection closes. Set `CLAUDEX_CLAUDE_LAUNCHER` or
 `CLAUDEX_CODEX_LAUNCHER` if your launcher is installed elsewhere.
@@ -178,9 +182,9 @@ after the old connection closes. Set `CLAUDEX_CLAUDE_LAUNCHER` or
 The patch serves `$XDG_RUNTIME_DIR/claudex/desktop.sock`, mode 0600. The CLI
 and the MCP server share a client. When `XDG_RUNTIME_DIR` is missing or
 relative, they use a user-owned `/run/user/<uid>` directory with mode 0700.
-The socket serves only the operations listed above, and only for local
-chats in the account and organization Desktop has active. Desktop does the work through its own
-window API, under its own checks:
+Chat operations apply only to local chats in Desktop's active account and
+organization. The restart command can also ask Desktop to quit. Desktop
+uses its own APIs for these operations.
 
 - An archived chat can be read, archived or unarchived. Anything else is
   refused until you unarchive it.
@@ -239,8 +243,9 @@ recently used chats go first. The pass:
 - checks workspace trust the way Desktop does;
 - stops starting workers one short of Desktop's worker limit.
 
-A chat left cold by the limit reconnects when you open it. Each attempt is
-logged in `~/.config/Claude/logs/main.log`, as
+A cold chat needs a free worker slot for a background wake. On a host with
+a limit of ten, ten active workers can leave another chat disconnected.
+Desktop logs each attempt in `~/.config/Claude/logs/main.log` as
 `[claudex] Remote Control claudex_restart <chat> <result>` at launch or
 `claudex_reopen` on opening.
 
