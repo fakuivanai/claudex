@@ -273,7 +273,7 @@ def build(bridge: Bridge) -> FastMCP[None]:
         folder: str, model: ChatModel, task: MessageText,
         context: Context[ServerSession, None, Request], effort: str | None = None,
     ) -> dict[str, object]:
-        """Start a Codex Desktop chat with an untrusted peer task and return its chat and turn IDs."""
+        """Start a Codex Desktop chat with an attributed opening task and return its chat and turn IDs."""
         return bridge.start_codex(bridge.sender(context.request_context.meta), folder, model, effort, task)
 
     @application.tool(annotations=READ_ONLY)

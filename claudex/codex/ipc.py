@@ -30,6 +30,8 @@ COLD_POLL_SECONDS = 0.25
 ROUTER_TIMEOUT_MILLISECONDS = 10_000
 # Read large frames in chunks and keep one socket read bounded.
 READ_CHUNK_BYTES = 64 * 1024
+# Include a readable sender label while keeping start requests bounded.
+MAX_START_TITLE_CHARACTERS = 256
 # Request and turn identifiers are opaque strings, including vendor-prefixed IDs.
 WireIdentifier = Annotated[str, StringConstraints(min_length=1, max_length=128)]
 ClientId = NewType("ClientId", str)
@@ -405,9 +407,11 @@ class DesktopClient:
 
     def start_chat(self, folder: Path, model: str, effort: str | None, message: PeerMessage) -> StartResult:
         request: dict[str, object] = {"hostId": "local", "operationId": message.message_id}
+        sender = message.sender.to_wire()
+        sender["title"] = sender["title"].strip()[:MAX_START_TITLE_CHARACTERS] or sender["chat_id"]
         response = self.request(Method.START_CHAT, {
             **request, "action": "start", "folder": str(folder), "model": model,
-            "effort": effort, "toolOutput": tool_output(message),
+            "effort": effort, "sender": sender, "task": message.body,
         })
         reply = self.operation_reply(response)
         if reply.state == "pending":
@@ -563,7 +567,7 @@ def validate_effort(value: str | None) -> None:
 def start_chat(
     folder: Path, model: str, effort: str | None, message: PeerMessage, *, socket_path: Path | None = None,
 ) -> StartResult:
-    """Create a local Codex chat with native defaults and submit only peer tool output."""
+    """Create a local Codex chat with native defaults and an attributed opening task."""
     try:
         validate_model(model)
         validate_effort(effort)

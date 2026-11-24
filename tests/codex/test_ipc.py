@@ -269,7 +269,8 @@ class DesktopRelayTest(unittest.TestCase):
         start, poll = socket.frames[1:]
         self.assertEqual(start["params"], {
             "hostId": "local", "action": "start", "operationId": MESSAGE.message_id,
-            "folder": folder, "model": "gpt-6.2-sol", "effort": "high", "toolOutput": tool_output(MESSAGE),
+            "folder": folder, "model": "gpt-6.2-sol", "effort": "high",
+            "sender": MESSAGE.sender.to_wire(), "task": MESSAGE.body,
         })
         self.assertEqual(poll["targetClientId"], OWNER)
         self.assertEqual(poll["params"], {"hostId": "local", "action": "poll", "operationId": MESSAGE.message_id})

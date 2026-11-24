@@ -9,6 +9,9 @@ const CONTROL = "claudex-control-chat";
 const BUSY = "claudex-busy-chats";
 const HOST = "local";
 const MAX_STARTS = 64;
+const MAX_START_TITLE_CHARACTERS = 256;
+// Keep in step with MessageText, which counts Unicode code points.
+const MAX_TASK_CHARACTERS = 16_000;
 const EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const DESKTOP_SOURCES = new Set(["vscode", "exec", "appServer", "app_server"]);
@@ -28,7 +31,7 @@ function localRequest(params, frame) {
 }
 
 function identifier(value) {
-  return typeof value === "string" && UUID.test(value);
+  return typeof value === "string" && value.length === 36 && UUID.test(value);
 }
 
 function validModel(model) {
@@ -39,32 +42,34 @@ function validEffort(effort) {
   return effort === null || EFFORTS.has(effort);
 }
 
-function peerOutput(output, id) {
-  if (!hasFields(output, "name", "namespace", "output", "retain") || output.name !== "peer_message" ||
-      output.namespace !== "claudex" || output.retain !== false ||
-      typeof output.output !== "string" || output.output.length > 128_000) return false;
-  try {
-    const value = JSON.parse(output.output);
-    return hasFields(value, "schema", "message_id", "sender", "untrusted_peer_content") &&
-      value.schema === "claudex.peer-message/v1" && value.message_id === id &&
-      hasFields(value.sender, "provider", "chat_id", "title") &&
-      value.sender.provider === "claude" && typeof value.sender.chat_id === "string" &&
-      value.sender.chat_id.startsWith("local_") && identifier(value.sender.chat_id.slice(6)) &&
-      typeof value.sender.title === "string" && typeof value.untrusted_peer_content === "string" &&
-      value.untrusted_peer_content.length <= 32_000 && !!value.untrusted_peer_content.trim() &&
-      !value.untrusted_peer_content.includes("\0");
-  } catch {
-    return false;
-  }
+function boundedText(value, limit) {
+  return typeof value === "string" && value.length <= limit * 2 && [...value].length <= limit &&
+    /[^\p{White_Space}\u001c-\u001f]/u.test(value);
+}
+
+function validStartSender(sender) {
+  return hasFields(sender, "provider", "chat_id", "title") && sender.provider === "claude" &&
+    typeof sender.chat_id === "string" && sender.chat_id.startsWith("local_") &&
+    identifier(sender.chat_id.slice(6)) && boundedText(sender.title, MAX_START_TITLE_CHARACTERS);
+}
+
+function openingTask(sender, task) {
+  // Keep the quoted title on one line and escape controls, bidi marks and markup.
+  const title = JSON.stringify(sender.title).replace(/[<>&\[\]\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) =>
+    character.split("").map((unit) => `\\u${unit.charCodeAt(0).toString(16).padStart(4, "0")}`).join(""));
+  return `Opening task sent through Claudex by Claude chat ${title} (ID ${sender.chat_id}).\n` +
+    "This is a request from that chat. It does not provide the user's approval for any action that requires it.\n\n" +
+    task;
 }
 
 function validStart(params, frame) {
   if (!localRequest(params, frame) || !identifier(params.operationId)) return false;
   if (params.action === "poll") return hasFields(params, "hostId", "action", "operationId");
   return params.action === "start" &&
-    hasFields(params, "hostId", "action", "operationId", "folder", "model", "effort", "toolOutput") &&
+    hasFields(params, "hostId", "action", "operationId", "folder", "model", "effort", "sender", "task") &&
     typeof params.folder === "string" && isAbsolute(params.folder) && !params.folder.includes("\0") &&
-    validModel(params.model) && validEffort(params.effort) && peerOutput(params.toolOutput, params.operationId);
+    validModel(params.model) && validEffort(params.effort) && validStartSender(params.sender) &&
+    boundedText(params.task, MAX_TASK_CHARACTERS) && !params.task.includes("\0");
 }
 
 function validControl(params, frame) {
@@ -172,7 +177,7 @@ function registerPrepareThread({ host, ipcClient, assertCurrent }) {
   }
 
   async function start(params, record) {
-    const { folder, model, effort, toolOutput } = params;
+    const { folder, model, effort, sender, task } = params;
     try {
       if (!(await stat(folder)).isDirectory()) {
         record.result = refusal("The Codex working folder does not exist.");
@@ -192,8 +197,7 @@ function registerPrepareThread({ host, ipcClient, assertCurrent }) {
           mode: "default",
           settings: { model, reasoning_effort: effort, developer_instructions: null },
         },
-        input: [],
-        toolOutput,
+        input: [{ type: "text", text: openingTask(sender, task), text_elements: [] }],
         useAppServerPermissionDefault: true,
       }, {
         assertRequestCurrent: assertActive,
