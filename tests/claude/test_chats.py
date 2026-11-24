@@ -1,6 +1,7 @@
 import json
 import os
 from pathlib import Path
+import socket
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -45,6 +46,31 @@ class ClaudeDesktopTest(unittest.TestCase):
 
     def test_recorded_marker_and_registry_resolve_live_chat(self) -> None:
         self.assertEqual([live.chat for live in claude.chats.live_sessions()], [self.live.chat])
+
+    def test_untitled_chat_uses_its_confirmed_id_for_sender_and_inbox(self) -> None:
+        saved = json.loads(self.record.read_text(encoding="utf-8"))
+        saved["title"] = None
+        self.record.write_text(json.dumps(saved), encoding="utf-8")
+        with socket.socket(socket.AF_UNIX) as inbox:
+            inbox.bind(str(self.inbox))
+            chat = ClaudeChat(CHAT_ID, str(CHAT_ID), WorkerStatus.IDLE, Liveness.PROCESS_VISIBLE)
+            self.assertEqual(claude.chats.sender(), chat)
+            self.assertEqual(claude.chats.live_sessions(), [LiveChat(chat, BACKEND_ID, self.inbox)])
+
+    def test_untitled_chat_requires_one_unarchived_backend_match(self) -> None:
+        saved = json.loads(self.record.read_text(encoding="utf-8"))
+        saved["title"] = None
+        saved["isArchived"] = True
+        self.record.write_text(json.dumps(saved), encoding="utf-8")
+        with self.subTest(records="archived only"), self.assertRaises(ClaudeDesktopError):
+            claude.chats.sender()
+        saved["isArchived"] = False
+        self.record.write_text(json.dumps(saved), encoding="utf-8")
+        duplicate = self.record.parent.parent / "other-organization" / self.record.name
+        duplicate.parent.mkdir()
+        duplicate.write_bytes(self.record.read_bytes())
+        with self.subTest(records="duplicate backend matches"), self.assertRaises(ClaudeDesktopError):
+            claude.chats.sender()
 
     def test_stale_backend_is_not_listed(self) -> None:
         self.marker_data["sessionId"] = "00000000-0000-4000-8000-000000000103"

@@ -171,13 +171,12 @@ def saved_records(target: ClaudeChatId, *, include_archived: bool = False) -> li
 
 
 def _live_title(marker: RuntimeMarker) -> str | None:
-    titles = {
-        record.title
-        for record in saved_records(marker.id)
-        if record.backend_id == marker.backend_id and record.title and record.title.strip()
-    }
+    records = [record for record in saved_records(marker.id) if record.backend_id == marker.backend_id]
+    titles = {record.title for record in records if record.title and record.title.strip()}
     if len(titles) == 1:
         return titles.pop()
+    if len(records) == 1 and not titles:
+        return str(marker.id)
     return marker.name if marker.name in titles else None
 
 
