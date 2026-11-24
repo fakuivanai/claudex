@@ -83,6 +83,24 @@ function fixture() {
   return { api, manager, native, calls, dispatch, run };
 }
 
+test("checks the current account and native activity before accepting quit", async () => {
+  const { native, manager, dispatch } = fixture();
+  const quit = { tool: "quit", input: { force: false } };
+  const accepted = { status: "ok", result: { accepted: true } };
+  const queuedScope = { ...scope, generation: native.generation };
+
+  native.row.isRunning = true;
+  assert.deepEqual(await dispatch(quit), { status: "refused", reason: "Claude Desktop still has running chats." });
+  assert.deepEqual(await dispatch({ ...quit, input: { force: true } }), accepted);
+  native.row.isRunning = false;
+  assert.deepEqual(await dispatch(quit), accepted);
+
+  manager.waitForSessionsLoaded = async () => { native.generation++; };
+  assert.equal((await dispatch(quit, queuedScope)).status, "error");
+  native.signedIn = "other";
+  assert.equal((await dispatch(quit)).status, "error");
+});
+
 test("projects only this scope's local chats and keeps URLs private", async () => {
   const { native, manager, dispatch } = fixture();
   manager.sessions.set(other, { ...native.row, sessionId: other, homeTenancy: { ...scope, orgId: "other" } });

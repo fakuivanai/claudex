@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from claudex.claude.control import DesktopChat
+from claudex.claude.control import DesktopChat, DesktopQuit, InvalidResponse, Refused, Success, TimedOut, UnsupportedQuit
 from claudex.codex.history import Chat, HistoryError
 from claudex.codex.ipc import ChatStatus, CodexDesktopError
 from claudex.models import CodexChatId, Provider
@@ -95,7 +95,7 @@ class RestartTests(unittest.TestCase):
         self.assertEqual(result["status"], "restarted")
         self.assertEqual(result["reachable"], 2)
         check_scope.assert_called_once_with(OWNER)
-        quit_app.assert_called_once_with(Provider.CODEX, OWNER, {})
+        quit_app.assert_called_once_with(Provider.CODEX, OWNER, {}, force=False)
         self.assertIn("--user", spawn.call_args.args[0])
         self.assertEqual(spawn.call_args.args[0][-1], str(LAUNCHER))
 
@@ -166,13 +166,37 @@ class RestartTests(unittest.TestCase):
                 self.assertIsNone(process(303))
                 self.assertIsNone(process(304))
 
+    def test_claude_quit_prefers_the_socket_and_never_falls_back_after_dispatch(self) -> None:
+        responses = [
+            Success(result=DesktopQuit(accepted=True)),
+            InvalidResponse("The socket closed."),
+            TimedOut("No timely acknowledgement."),
+            Refused(reason="Claude Desktop still has running chats."),
+        ]
+        with (
+            patch("claudex.restart.process", return_value=OWNER),
+            patch("claudex.restart.DesktopControl") as control,
+            patch("claudex.restart.claude_tray") as tray,
+        ):
+            quit_call = control.return_value.quit
+            quit_call.side_effect = responses
+            quit_desktop(Provider.CLAUDE, OWNER, {}, force=True)
+            quit_call.assert_called_once_with(owner_pid=OWNER.pid, force=True)
+            quit_desktop(Provider.CLAUDE, OWNER, {})
+            quit_desktop(Provider.CLAUDE, OWNER, {})
+            with self.assertRaisesRegex(RestartError, "still has running chats"):
+                quit_desktop(Provider.CLAUDE, OWNER, {})
+            tray.assert_not_called()
+
     def test_claude_tray_quit_only_uses_menu_owned_by_verified_pid(self) -> None:
         layout = [0, [0, {}, [{"data": [8, {"label": {"data": "Quit"}}, []]}]]]
         replies = [[":1.4/Tray", ":1.5/Tray"], [999], [OWNER.pid], "/Menu", layout]
         with (
             patch("claudex.restart.process", return_value=OWNER),
             patch("claudex.restart.bus", side_effect=[*replies, None]) as bus,
+            patch("claudex.restart.DesktopControl") as control,
         ):
+            control.return_value.quit.return_value = UnsupportedQuit()
             quit_desktop(Provider.CLAUDE, OWNER, {})
         self.assertEqual(bus.call_args.args, ({}, "call", ":1.5", "/Menu", "com.canonical.dbusmenu",
                                               "Event", "isvu", "8", "clicked", "s", "", "0"))

@@ -93,7 +93,7 @@ function createDesktopBridge(api, manager, { account, windowActive = () => true 
     if (!current()) return SCOPE_CHANGED;
     if (manager.isInitializing() || !manager.areSessionsLoaded()) return ROSTER_UNAVAILABLE;
 
-    if (request.tool === "getSessionList") {
+    if (request.tool === "getSessionList" || request.tool === "quit") {
       const roster = await api.getSessionList();
       if (!current() || roster?.loadGeneration !== scope.generation) return SCOPE_CHANGED;
       if (!Array.isArray(roster.sessions) || typeof roster.archivedPending !== "boolean") {
@@ -104,6 +104,12 @@ function createDesktopBridge(api, manager, { account, windowActive = () => true 
         if (typeof row?.sessionId !== "string" || !LOCAL_CHAT_ID.test(row.sessionId) || row.isCloudRun) continue;
         const chat = manager.sessions.get(row.sessionId);
         if (ownsLocalChat(chat, scope)) chats.push(projectChat(row, chat));
+      }
+      if (request.tool === "quit") {
+        if (!request.input.force && chats.some((chat) => chat.running)) {
+          return refusal("Claude Desktop still has running chats.");
+        }
+        return success({ accepted: true });
       }
       return success({ chats, archived_pending: roster.archivedPending });
     }
@@ -287,7 +293,16 @@ function attachDesktopWindow(window, api, manager, account, log) {
     listener = await startDesktopSocket((request, scope) => {
       const active = Array.from(windows.values()).at(-1);
       return active ? active(request, scope) : ROSTER_UNAVAILABLE;
-    }, { capture: () => captureScope(manager, account) });
+    }, {
+      capture: () => captureScope(manager, account),
+      requestQuit: () => {
+        try {
+          app.quit();
+        } catch {
+          log("[claudex] Desktop could not quit");
+        }
+      },
+    });
     if (quitting) await listener.close();
     else log("[claudex] Desktop control socket ready");
   }).catch((error) => {

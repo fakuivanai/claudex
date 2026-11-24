@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import socket
+import struct
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from claudex.models import UUIDText, parse_claude_chat_id
 MAX_REQUEST_BYTES = 4096
 MAX_RESPONSE_BYTES = 512 * 1024
 DEFAULT_TIMEOUT_SECONDS = 90
+_UNIX_PEER_CREDENTIALS = struct.Struct("iII")
 _ChatId = Annotated[str, BeforeValidator(parse_claude_chat_id)]
 type RemoteControlState = Literal["on", "connecting", "unavailable", "off"]
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
@@ -59,6 +61,10 @@ class DesktopChatList(_WireModel):
 class DesktopMutation(_WireModel):
     chat: DesktopChat | None
     notice: str | None = None
+
+
+class DesktopQuit(_WireModel):
+    accepted: Literal[True]
 
 
 def _model_id(value: object) -> object:
@@ -113,6 +119,15 @@ class _ModeInput(_ChatInput):
 class _ListSessions(_WireModel):
     tool: Literal["getSessionList"] = "getSessionList"
     input: _WireModel
+
+
+class _QuitInput(_WireModel):
+    force: bool
+
+
+class _QuitDesktop(_WireModel):
+    tool: Literal["quit"] = "quit"
+    input: _QuitInput
 
 
 class _GetSession(_WireModel):
@@ -179,7 +194,7 @@ type _MutationRequest = (
     _ToggleRemoteControl | _WarmSession | _SetModel | _SetEffort | _SetFastMode |
     _SetPermissionMode | _Archive | _Unarchive | _Stop | _Interrupt
 )
-type _Request = _ListSessions | _GetSession | _StartSession | _MutationRequest
+type _Request = _ListSessions | _GetSession | _StartSession | _MutationRequest | _QuitDesktop
 
 _Result = TypeVar("_Result", bound=_WireModel)
 
@@ -223,11 +238,17 @@ class InvalidRequest:
     status: Literal["invalid_request"] = "invalid_request"
 
 
+@dataclass(frozen=True)
+class UnsupportedQuit:
+    """The running patch rejected the otherwise valid quit request."""
+
+
 type DesktopResult[T: _WireModel] = Success[T] | Refused | DesktopFailure | Unavailable | TimedOut | InvalidResponse | InvalidRequest
 type _Response[T: _WireModel] = Annotated[Success[T] | Refused | DesktopFailure, Field(discriminator="status")]
 _CHAT_LIST_RESPONSE = RootModel[_Response[DesktopChatList]]
 _CHAT_RESPONSE = RootModel[_Response[DesktopChat]]
 _MUTATION_RESPONSE = RootModel[_Response[DesktopMutation]]
+_QUIT_RESPONSE = RootModel[_Response[DesktopQuit]]
 
 
 class DesktopControl:
@@ -239,6 +260,15 @@ class DesktopControl:
 
     def list_chats(self) -> DesktopResult[DesktopChatList]:
         return self._request(_ListSessions(input=_WireModel()), _CHAT_LIST_RESPONSE)
+
+    def quit(self, *, owner_pid: int, force: bool) -> DesktopResult[DesktopQuit] | UnsupportedQuit:
+        result = self._request(
+            _QuitDesktop(input=_QuitInput(force=force)), _QUIT_RESPONSE, expected_peer_pid=owner_pid,
+        )
+        # The preceding patch rejects unknown tools in its socket parser.
+        if isinstance(result, DesktopFailure) and result.reason == "Invalid desktop request.":
+            return UnsupportedQuit()
+        return result
 
     def get_chat(self, chat_id: str) -> DesktopResult[DesktopChat]:
         try:
@@ -315,7 +345,8 @@ class DesktopControl:
         return result
 
     def _request(
-        self, request: _Request, response: type[RootModel[_Response[_Result]]],
+        self, request: _Request, response: type[RootModel[_Response[_Result]]], *,
+        expected_peer_pid: int | None = None,
     ) -> DesktopResult[_Result]:
         wire = request.model_dump_json().encode("utf-8") + b"\n"
         if len(wire) > MAX_REQUEST_BYTES:
@@ -331,10 +362,17 @@ class DesktopControl:
             )
         endpoint = runtime / "claudex" / "desktop.sock"
         deadline = time.monotonic() + self._timeout
+        dispatching_quit = False
         try:
             with socket.socket(socket.AF_UNIX) as connection:
                 connection.settimeout(self._timeout)
                 connection.connect(str(endpoint))
+                if expected_peer_pid is not None:
+                    peer = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _UNIX_PEER_CREDENTIALS.size)
+                    pid, uid, _ = _UNIX_PEER_CREDENTIALS.unpack(peer)
+                    if pid != expected_peer_pid or uid != os.getuid():
+                        return Refused(reason="The control socket does not belong to the selected Claude Desktop.")
+                    dispatching_quit = True
                 connection.settimeout(_remaining(deadline))
                 connection.sendall(wire)
                 connection.shutdown(socket.SHUT_WR)
@@ -344,6 +382,8 @@ class DesktopControl:
         except TimeoutError:
             return TimedOut("Desktop socket timed out. Check the current chat state before retrying.")
         except OSError:
+            if dispatching_quit:
+                return InvalidResponse("The Desktop socket closed before confirming the quit request.")
             return DesktopFailure(reason="The Desktop socket exchange failed.")
         if isinstance(frame, InvalidResponse):
             return frame

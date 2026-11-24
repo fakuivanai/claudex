@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 from claudex.claude.control import (
     EFFORTS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PERMISSION_MODES, DesktopControl, DesktopFailure, DesktopMutation,
-    DesktopResult, InvalidRequest, InvalidResponse, Refused, Success, TimedOut, Unavailable,
+    DesktopResult, InvalidRequest, InvalidResponse, Refused, Success, TimedOut, Unavailable, UnsupportedQuit,
 )
 
 _CHAT_ID = "local_01234567-89ab-cdef-0123-456789abcdef"
@@ -41,7 +41,8 @@ def exchange(server: socket.socket, response: bytes, release: Event | None) -> b
             request = stream.read(MAX_REQUEST_BYTES + 1)
         if release is not None:
             release.wait(3)
-        connection.sendall(response)
+        if response:
+            connection.sendall(response)
         return request
 
 
@@ -111,6 +112,24 @@ class DesktopControlTests(unittest.TestCase):
             )
             assert isinstance(result, InvalidResponse)
             self.assertIn("The chat may already have started", result.reason)
+
+    def test_quit_checks_socket_owner_before_sending(self) -> None:
+        with self.reply(frame({"status": "ok", "result": {"accepted": True}})) as request:
+            result = self.desktop.quit(owner_pid=os.getpid(), force=False)
+            assert isinstance(result, Success)
+            self.assertEqual(json.loads(request.result(3)), {"tool": "quit", "input": {"force": False}})
+        with self.reply(b"") as request:
+            result = self.desktop.quit(owner_pid=os.getpid() + 1, force=True)
+            self.assertIsInstance(result, Refused)
+            self.assertEqual(request.result(3), b"")
+
+    def test_quit_recognizes_only_the_old_parser_response(self) -> None:
+        with self.reply(frame({"status": "error", "reason": "Invalid desktop request."})):
+            self.assertIsInstance(self.desktop.quit(owner_pid=os.getpid(), force=False), UnsupportedQuit)
+        with self.reply(frame({"status": "refused", "reason": "Invalid desktop request."})):
+            self.assertIsInstance(self.desktop.quit(owner_pid=os.getpid(), force=False), Refused)
+        with self.reply(b""):
+            self.assertIsInstance(self.desktop.quit(owner_pid=os.getpid(), force=False), InvalidResponse)
 
     def test_each_mutation_sends_its_native_method_and_payload(self) -> None:
         cases: list[tuple[str, dict[str, object], Callable[[], DesktopResult[DesktopMutation]]]] = [

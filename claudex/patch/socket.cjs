@@ -40,6 +40,7 @@ function parseRequest(bytes) {
   }
   const { tool, input } = request;
   if (tool === "getSessionList" && exactObject(input)) return request;
+  if (tool === "quit" && exactObject(input, "force") && typeof input.force === "boolean") return request;
   const id = input?.chat_id;
   if (typeof id !== "string" || id.length !== 42 || !LOCAL_CHAT_ID.test(id)) {
     throw new Error("Invalid Desktop chat ID.");
@@ -85,7 +86,7 @@ function error(reason) {
   return { status: "error", reason };
 }
 
-function reply(socket, response) {
+function reply(socket, response, afterWrite) {
   let wire;
   try {
     const success = response?.status === "ok" && exactObject(response, "status", "result") &&
@@ -100,7 +101,24 @@ function reply(socket, response) {
   } catch {
     wire = JSON.stringify(error("Desktop handler returned an invalid response.")) + "\n";
   }
-  socket.end(wire);
+  socket.end(wire, afterWrite);
+}
+
+function quitAfterReply(socket, response, requestQuit) {
+  // Desktop's before-quit hook closes the listener and its clients. Let the
+  // acknowledgement reach the kernel first. A disconnected client cannot
+  // cancel an already accepted quit.
+  let requested = false;
+  function quitOnce() {
+    if (requested) return;
+    requested = true;
+    requestQuit();
+  }
+  if (socket.destroyed) quitOnce();
+  else {
+    socket.once("close", quitOnce);
+    reply(socket, response, quitOnce);
+  }
 }
 
 function prepareEndpoint(directory, endpoint) {
@@ -121,7 +139,7 @@ function prepareEndpoint(directory, endpoint) {
 }
 
 async function startDesktopSocket(dispatch, {
-  runtimeDirectory = process.env.XDG_RUNTIME_DIR, capture = () => undefined,
+  runtimeDirectory = process.env.XDG_RUNTIME_DIR, capture = () => undefined, requestQuit,
 } = {}) {
   if (typeof runtimeDirectory !== "string" || !path.isAbsolute(runtimeDirectory)) {
     throw new Error("Desktop socket requires an absolute XDG_RUNTIME_DIR.");
@@ -134,13 +152,29 @@ async function startDesktopSocket(dispatch, {
   const sockets = new Set();
   const queue = [];
   let active = null;
+  let quitAccepted = false;
   async function dispatchQueued() {
     if (active) return;
     while (queue.length) {
       const { socket, request, scope } = queue.shift();
       active = socket;
       try {
-        reply(socket, await dispatch(request, scope));
+        if (quitAccepted) {
+          reply(socket, error("Desktop is quitting."));
+          continue;
+        }
+        const response = await dispatch(request, scope);
+        if (request.tool === "quit" && response?.status === "ok") {
+          if (!requestQuit || !exactObject(response, "status", "result") ||
+              !exactObject(response.result, "accepted") || response.result.accepted !== true) {
+            reply(socket, error("Desktop could not accept native quit."));
+            continue;
+          }
+          quitAccepted = true;
+          quitAfterReply(socket, response, requestQuit);
+          continue;
+        }
+        reply(socket, response);
       } catch {
         reply(socket, error("Desktop handler failed."));
       } finally {

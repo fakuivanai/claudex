@@ -14,7 +14,7 @@ import sys
 import tempfile
 import time
 
-from claudex.claude.control import DesktopChat, DesktopControl, Success
+from claudex.claude.control import DesktopChat, DesktopControl, InvalidResponse, Success, TimedOut, UnsupportedQuit
 from claudex.codex import history, ipc
 from claudex.environment import SYSTEM_PATH, desktop_environment, systemd_runtime_directory
 from claudex.models import Provider
@@ -199,8 +199,16 @@ def claude_tray(owner: Process, environment: Mapping[str, str]) -> Tray:
     return actions[0]
 
 
-def quit_desktop(app: Provider, owner: Process, environment: Mapping[str, str]) -> None:
+def quit_desktop(app: Provider, owner: Process, environment: Mapping[str, str], *, force: bool = False) -> None:
     if app == Provider.CLAUDE:
+        if process(owner.pid) != owner:
+            raise RestartError("Claude Desktop changed while preparing to quit.")
+        result = DesktopControl(timeout=CALL_SECONDS).quit(owner_pid=owner.pid, force=force)
+        if isinstance(result, (Success, InvalidResponse, TimedOut)):
+            # If the acknowledgement was lost, verify exit before relaunching.
+            return
+        if not isinstance(result, UnsupportedQuit):
+            raise RestartError(f"Claude Desktop native quit failed: {result.reason}")
         tray = claude_tray(owner, environment)
         if process(owner.pid) != owner:
             raise RestartError("Claude Desktop changed while preparing to quit.")
@@ -383,7 +391,7 @@ def native_restart(
         raise RestartError("Desktop changed before the restart.")
     require_separate_worker(owner)
     children = app_server_children(owner) if app == Provider.CODEX else ()
-    quit_desktop(app, owner, environment)
+    quit_desktop(app, owner, environment, force=force)
     if wait_for(lambda: True if process(owner.pid) != owner else None, QUIT_SECONDS) is None:
         raise RestartError("Timed out waiting for Desktop to exit.")
     if wait_for(lambda: True if all(process(child.pid) != child for child in children) else None, QUIT_SECONDS) is None:

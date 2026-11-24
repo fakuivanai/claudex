@@ -13,6 +13,7 @@ const { MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, startDesktopSocket } = require(".
 
 const localId = "local_01234567-89ab-cdef-0123-456789abcdef";
 const list = { tool: "getSessionList", input: {} };
+const quit = { tool: "quit", input: { force: false } };
 const toggle = { tool: "toggleRemoteControl", input: { chat_id: localId, enabled: true } };
 
 const start = {
@@ -37,14 +38,14 @@ function exchange(endpoint, wire, sent) {
   });
 }
 
-async function fixture(t, dispatch) {
+async function fixture(t, dispatch, options = {}) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), "claudex-transport-"));
   let listener;
   t.after(async () => {
     await listener?.close();
     await fs.rm(directory, { recursive: true, force: true });
   });
-  listener = await startDesktopSocket(dispatch, { runtimeDirectory: directory });
+  listener = await startDesktopSocket(dispatch, { runtimeDirectory: directory, ...options });
   const endpoint = path.join(directory, "claudex", "desktop.sock");
   return { directory, endpoint, listener };
 }
@@ -67,12 +68,40 @@ test("forwards the native start fields", async (t) => {
   assert.deepEqual(await exchange(endpoint, encode(start)), success(start));
 });
 
+test("acknowledges native quit before Desktop immediately closes the listener", async (t) => {
+  const accepted = success({ accepted: true });
+  let quits = 0;
+  const { endpoint, listener } = await fixture(t, async (request) => {
+    assert.deepEqual(request, quit);
+    return accepted;
+  }, { requestQuit: () => { quits++; void listener.close(); } });
+  assert.deepEqual(await exchange(endpoint, encode(quit)), accepted);
+  assert.equal(quits, 1);
+});
+
+test("refuses a duplicate quit once Desktop accepts the first one", async (t) => {
+  const accepted = success({ accepted: true });
+  let dispatches = 0;
+  let quits = 0;
+  const { endpoint } = await fixture(t, async () => {
+    dispatches++;
+    return accepted;
+  }, { requestQuit: () => { quits++; } });
+  assert.deepEqual(await exchange(endpoint, encode(quit)), accepted);
+  assert.deepEqual(await exchange(endpoint, encode(quit)), { status: "error", reason: "Desktop is quitting." });
+  assert.equal(dispatches, 1);
+  assert.equal(quits, 1);
+});
+
 test("rejects unknown tools, malformed frames and ambiguous targets before dispatch", async (t) => {
   let called = false;
   const { endpoint } = await fixture(t, async () => { called = true; });
   const invalidWires = [
     encode({ ...list, extra: true }),
     encode({ tool: "getSessionList", input: { extra: true } }),
+    encode({ tool: "quit", input: {} }),
+    encode({ tool: "quit", input: { force: "true" } }),
+    encode({ tool: "quit", input: { force: true, chat_id: localId } }),
     ...["createSession", "sendMessage", "respondToToolPermission", "runBashCommand", "delete"].map(
       (tool) => encode({ tool, input: { chat_id: localId } }),
     ),
