@@ -205,7 +205,9 @@ def build(bridge: Bridge) -> FastMCP[None]:
         folder: str, model: ChatModel, task: MessageText,
         context: Context[ServerSession, None, Request], effort: Effort | None = None,
     ) -> dict[str, object]:
-        """Start a Claude Desktop chat and give it an attributed peer task, using the app's default permissions."""
+        """Start a Claude Desktop chat with a peer task. Its mailbox identifies the sending Codex chat
+        by app, ID and title. The task carries no user approval.
+        """
         return bridge.start_claude(bridge.sender(context.request_context.meta), folder, model, effort, task)
 
     @application.tool(annotations=READ_ONLY)
@@ -273,7 +275,9 @@ def build(bridge: Bridge) -> FastMCP[None]:
         folder: str, model: ChatModel, task: MessageText,
         context: Context[ServerSession, None, Request], effort: str | None = None,
     ) -> dict[str, object]:
-        """Start a Codex Desktop chat with an attributed opening task and return its chat and turn IDs."""
+        """Start a Codex Desktop chat with a peer task. Its opening prompt names the sending Claude chat
+        by app, ID and title and says the task carries no user approval. Returns the chat and turn IDs.
+        """
         return bridge.start_codex(bridge.sender(context.request_context.meta), folder, model, effort, task)
 
     @application.tool(annotations=READ_ONLY)
@@ -332,7 +336,9 @@ def build(bridge: Bridge) -> FastMCP[None]:
         target: str, body: MessageText,
         context: Context[ServerSession, None, Request],
     ) -> dict[str, object]:
-        """Send peer data to an eligible chat by exact ID."""
+        """Send a peer message to an exact chat in the other app. The recipient sees the sending chat's
+        app, ID and title. The message is marked as peer content and carries no user approval.
+        """
         return receipt_wire(bridge.send(bridge.sender(context.request_context.meta), target, body))
 
     @application.tool(annotations=READ_ONLY)

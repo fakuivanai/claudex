@@ -131,7 +131,8 @@ WINDOW_API = Anchor(
     b'window,api,manager,()=>t.I0(),message=>t.EEt.info(message),async()=>({'
     # The first-party renderer stores start picks in AppPreferences.epitaxyPrefs.
     # The pinned main process owns its feature flag and managed Auto checks.
-    b'preferences:t.Udt("epitaxyPrefs"),autoDefaultEnabled:t.udt("ccd_auto_default_mode",false),'
+    # In the pinned feature cache, udt reads the hashed key for ccd_auto_default_mode.
+    b'preferences:t.Udt("epitaxyPrefs"),autoDefaultEnabled:t.udt("1709592054",false),'
     b'autoAllowed:!t.tm("code")&&!t.jdt()&&!t.bZ(await t.hZ())}))}'
     b'catch{t.EEt.warn("[claudex] Could not attach the Desktop control socket")}return api};',
 )
