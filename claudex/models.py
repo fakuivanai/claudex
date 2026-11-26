@@ -13,6 +13,13 @@ class Provider(StrEnum):
     CODEX = "codex"
 
 
+class MessageAuthor(StrEnum):
+    DEVELOPER = "developer"
+    AGENT = "agent"
+    SYSTEM = "system"
+    UNKNOWN = "unknown"
+
+
 def parse_uuid(value: object) -> str:
     if isinstance(value, str):
         try:

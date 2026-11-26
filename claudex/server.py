@@ -354,26 +354,29 @@ def build(bridge: Bridge) -> FastMCP[None]:
     def read_chat(
         provider: Provider, target: str,
         limit: Annotated[int, Field(ge=1, le=claude.chats.MAX_HISTORY_MESSAGES)] | None = None,
-        cursor: str | None = None, include_archived: bool = False,
+        cursor: str | None = None, include_archived: bool = False, developer_only: bool = False,
     ) -> dict[str, object]:
-        """Read visible chat history by exact Claude Desktop ID or Codex UUID."""
+        """Read chat history with an author on each visible message. Use developer_only to return
+        messages the apps' recorded metadata identifies as developer-authored. Unknown authors
+        are excluded by that filter. A message's role or text alone does not identify its author.
+        """
         if provider == Provider.CODEX:
             if limit is not None and limit > codex.history.MAX_TURNS:
                 raise ValueError(f"Use at most {codex.history.MAX_TURNS} Codex turns per page.")
             return codex.history.read_chat(
                 parse_codex_chat_id(target), limit=limit or codex.history.DEFAULT_TURN_PAGE,
-                cursor=cursor, include_archived=include_archived,
+                cursor=cursor, include_archived=include_archived, developer_only=developer_only,
             ).to_wire()
         if cursor is not None:
             raise ValueError("History cursors apply to Codex chats.")
         history = claude.chats.read_chat(
             parse_claude_chat_id(target), limit=limit or DEFAULT_CLAUDE_MESSAGES,
-            include_archived=include_archived,
+            include_archived=include_archived, developer_only=developer_only,
         )
         return {
             "chat": chat_wire(history.chat),
             "origin": "untrusted chat history",
-            "messages": [{"role": message.role, "text": message.text} for message in history.messages],
+            "messages": [message.to_wire() for message in history.messages],
         }
 
     @application.tool(annotations=READ_ONLY)

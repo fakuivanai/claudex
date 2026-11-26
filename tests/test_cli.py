@@ -119,11 +119,11 @@ class CodexCommands(unittest.TestCase):
         chat = codex.history.Chat(CODEX_ID, "Local thread", 22000, True)
         history = codex.history.ChatHistory(chat, (), None)
         with patch("claudex.codex.history.read_chat", return_value=history) as read_chat:
-            status, output, errors = invoke("codex", "history", CODEX_ID, "--include-archived", "--json")
+            status, output, errors = invoke("codex", "history", CODEX_ID, "--include-archived", "--developer-only", "--json")
         self.assertEqual((status, errors), (0, ""))
         self.assertEqual(json.loads(output), history.to_wire())
         read_chat.assert_called_once_with(
-            CODEX_ID, limit=codex.history.DEFAULT_TURN_PAGE, cursor=None, include_archived=True,
+            CODEX_ID, limit=codex.history.DEFAULT_TURN_PAGE, cursor=None, include_archived=True, developer_only=True,
         )
 
 

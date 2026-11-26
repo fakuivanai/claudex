@@ -132,6 +132,13 @@ verify them: any program running as you could write to the mailbox
 directly. On a single-user machine that's fine, but the sender is a label,
 not proof.
 
+`read_chat` reports a message's author separately from its stored role.
+It uses the apps' recorded metadata and returns `unknown` when authorship
+is ambiguous. Set `developer_only` to keep messages with a recorded
+developer author. Codex's visible history does not record who supplied
+a user-role prompt, so that filter can return no messages even when
+the chat shows prompts.
+
 ## MCP tools
 
 | Tool | What it does |

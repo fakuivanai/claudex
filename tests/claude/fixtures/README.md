@@ -10,3 +10,7 @@ Desktop 5.11492.5, with a Claude Code 2.1.325 worker:
 
 The chat IDs, process ID, machine and PID namespace, socket path and title
 are replaced with stand-ins. Fields Claudex doesn't read are left out.
+
+`history-authorship.jsonl` uses sanitized transcript envelopes recorded from
+the same Desktop and worker versions. IDs and bodies are stand-ins. The
+older unauthenticated body tests that text cannot supply authorship.

@@ -39,6 +39,7 @@ class Arguments(argparse.Namespace):
     cursor: str | None
     archived: bool
     include_archived: bool
+    developer_only: bool
     wait: bool
     force: bool
     prompt: str
@@ -123,6 +124,8 @@ def parser() -> argparse.ArgumentParser:
     history = codex_commands.add_parser("history", help="Read the visible turns in a chat", allow_abbrev=False)
     history.add_argument("codex_chat_id", type=parse_codex_chat_id, metavar="CHAT_ID")
     history.add_argument("--include-archived", action="store_true", help="Allow an archived chat")
+    history.add_argument("--developer-only", action="store_true",
+                         help="Show messages with a recorded developer author")
     history.add_argument("--limit", type=lambda value: page_size(value, codex.history.MAX_TURNS),
                          default=codex.history.DEFAULT_TURN_PAGE,
                          help=f"Turns per page, at most {codex.history.MAX_TURNS}")
@@ -178,6 +181,7 @@ def codex_result(args: Arguments) -> codex.history.ChatPage | codex.history.Chat
         case "history":
             return codex.history.read_chat(
                 args.codex_chat_id, limit=args.limit, cursor=args.cursor, include_archived=args.include_archived,
+                developer_only=args.developer_only,
             )
         case "status":
             return codex.ipc.chat_status(args.codex_chat_id)
@@ -252,7 +256,8 @@ def print_result(result: Result, as_json: bool) -> None:
                 print(f"Turn {printable(turn.record.id)} ({turn.record.status})")
                 for message in turn.messages:
                     text = printable(message.preview.text, multiline=True)
-                    print(f"{message.to_wire()['role']}: {text}" + (" [truncated]" if message.preview.truncated else ""))
+                    wire = message.to_wire()
+                    print(f"{wire['role']} [{wire['author']}]: {text}" + (" [truncated]" if message.preview.truncated else ""))
             print_cursor(result.next_cursor)
         case codex.ipc.ChatStatus():
             print(f"{result.chat_id}  {result.state.replace('_', ' ')}, {result.activity}")

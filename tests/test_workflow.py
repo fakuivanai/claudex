@@ -80,7 +80,9 @@ class WorkflowTest(unittest.IsolatedAsyncioTestCase):
                 claude_server = build(Bridge(Provider.CLAUDE, mailbox, desktop))
                 async with create_connected_server_and_client_session(claude_server) as claude:
                     inbox = await claude.call_tool("read_messages")
-                    transcript = await claude.call_tool("read_chat", {"provider": "codex", "target": SOURCE_CHAT})
+                    transcript = await claude.call_tool("read_chat", {
+                        "provider": "codex", "target": SOURCE_CHAT, "developer_only": True,
+                    })
                     response = await claude.call_tool("send_message", {"target": SOURCE_CHAT, "body": "Fixture review ready."})
                     created = await claude.call_tool("codex_start_chat", {
                         "folder": directory, "model": "gpt-6.2-sol", "effort": "low", "task": "Review a fixture.",
@@ -93,8 +95,9 @@ class WorkflowTest(unittest.IsolatedAsyncioTestCase):
             received = inbox.structuredContent["messages"][0]
             self.assertEqual((received["origin"], received["body"], received["sender"]["chat_id"]),
                              ("untrusted peer", REVIEW_TASK, SOURCE_CHAT))
-            read.assert_called_once()
-            self.assertEqual(read.call_args.args[0], SOURCE_CHAT)
+            read.assert_called_once_with(
+                SOURCE_CHAT, limit=history.DEFAULT_TURN_PAGE, cursor=None, include_archived=False, developer_only=True,
+            )
             destination, reply_message = reply.call_args.args
             self.assertEqual((destination, reply_message.sender.chat_id), (SOURCE_CHAT, claude_id))
             workspace, model, effort, start_message = start.call_args.args

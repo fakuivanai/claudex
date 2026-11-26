@@ -1,0 +1,50 @@
+[
+  {
+    "recording": "developer follow-up",
+    "thread_source": "agent_created_thread",
+    "item": {
+      "type": "userMessage",
+      "id": "item_fixture_1",
+      "clientId": "00000000-0000-4000-8000-000000000001",
+      "content": [
+        {
+          "type": "text",
+          "text": "Sanitized developer follow-up.",
+          "text_elements": []
+        }
+      ]
+    }
+  },
+  {
+    "recording": "Codex agent opener",
+    "thread_source": "agent_created_thread",
+    "item": {
+      "type": "userMessage",
+      "id": "item_fixture_2",
+      "clientId": "00000000-0000-4000-8000-000000000002",
+      "content": [
+        {
+          "type": "text",
+          "text": "Sanitized Codex agent opening request.",
+          "text_elements": []
+        }
+      ]
+    }
+  },
+  {
+    "recording": "Claudex opener",
+    "thread_source": "user",
+    "item": {
+      "type": "userMessage",
+      "id": "item_fixture_3",
+      "clientId": "00000000-0000-4000-8000-000000000003",
+      "content": [
+        {
+          "type": "text",
+          "text": "Sanitized Claudex opening task.",
+          "text_elements": []
+        }
+      ]
+    }
+  }
+]

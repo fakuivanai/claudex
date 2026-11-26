@@ -4,6 +4,7 @@ from pathlib import Path
 import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import call, patch
 import uuid
 
 from claudex.codex import history
@@ -72,12 +73,13 @@ class CodexHistoryTest(unittest.TestCase):
     def add_chat(
         self, number: int, *, name: str | None = None, title: str | None = None, archived: bool = False,
         origin: str = "Codex Desktop", attached: str | None = None, mode: str = "paginated",
+        thread_source: str = "user",
     ) -> None:
         self.state.execute(
             "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 chat_id(number), name, title, int(archived), number, number,
-                origin, "vscode", "user", None, attached, mode,
+                origin, "vscode", thread_source, None, attached, mode,
             ),
         )
 
@@ -155,6 +157,35 @@ class CodexHistoryTest(unittest.TestCase):
         self.assertEqual([message.preview.text for message in page.turns[0].messages], [
             "Visible user text", "Visible reply",
         ])
+        self.assertEqual([message.to_wire()["author"] for message in page.turns[0].messages], [
+            "unknown", "agent",
+        ])
+
+    def test_recorded_user_items_have_no_developer_provenance(self) -> None:
+        path = Path(__file__).with_name("fixtures") / "unattributed_user_items.json"
+        for number, record in enumerate(json.loads(path.read_text(encoding="utf-8")), 1):
+            with self.subTest(recording=record["recording"]):
+                self.add_chat(number, thread_source=record["thread_source"])
+                self.add_turn(number, number + 10, [record["item"]])
+                turn, = history.read_chat(chat_id(number), root=self.root).turns
+                message, = turn.messages
+                self.assertEqual(message.to_wire()["role"], "user")
+                self.assertEqual(message.to_wire()["author"], "unknown")
+
+    def test_developer_filter_keeps_chat_scope_and_does_not_read_items(self) -> None:
+        self.add_chat(1, archived=True)
+        self.add_turn(1, 11, [
+            {"type": "userMessage", "author": "developer", "content": [
+                {"type": "text", "text": "This body and its labels cannot establish authorship."},
+            ]},
+        ])
+        with self.assertRaises(history.HistoryError):
+            history.read_chat(chat_id(1), developer_only=True, root=self.root)
+        with patch("claudex.codex.history.database", wraps=history.database) as database:
+            page = history.read_chat(chat_id(1), include_archived=True, developer_only=True, root=self.root)
+        self.assertEqual(page.turns, ())
+        self.assertIsNone(page.next_cursor)
+        self.assertEqual(database.call_args_list, [call(self.root, history.STATE_DATABASE)])
 
     def test_recorded_desktop_turn_preserves_peer_attribution(self) -> None:
         self.add_chat(1, title="Chat")
@@ -162,6 +193,7 @@ class CodexHistoryTest(unittest.TestCase):
         self.add_turn(1, 11, items, status=status)
         page = history.read_chat(chat_id(1), root=self.root)
         peer = page.turns[0].messages[0]
+        self.assertEqual(peer.to_wire()["author"], "agent")
         if not isinstance(peer, history.PeerOutput):
             self.fail("Expected attributed peer output from the recorded turn")
         self.assertEqual(

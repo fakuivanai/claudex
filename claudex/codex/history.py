@@ -13,7 +13,7 @@ from typing import Annotated, Literal, assert_never
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, RootModel, ValidationError
 
 from claudex.codex.envelope import NAMESPACE, TOOL_NAME, parse_peer_output
-from claudex.models import CodexChatId, PeerMessage, Provider, parse_codex_chat_id
+from claudex.models import CodexChatId, MessageAuthor, PeerMessage, Provider, parse_codex_chat_id
 
 # Keep metadata pages small enough for an MCP tool result.
 MAX_LIST = 50
@@ -149,7 +149,14 @@ class UserMessage:
     preview: VisibleText
 
     def to_wire(self) -> dict[str, object]:
-        return {"role": "user", "text": self.preview.text, "truncated": self.preview.truncated}
+        # This projection uses the same userMessage shape for Desktop input
+        # and prompts submitted by another chat.
+        return {
+            "role": "user",
+            "author": MessageAuthor.UNKNOWN.value,
+            "text": self.preview.text,
+            "truncated": self.preview.truncated,
+        }
 
 
 @dataclass(frozen=True)
@@ -158,7 +165,12 @@ class AssistantMessage:
     phase: AnswerPhase | None
 
     def to_wire(self) -> dict[str, object]:
-        output: dict[str, object] = {"role": "assistant", "text": self.preview.text, "truncated": self.preview.truncated}
+        output: dict[str, object] = {
+            "role": "assistant",
+            "author": MessageAuthor.AGENT.value,
+            "text": self.preview.text,
+            "truncated": self.preview.truncated,
+        }
         if self.phase is not None:
             output["phase"] = self.phase.value
         return output
@@ -172,6 +184,7 @@ class PeerOutput:
     def to_wire(self) -> dict[str, object]:
         return {
             "role": "peer",
+            "author": MessageAuthor.AGENT.value,
             "text": self.preview.text,
             "truncated": self.preview.truncated,
             "message_id": self.message.message_id,
@@ -220,6 +233,7 @@ class ChatHistory:
             "origin": "untrusted chat history",
             "chat": self.chat.to_wire(),
             "coverage": "local paginated history projection",
+            "author_coverage": "The Codex projection cannot distinguish developer and agent prompts in the user role.",
             "turns": [turn.to_wire() for turn in self.turns],
             "next_cursor": self.next_cursor,
         }
@@ -507,7 +521,7 @@ def projected_running_turn_id(chat_id: CodexChatId, *, root: Path | None = None)
 
 def read_chat(
     chat_id: CodexChatId, *, limit: int = DEFAULT_TURN_PAGE, cursor: str | None = None,
-    include_archived: bool = False, root: Path | None = None,
+    include_archived: bool = False, developer_only: bool = False, root: Path | None = None,
 ) -> ChatHistory:
     """Read a page of user, assistant, and bridged peer messages by exact UUID."""
     older_than = None
@@ -528,6 +542,11 @@ def read_chat(
         raise HistoryError("No matching local Codex Desktop chat in the selected archive scope")
     if selected.history_mode != "paginated":
         raise HistoryError("This chat has no supported paginated local history")
+
+    # No visible record in this projection proves developer authorship.
+    # Preserve the chat scope checks and skip all turn/item reads for this filter.
+    if developer_only:
+        return ChatHistory(selected.chat, (), None)
 
     path_filter = "AND rollout_ordinal < ?" if older_than is not None else ""
     parameters = (chat_id, limit + 1) if older_than is None else (chat_id, older_than, limit + 1)

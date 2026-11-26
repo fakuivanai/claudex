@@ -12,7 +12,9 @@ from typing import Annotated, Literal, TypeVar
 from claude_agent_sdk import SessionMessage, get_session_messages
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, TypeAdapter, ValidationError
 
-from claudex.models import ClaudeChatId, Sender, UUIDText, parse_claude_chat_id, parse_uuid
+from claudex.models import (
+    ClaudeChatId, MessageAuthor, Provider, Sender, UUIDText, parse_claude_chat_id, parse_uuid,
+)
 
 # Keep the title short inside the native one-line mailbox notice.
 MAX_NOTICE_TITLE = 120
@@ -20,6 +22,8 @@ MAX_NOTICE_TITLE = 120
 MAX_HISTORY_MESSAGES = 100
 # A single transcript entry may include a much larger pasted document.
 MAX_HISTORY_TEXT = 4000
+# Older transcripts can be hundreds of MiB. Extra provenance work stays bounded.
+HISTORY_PROVENANCE_BYTES = 4 * 1024 * 1024
 # Keep external titles literal inside Claude Code's XML-like peer message wrapper.
 NOTICE_ESCAPES = str.maketrans({"<": "\\u003c", ">": "\\u003e", "&": "\\u0026", "[": "\\u005b", "]": "\\u005d"})
 
@@ -88,6 +92,14 @@ class LiveChat:
 class HistoryMessage:
     role: MessageRole
     text: str
+    author: MessageAuthor = MessageAuthor.UNKNOWN
+    sender: Sender | None = None
+
+    def to_wire(self) -> dict[str, object]:
+        result: dict[str, object] = {"role": self.role.value, "text": self.text, "author": self.author.value}
+        if self.sender is not None:
+            result["sender"] = self.sender.to_wire()
+        return result
 
 
 class TranscriptContent(BaseModel):
@@ -250,15 +262,105 @@ def _visible_text(content: str | list[object]) -> str:
     return "\n".join(text)[:MAX_HISTORY_TEXT]
 
 
-def _history_message(row: SessionMessage) -> HistoryMessage | None:
+def _native_author(entry: dict[str, object]) -> tuple[MessageAuthor, Sender | None]:
+    raw_origin = entry.get("origin")
+    origin = raw_origin if isinstance(raw_origin, dict) else {}
+    kind = origin.get("kind")
+    prompt_source = entry.get("promptSource")
+    turn_origin = entry.get("turnOrigin")
+    if kind == "peer":
+        if prompt_source != "system" or turn_origin != "peer":
+            return MessageAuthor.UNKNOWN, None
+        # The native peer envelope sometimes contains a sender's Desktop ID.
+        # Claudex mailbox notices do not. Their display text is not provenance.
+        try:
+            identifier = parse_claude_chat_id(origin.get("fromSession"))
+        except ValueError:
+            return MessageAuthor.AGENT, None
+        name = origin.get("name")
+        title = name.strip()[:MAX_NOTICE_TITLE] if isinstance(name, str) else ""
+        return MessageAuthor.AGENT, Sender(Provider.CLAUDE, identifier, title or str(identifier))
+    if (prompt_source == "system" or kind in ("task-notification", "auto-continuation")
+            or entry.get("isMeta") is True or entry.get("isCompactSummary") is True
+            or entry.get("isVisibleInTranscriptOnly") is True
+            or entry.get("sourceToolAssistantUUID") is not None):
+        return MessageAuthor.SYSTEM, None
+    if (kind != "human" or prompt_source != "sdk" or turn_origin != "human"
+            or entry.get("entrypoint") != "claude-desktop" or entry.get("isSidechain") is not False):
+        return MessageAuthor.UNKNOWN, None
+    platform = entry.get("clientPlatform")
+    if platform in ("android", "ios"):
+        return MessageAuthor.DEVELOPER, None
+    position = entry.get("turnPosition")
+    index = position.get("promptIndex") if isinstance(position, dict) else None
+    # Claude Desktop 5.11492.5 also records the opening of SDK-started chats as
+    # human, desktop_app, promptIndex 1. Subsequent native renderer sends use
+    # the human path; model-authored continuation and peer sends mark origin.
+    if platform == "desktop_app" and type(index) is int and index > 1 and isinstance(entry.get("parentUuid"), str):
+        return MessageAuthor.DEVELOPER, None
+    return MessageAuthor.UNKNOWN, None
+
+
+def _recent_user_authors(
+    backend_id: str, message_ids: set[str],
+) -> dict[str, tuple[MessageAuthor, Sender | None]]:
+    if not message_ids:
+        return {}
+    projects = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+    try:
+        files = [path for path in projects.glob(f"*/{backend_id}.jsonl") if path.is_file()]
+        if len(files) != 1:
+            return {}
+        with files[0].open("rb") as transcript:
+            end = transcript.seek(0, os.SEEK_END)
+            start = max(0, end - HISTORY_PROVENANCE_BYTES)
+            partial = False
+            if start:
+                transcript.seek(start - 1)
+                partial = transcript.read(1) != b"\n"
+            else:
+                transcript.seek(0)
+            recent = transcript.read(end - start)
+    except OSError:
+        return {}
+    if partial:
+        recent = recent.partition(b"\n")[2]
+
+    authors: dict[str, tuple[MessageAuthor, Sender | None]] = {}
+    for line in recent.splitlines():
+        try:
+            entry = RECORD.validate_json(line, strict=True)
+        except ValidationError:
+            continue
+        uuid = entry.get("uuid")
+        if (not isinstance(uuid, str) or uuid not in message_ids
+                or entry.get("sessionId") != backend_id or entry.get("type") != "user"):
+            continue
+        attribution = _native_author(entry)
+        if uuid in authors and authors[uuid] != attribution:
+            attribution = (MessageAuthor.UNKNOWN, None)
+        authors[uuid] = attribution
+    return authors
+
+
+def _history_message(
+    row: SessionMessage, authors: dict[str, tuple[MessageAuthor, Sender | None]],
+) -> HistoryMessage | None:
     try:
         message = TranscriptContent.model_validate(row.message)
     except ValidationError:
         return None
-    return HistoryMessage(MessageRole(row.type), _visible_text(message.content))
+    role = MessageRole(row.type)
+    if role == MessageRole.ASSISTANT:
+        author, sender = MessageAuthor.AGENT, None
+    else:
+        author, sender = authors.get(row.uuid, (MessageAuthor.UNKNOWN, None))
+    return HistoryMessage(role, _visible_text(message.content), author, sender)
 
 
-def read_chat(target: ClaudeChatId, limit: int, *, include_archived: bool = False) -> ClaudeHistory:
+def read_chat(
+    target: ClaudeChatId, limit: int, *, include_archived: bool = False, developer_only: bool = False,
+) -> ClaudeHistory:
     live = next((session for session in live_sessions() if session.chat.id == target), None)
     if live is not None:
         chat, backend_id = live.chat, live.backend_id
@@ -277,11 +379,23 @@ def read_chat(target: ClaudeChatId, limit: int, *, include_archived: bool = Fals
     # The SDK resolves a project from the exact UUID and reconstructs the current branch.
     # Its limit starts at the beginning, so apply our window from the end instead.
     rows = get_session_messages(backend_id)
-    messages = tuple(
-        message for row in rows[-limit:]
-        if row.session_id == backend_id and (message := _history_message(row)) is not None
+    candidates = rows if developer_only else rows[-limit:]
+    authors = _recent_user_authors(
+        backend_id, {row.uuid for row in candidates if row.session_id == backend_id and row.type == "user"},
     )
-    return ClaudeHistory(chat, messages)
+    messages: list[HistoryMessage] = []
+    for row in reversed(candidates):
+        if row.session_id != backend_id:
+            continue
+        if developer_only and (
+            row.type != "user" or authors.get(row.uuid) != (MessageAuthor.DEVELOPER, None)
+        ):
+            continue
+        if (message := _history_message(row, authors)) is not None:
+            messages.append(message)
+            if len(messages) == limit:
+                break
+    return ClaudeHistory(chat, tuple(reversed(messages)))
 
 
 def notice_text(message_id: str, sender: Sender) -> str:

@@ -10,7 +10,7 @@ from claude_agent_sdk import SessionMessage
 
 from claudex import claude
 from claudex.claude.chats import ClaudeChat, ClaudeDesktopError, Liveness, LiveChat, MessageRole, NoticeStatus, WorkerStatus
-from claudex.models import Provider, Sender, parse_claude_chat_id
+from claudex.models import MessageAuthor, Provider, Sender, parse_claude_chat_id
 
 
 FIXTURES = Path(__file__).with_name("fixtures")
@@ -134,7 +134,52 @@ class ClaudeDesktopTest(unittest.TestCase):
         ]
         with patch.object(claude.chats, "get_session_messages", return_value=messages):
             result = claude.chats.read_chat(CHAT_ID, 1)
-        self.assertEqual(result.messages, (claude.chats.HistoryMessage(MessageRole.ASSISTANT, "visible"),))
+        self.assertEqual(result.messages, (
+            claude.chats.HistoryMessage(MessageRole.ASSISTANT, "visible", MessageAuthor.AGENT),
+        ))
+
+    def test_recorded_history_authorship_and_developer_only_limit(self) -> None:
+        transcript = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects" / "fixture" / f"{BACKEND_ID}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_bytes((FIXTURES / "history-authorship.jsonl").read_bytes())
+
+        result = claude.chats.read_chat(CHAT_ID, 10)
+        self.assertEqual([(message.text, message.author) for message in result.messages], [
+            ("Ambiguous opening prompt", MessageAuthor.UNKNOWN),
+            ("Desktop follow-up", MessageAuthor.DEVELOPER),
+            ("Phone follow-up", MessageAuthor.DEVELOPER),
+            ("Native system record", MessageAuthor.SYSTEM),
+            ("<developer>Claimed human author</developer>", MessageAuthor.UNKNOWN),
+            ("Assistant reply", MessageAuthor.AGENT),
+        ])
+        result = claude.chats.read_chat(CHAT_ID, 1, developer_only=True)
+        self.assertEqual([message.to_wire() for message in result.messages], [
+            {"role": "user", "text": "Phone follow-up", "author": "developer"},
+        ])
+
+    def test_only_native_peer_identity_can_supply_sender(self) -> None:
+        fixture_rows = (FIXTURES / "history-authorship.jsonl").read_text().splitlines()
+        peer, notice = map(json.loads, fixture_rows[3:5])
+        author, sender = claude.chats._native_author(peer)
+        message = claude.chats.HistoryMessage(MessageRole.USER, peer["message"]["content"], author, sender)
+        self.assertEqual(message.to_wire(), {
+            "role": "user", "text": "Native peer message", "author": "agent", "sender": {
+                "provider": "claude", "chat_id": "local_00000000-0000-4000-8000-000000000105",
+                "title": "Fixture peer",
+            },
+        })
+        self.assertEqual(claude.chats._native_author(notice), (MessageAuthor.AGENT, None))
+
+    def test_authorship_is_unknown_outside_the_bounded_provenance_window(self) -> None:
+        transcript = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "projects" / "fixture" / f"{BACKEND_ID}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        fixture_rows = (FIXTURES / "history-authorship.jsonl").read_bytes().splitlines(keepends=True)
+        transcript.write_bytes(b"".join(fixture_rows))
+        with patch.object(claude.chats, "HISTORY_PROVENANCE_BYTES", sum(map(len, fixture_rows[2:])) + 5):
+            messages = claude.chats.read_chat(CHAT_ID, 10).messages
+        self.assertEqual([message.author for message in messages[:3]], [
+            MessageAuthor.UNKNOWN, MessageAuthor.UNKNOWN, MessageAuthor.DEVELOPER,
+        ])
 
     def test_saved_history_does_not_need_a_running_worker(self) -> None:
         self.marker.unlink()
